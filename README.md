@@ -1,10 +1,19 @@
 # ecoTrace Communication Module
 
-> ## 🚧 NOT TESTED YET
-> The **PCB has been tested** and works. **This firmware/repo has NOT** - it compiles
-> cleanly but has not been run or verified on hardware. Treat everything here as a
-> starting point to validate yourself, not as known-good. Expect bugs; check behaviour
-> against the schematic and the datasheets before relying on it.
+> ## 🚧 PARTIALLY TESTED - read this
+> The **PCB works**, and so does the **reference firmware this repo is built from**:
+> the board self-test (`functionality_test`) and the `bms_stove` ESP-IDF datalogger
+> have run on real hardware - including USB + solar charging, cellular upload, deep
+> sleep, and the GPIO14 sensor switch.
+>
+> What has **NOT been run on hardware yet** is this repo's Arduino rewrite: the
+> **`datalogger`** app and the **`lib/EcoTrace`** driver library. They compile cleanly
+> but have not been exercised on a board. Validate before relying on them. The
+> highest-risk piece is the **BQ25792 charging path** - this driver uses corrected
+> registers that differ from the older (proven) code, so charging specifically has
+> never been run as written here.
+>
+> Full proven-vs-unproven breakdown: [`docs/testing-status.md`](docs/testing-status.md).
 
 Firmware and board-support for the **ecoTrace Communication Module** - a small,
 battery- and solar-powered ESP32-C6 board with an LTE modem, built for **logging
@@ -107,7 +116,7 @@ lib/EcoTrace/      board support: pin map + drivers (the reusable core)
 src/
   datalogger/        the main application (+ config.h)
   functionality_test/  board bring-up self-test
-docs/              getting started, pinout, errata, api reference, power states
+docs/              getting started, pinout, errata, api reference, testing status
 hardware/          KiCad project + exports
 ```
 
