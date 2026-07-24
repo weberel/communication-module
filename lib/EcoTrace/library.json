@@ -1,0 +1,11 @@
+{
+  "name": "EcoTrace",
+  "version": "0.1.0",
+  "description": "Board support package for the ecoTrace Communication Module (ESP32-C6-MINI-1 + BQ25792 PMIC + A7672E LTE modem). Pin map, board init, and self-contained drivers for the parts that need precise control.",
+  "keywords": "ecotrace, esp32-c6, bq25792, a7672e, lte, solar, mppt, datalogger",
+  "authors": [
+    { "name": "GHE ETH Zurich", "url": "https://ecotrace.ch" }
+  ],
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}
