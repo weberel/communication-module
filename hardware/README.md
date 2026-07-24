@@ -27,5 +27,5 @@ hardware/
 `kicad/jlcpcb/` holds a ready-to-order set (gerbers, drill, BOM, CPL, and a zipped
 gerber bundle) targeted at JLCPCB. Re-export from KiCad if you change the board.
 
-Note: there is also a 4-layer variant of this board on the shared drive
-(`Communication_pcb_main _4l`); only the 2-layer Rev A design is included here.
+This is the **current 4-layer** version of the board (F.Cu / In1 / In2 / B.Cu). An
+older 2-layer design also exists on the shared drive; it is not included here.

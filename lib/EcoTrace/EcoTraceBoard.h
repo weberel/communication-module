@@ -32,7 +32,8 @@ void ledOn();
 void ledOff();
 void ledToggle();
 
-/* External sensor rail (GPIO14 high-side switch). No-op-safe if unpopulated. */
+/* External sensor rail (GPIO14 high-side switch, active HIGH). Powers sensors on
+ * the SENSOR header; the on-board SC7A20 + LTR-303 are on 3V3, not this rail. */
 void sensorRail(bool on);
 
 /* Enter deep sleep for `seconds`, holding the modem rail off, PWRKEY high, sensor

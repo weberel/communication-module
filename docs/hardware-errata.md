@@ -47,12 +47,12 @@ over USB Serial/JTAG ever fails, you recover via the **BOOT pad + reset** (hold 
 low, pulse reset, release BOOT) to force the ROM bootloader. See
 [`pinout.md`](pinout.md) for the pad list.
 
-## 🟡 6. GPIO14 sensor-rail population varies
+## 🟡 6. GPIO14 sensor rail powers the SENSOR header, not the on-board sensors
 
-`GPIO14` drives a high-side switch for an **external sensor rail** (active HIGH). On
-some boards this footprint is **not populated**; the on-board SC7A20 + LTR-303 are
-always wired to 3V3 regardless and can only be low-powered over I2C. Confirm on your
-board before relying on switching sensor power in sleep.
+Not a defect, just worth knowing: `GPIO14` drives a populated high-side switch
+(active HIGH) for the **external sensor rail** on the SENSOR header. The on-board
+SC7A20 + LTR-303 are wired directly to 3V3, **not** this rail, so cutting GPIO14 in
+sleep does not power them down -- put those in low-power mode over I2C instead.
 
 ---
 

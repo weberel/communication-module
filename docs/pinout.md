@@ -23,7 +23,7 @@ Exposed GPIOs on the MINI-1 module: `0,1,2,3,4,5,6,7,8,9,12,13,14,15,18,19,20,21
 | 9 | SPI_CS_PERIPH | spare CS, **not populated**. Strapping + **BOOT pad** (TP403) |
 | 12 | USB D− | native USB Serial/JTAG |
 | 13 | USB D+ | native USB Serial/JTAG |
-| 14 | SENSOR_PWR | external sensor rail high-side switch, active HIGH. **Population varies** |
+| 14 | SENSOR_PWR | populated high-side switch (active HIGH) for EXTERNAL sensor power on the SENSOR header. On-board sensors run on the always-on 3V3 (RT9080 LDO), not this switch |
 | 15 | (tied to GND) | strapping pin |
 | 18 | SPI_CLK | to GD25Q256 flash |
 | 19 | INT_bq | BQ25792 fault / charge interrupt |

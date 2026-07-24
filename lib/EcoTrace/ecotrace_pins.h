@@ -42,11 +42,11 @@
 #define ECO_PIN_INT_BQ         19    /* BQ25792 fault / charge interrupt */
 
 /* ---- External sensor power rail --------------------------------------------- */
-/* GPIO14: high-side switch (NPN -> P-MOSFET), active HIGH = external sensor rail on.
- * POPULATION VARIES BY BOARD -- confirm on yours before relying on it.
- *   - Some boards ship this footprint UNpopulated (sensors then wired direct to 3V3).
- *   - The on-board SC7A20 + LTR-303 are always wired to 3V3, NOT this rail; they can
- *     only be low-power'd over I2C. See docs/hardware-errata.md. */
+/* GPIO14: populated high-side switch (NPN -> P-MOSFET), active HIGH. It switches the
+ * power to EXTERNAL sensors on the SENSOR header only. Drive LOW + gpio_hold to cut
+ * it in deep sleep.
+ * NOTE: the on-board SC7A20 + LTR-303 run on the always-on 3V3 rail (RT9080 LDO off
+ * VBAT), NOT this switch, so GPIO14 never powers them down -- low-power those over I2C. */
 #define ECO_PIN_SENSOR_PWR     14
 #define ECO_SENSOR_PWR_ON      HIGH
 #define ECO_SENSOR_PWR_OFF     LOW

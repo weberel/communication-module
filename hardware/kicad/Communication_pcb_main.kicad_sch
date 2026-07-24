@@ -1,10 +1,110 @@
 (kicad_sch
-	(version 20250114)
+	(version 20260306)
 	(generator "eeschema")
-	(generator_version "9.0")
+	(generator_version "10.0")
 	(uuid "d5ce9b6d-7064-4361-9f7c-a9b3ebd6405c")
 	(paper "A4")
-	(lib_symbols)
+	(lib_symbols
+		(symbol "Mechanical:MountingHole"
+			(pin_names
+				(offset 1.016)
+			)
+			(exclude_from_sim no)
+			(in_bom no)
+			(on_board yes)
+			(in_pos_files yes)
+			(duplicate_pin_numbers_are_jumpers no)
+			(property "Reference" "H"
+				(at 0 5.08 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "Value" "MountingHole"
+				(at 0 3.175 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "Footprint" ""
+				(at 0 0 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(hide yes)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "Datasheet" ""
+				(at 0 0 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(hide yes)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "Description" "Mounting Hole without connection"
+				(at 0 0 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(hide yes)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "ki_keywords" "mounting hole"
+				(at 0 0 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(hide yes)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "ki_fp_filters" "MountingHole*"
+				(at 0 0 0)
+				(show_name no)
+				(do_not_autoplace no)
+				(hide yes)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(symbol "MountingHole_0_1"
+				(circle
+					(center 0 0)
+					(radius 1.27)
+					(stroke
+						(width 1.27)
+						(type default)
+					)
+					(fill
+						(type none)
+					)
+				)
+			)
+			(embedded_fonts no)
+		)
+	)
 	(junction
 		(at 63.5 91.44)
 		(diameter 0)
@@ -25,6 +125,16 @@
 	)
 	(wire
 		(pts
+			(xy 96.52 127) (xy 55.88 127)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "04bef47f-3aa6-42ad-b5e7-e93317420916")
+	)
+	(wire
+		(pts
 			(xy 110.49 114.3) (xy 68.58 114.3)
 		)
 		(stroke
@@ -35,6 +145,16 @@
 	)
 	(wire
 		(pts
+			(xy 96.52 64.77) (xy 96.52 127)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "11d567e9-a74a-4a21-bb35-45a1eb13a03d")
+	)
+	(wire
+		(pts
 			(xy 52.07 87.63) (xy 60.96 87.63)
 		)
 		(stroke
@@ -42,6 +162,16 @@
 			(type default)
 		)
 		(uuid "1898b371-2e31-4d92-88c3-471a09b3a3fb")
+	)
+	(wire
+		(pts
+			(xy 55.88 114.3) (xy 52.07 114.3)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "1f7a1b89-f417-4eb0-949e-bb2afd616e03")
 	)
 	(wire
 		(pts
@@ -265,6 +395,16 @@
 	)
 	(wire
 		(pts
+			(xy 55.88 127) (xy 55.88 114.3)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "9bd88f45-19a0-4473-86af-a5c8cdd378b8")
+	)
+	(wire
+		(pts
 			(xy 88.9 102.87) (xy 88.9 64.77)
 		)
 		(stroke
@@ -393,9 +533,313 @@
 		)
 		(uuid "f3b10ce1-bb81-4227-85f2-fca967298a87")
 	)
+	(symbol
+		(lib_id "Mechanical:MountingHole")
+		(at 173.99 87.63 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom no)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(uuid "3c1b218e-6f7a-46c3-9ff3-4e237a2a486a")
+		(property "Reference" "H402"
+			(at 176.53 86.3599 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "MountingHole"
+			(at 176.53 88.8999 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "weberel:Slot_2.2mm_M2_ISO14580_Pad"
+			(at 173.99 87.63 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 173.99 87.63 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "Mounting Hole without connection"
+			(at 173.99 87.63 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(instances
+			(project "Communication_pcb_main"
+				(path "/d5ce9b6d-7064-4361-9f7c-a9b3ebd6405c"
+					(reference "H402")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Mechanical:MountingHole")
+		(at 173.99 81.28 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom no)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(uuid "43116636-bf6b-4ed6-92ac-c7ad28a8ed1a")
+		(property "Reference" "H401"
+			(at 176.53 80.0099 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "MountingHole"
+			(at 176.53 82.5499 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "MountingHole:MountingHole_2.2mm_M2_ISO14580_Pad"
+			(at 173.99 81.28 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 173.99 81.28 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "Mounting Hole without connection"
+			(at 173.99 81.28 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(instances
+			(project "Communication_pcb_main"
+				(path "/d5ce9b6d-7064-4361-9f7c-a9b3ebd6405c"
+					(reference "H401")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Mechanical:MountingHole")
+		(at 173.99 100.33 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom no)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(uuid "a7f274e5-5348-46e6-87ca-c5095576b40d")
+		(property "Reference" "H404"
+			(at 176.53 99.0599 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "MountingHole"
+			(at 176.53 101.5999 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "weberel:Slot_2.2mm_M2_ISO14580_Pad"
+			(at 173.99 100.33 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 173.99 100.33 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "Mounting Hole without connection"
+			(at 173.99 100.33 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(instances
+			(project "Communication_pcb_main"
+				(path "/d5ce9b6d-7064-4361-9f7c-a9b3ebd6405c"
+					(reference "H404")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Mechanical:MountingHole")
+		(at 173.99 93.98 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom no)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(uuid "aac4e9f0-d424-4bae-a082-2958b773fc14")
+		(property "Reference" "H403"
+			(at 176.53 92.7099 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "MountingHole"
+			(at 176.53 95.2499 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "MountingHole:MountingHole_2.2mm_M2_ISO14580_Pad"
+			(at 173.99 93.98 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 173.99 93.98 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "Mounting Hole without connection"
+			(at 173.99 93.98 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(instances
+			(project "Communication_pcb_main"
+				(path "/d5ce9b6d-7064-4361-9f7c-a9b3ebd6405c"
+					(reference "H403")
+					(unit 1)
+				)
+			)
+		)
+	)
 	(sheet
 		(at 34.29 81.28)
-		(size 17.78 31.75)
+		(size 17.78 36.83)
 		(exclude_from_sim no)
 		(in_bom yes)
 		(on_board yes)
@@ -406,11 +850,13 @@
 			(type solid)
 		)
 		(fill
-			(color 0 0 0 0.0000)
+			(color 0 0 0 0)
 		)
 		(uuid "4290db26-9d57-471e-b1b7-a742a1f69923")
 		(property "Sheetname" "SimCom"
 			(at 34.29 80.5684 0)
+			(show_name no)
+			(do_not_autoplace no)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -419,7 +865,9 @@
 			)
 		)
 		(property "Sheetfile" "simcom.kicad_sch"
-			(at 34.29 113.6146 0)
+			(at 34.29 118.6946 0)
+			(show_name no)
+			(do_not_autoplace no)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -507,6 +955,16 @@
 				(justify right)
 			)
 		)
+		(pin "STATUS" input
+			(at 52.07 114.3 0)
+			(uuid "8fc7742a-b735-4364-99f7-8054ac945421")
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify right)
+			)
+		)
 		(instances
 			(project "Communication_pcb_main"
 				(path "/d5ce9b6d-7064-4361-9f7c-a9b3ebd6405c"
@@ -528,11 +986,13 @@
 			(type solid)
 		)
 		(fill
-			(color 0 0 0 0.0000)
+			(color 0 0 0 0)
 		)
 		(uuid "7ee84b76-6a01-4d39-b807-1a565a68ab86")
 		(property "Sheetname" "PowerManagament"
 			(at 110.49 80.5684 0)
+			(show_name no)
+			(do_not_autoplace no)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -542,6 +1002,8 @@
 		)
 		(property "Sheetfile" "power_mgmt.kicad_sch"
 			(at 110.49 121.2346 0)
+			(show_name no)
+			(do_not_autoplace no)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -670,11 +1132,13 @@
 			(type solid)
 		)
 		(fill
-			(color 0 0 0 0.0000)
+			(color 0 0 0 0)
 		)
 		(uuid "c50dad51-1de1-4269-a2a6-be3c05759b6e")
 		(property "Sheetname" "MCU"
 			(at 43.18 37.3884 0)
+			(show_name no)
+			(do_not_autoplace no)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -684,6 +1148,8 @@
 		)
 		(property "Sheetfile" "mcu.kicad_sch"
 			(at 43.18 65.3546 0)
+			(show_name no)
+			(do_not_autoplace no)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -824,6 +1290,16 @@
 		(pin "VSYS" input
 			(at 58.42 64.77 270)
 			(uuid "f66b9afa-214f-455b-a9bb-d343fc56c303")
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(pin "STATUS" input
+			(at 96.52 64.77 270)
+			(uuid "8b3d8d19-9aa8-40d4-a04b-de8b803fd609")
 			(effects
 				(font
 					(size 1.27 1.27)

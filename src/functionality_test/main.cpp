@@ -36,7 +36,7 @@
 #define PIN_INT_SHARED       3     /* SC7A20 + LTR-303 shared INT */
 #define PIN_INT_BQ           19
 
-#define PIN_SENSOR_PWR       14    /* MOSFET footprint not populated */
+#define PIN_SENSOR_PWR       14    /* external sensor rail high-side switch (populated), active HIGH */
 #define PIN_LED              1     /* status LED, blinks during test */
 
 /* ===================== I2C device addresses (7-bit) ===================== */
@@ -155,12 +155,13 @@ static void led_stop_solid_on(void)
 static void test_power_rails(void)
 {
     SECTION("Power rails");
-    /* Sensor MOSFET on GPIO14 is NOT populated - sensors are wired to 3V3 directly. */
+    /* GPIO14 sensor-rail MOSFET is populated (active HIGH). The on-board SC7A20 +
+     * LTR-303 are on 3V3, not this rail, so they stay powered regardless. */
     pinMode(PIN_MODEM_PWR_EN, OUTPUT);
     digitalWrite(PIN_MODEM_PWR_EN, LOW);
     pinMode(PIN_MODEM_PWRKEY, OUTPUT);
     digitalWrite(PIN_MODEM_PWRKEY, HIGH);
-    TEST_INFO("SENSOR_PWR",   "GPIO%d MOSFET footprint not populated - sensors always-on", PIN_SENSOR_PWR);
+    TEST_INFO("SENSOR_PWR",   "GPIO%d ext-sensor rail switch (populated); on-board sensors on 3V3", PIN_SENSOR_PWR);
     TEST_INFO("MODEM_PWR_EN", "GPIO%d -> LOW  (modem rail off)", PIN_MODEM_PWR_EN);
     TEST_INFO("MODEM_PWRKEY", "GPIO%d -> HIGH (idle)",           PIN_MODEM_PWRKEY);
 }
