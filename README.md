@@ -37,7 +37,7 @@ picking up the board.
 | Power / charging | **BQ25792** buck-boost charger + PMIC - USB, solar (MPPT), LiPo, 16-bit ADC |
 | Cellular | **SIMCom A7672E-LASE** LTE Cat-1 modem (+ internal GNSS, untested) |
 | Sensors (optional) | SC7A20 accelerometer, LTR-303ALS ambient light |
-| Storage | GD25Q256 32 MB SPI NOR flash |
+| Storage | GD25Q128 16 MB SPI NOR flash |
 | Security | ATECC608B secure element |
 | Inputs | USB-C (power + flashing), SIM slot, battery connector, VIN (solar/DC in) |
 | Antennas | u.FL for LTE and GPS |
@@ -70,7 +70,7 @@ on the board. Pull in only what you need. Full list: [`docs/api-reference.md`](d
 | `ModemA7672` | LTE power/AT, SIM, registration, GPRS, HTTP GET/POST, time | ✅ full (GPS = stub) |
 | `LTR303` | ambient light (CH0/CH1, lux) - datalogger's example sensor | ✅ |
 | `SC7A20` | accelerometer (X/Y/Z mg) | ✅ |
-| `ExtFlash` | GD25Q256 read/erase/program, power-down | ✅ (low 16 MB) |
+| `ExtFlash` | GD25Q128 read/erase/program, power-down | ✅ (full 16 MB) |
 | `ATECC608B` | secure element presence/wake | 🔹 thin (crypto via CryptoAuthLib) |
 | `EcoTraceBoard` | safe init, I2C/SPI bring-up, deep sleep | ✅ |
 

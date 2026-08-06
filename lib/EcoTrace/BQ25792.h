@@ -78,6 +78,7 @@ public:
     void disableWatchdog();                /* REG10[2:0]=0 so the charger keeps our settings */
     void enableACDRV1(bool on = true);     /* USB path gate (locked off if FET not populated) */
     void enableACDRV2(bool on = true);     /* solar path gate */
+    void enableExtILIM(bool on = true);    /* ILIM_HIZ pin current clamp (REG14[1]) */
 
     /* Convenience: disable watchdog, clear HIZ, enable charging, apply limits.
      * Pass 0 for any limit you want left at its current value. */

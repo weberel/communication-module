@@ -244,6 +244,49 @@ static const char *chg_names[] = {
     "taper (CV)",  "reserved", "top-off",    "done"
 };
 
+/* ILIM_HIZ probe (repo issue #3): the R209/R212 divider on ILIM_HIZ may clamp
+ * input current below the IINDPM register unless EN_EXT_ILIM (REG14[1]) is
+ * cleared. Ask for 900 mA, measure real IBUS with the pin limit active, then
+ * with it disabled. Restores IINDPM and REG14 after. Only discriminates when
+ * total input demand exceeds the suspected ~600 mA clamp, so it is also called
+ * late in the modem test where the modem + WiFi system load stacks on top of
+ * the charge current. Draws up to 900 mA from the input for a few seconds -
+ * fine on a charger, over-spec on a 500 mA port. */
+static void bq_ilim_probe(const char *tag)
+{
+    uint8_t cs[2];
+    if (!i2c_read_reg(ADDR_BQ25792, 0x1B, cs, 2) || !(cs[0] & 0x01)) return;
+
+    uint8_t save_iindpm[2] = {0, 0}, save_r14 = 0;
+    i2c_read_reg(ADDR_BQ25792, 0x06, save_iindpm, 2);
+    i2c_read_reg(ADDR_BQ25792, 0x14, &save_r14, 1);
+
+    i2c_write_reg(ADDR_BQ25792, 0x06, 0);
+    i2c_write_reg(ADDR_BQ25792, 0x07, 90);          /* IINDPM = 900 mA */
+    delay(2500);
+
+    for (int phase = 0; phase < 2; phase++) {
+        if (phase == 1) {
+            i2c_write_reg(ADDR_BQ25792, 0x14, save_r14 & ~0x02);   /* EN_EXT_ILIM = 0 */
+            delay(2000);
+        }
+        uint8_t b[2];
+        int16_t ibus = 0, ibat = 0;
+        uint16_t vbat = 0;
+        if (i2c_read_reg(ADDR_BQ25792, 0x31, b, 2)) ibus = (int16_t)((b[0] << 8) | b[1]);
+        if (i2c_read_reg(ADDR_BQ25792, 0x33, b, 2)) ibat = (int16_t)((b[0] << 8) | b[1]);
+        if (i2c_read_reg(ADDR_BQ25792, 0x3B, b, 2)) vbat = ((uint16_t)b[0] << 8) | b[1];
+        i2c_read_reg(ADDR_BQ25792, 0x1B, cs, 2);
+        TEST_INFO(phase == 0 ? "ILIM probe A" : "ILIM probe B",
+                  "[%s] IINDPM=900 EXT_ILIM=%s: IBUS=%d mA IBAT=%+d mA VBAT=%u mV IINDPM_STAT=%d",
+                  tag, phase == 0 ? "on " : "off", ibus, ibat, vbat, (cs[0] & 0x80) ? 1 : 0);
+    }
+
+    i2c_write_reg(ADDR_BQ25792, 0x14, save_r14);
+    i2c_write_reg(ADDR_BQ25792, 0x06, save_iindpm[0]);
+    i2c_write_reg(ADDR_BQ25792, 0x07, save_iindpm[1]);
+}
+
 static void bq_verbose_dump(void)
 {
     uint8_t r[7];
@@ -322,6 +365,17 @@ static void test_bq25792(void)
             uint16_t mv = ((uint16_t)vbus[0] << 8) | vbus[1];
             TEST_INFO("BQ25792 VBUS", "%u mV (USB / charger input)", mv);
         }
+        /* VAC1/VAC2 sense the adapter side BEFORE the ACFETs, so these tell us
+         * whether 5 V physically arrives at the charger, independent of gate state. */
+        uint8_t vac[2];
+        if (i2c_read_reg(ADDR_BQ25792, 0x37, vac, 2)) {
+            uint16_t mv = ((uint16_t)vac[0] << 8) | vac[1];
+            TEST_INFO("BQ25792 VAC1", "%u mV (USB side, pre-ACFET1)", mv);
+        }
+        if (i2c_read_reg(ADDR_BQ25792, 0x39, vac, 2)) {
+            uint16_t mv = ((uint16_t)vac[0] << 8) | vac[1];
+            TEST_INFO("BQ25792 VAC2", "%u mV (solar side, pre-ACFET2)", mv);
+        }
     }
 
     /* Charge state + nudge if not charging */
@@ -332,15 +386,24 @@ static void test_bq25792(void)
                   chg_names[st], cs[0], cs[1]);
 
         bool not_charging = ((cs[1] >> 5) & 0x07) == 0;
-        bool vbus_present = (cs[0] & 0x08) != 0;
-        bool ac1_present  = (cs[0] & 0x02) != 0;
-        if (not_charging && (vbus_present || ac1_present)) {
-            if (ac1_present && !vbus_present) {
-                uint8_t r12 = 0;
-                i2c_read_reg(ADDR_BQ25792, 0x12, &r12, 1);
-                i2c_write_reg(ADDR_BQ25792, 0x12, r12 | 0x08);  /* EN_ACDRV1 */
-                TEST_INFO("BQ25792 nudge", "EN_ACDRV1=1 (AC1 sense -> VBUS gate)");
+        bool vbus_present = (cs[0] & 0x01) != 0;   /* VBUS_PRESENT is REG1B[0]; [3] is PG */
+        if (not_charging) {
+            if (!vbus_present) {
+                /* The USB input sits behind ACFET1, which is off at POR, so the
+                 * charger sees no input until the gate is driven. EN_ACDRV1 is
+                 * REG13[6] per SLUSDG1D -- NOT REG12[3], which is WKUP_DLY. */
+                uint8_t r13 = 0;
+                i2c_read_reg(ADDR_BQ25792, 0x13, &r13, 1);
+                i2c_write_reg(ADDR_BQ25792, 0x13, r13 | 0x40);  /* EN_ACDRV1 */
+                TEST_INFO("BQ25792 nudge", "EN_ACDRV1=1 (drive ACFET1: USB -> VBUS)");
                 delay(500);
+                /* The BQ auto-clears EN_ACDRV if the FET pair failed POR detection
+                 * or VACx is absent -- read back to see which side rejected us. */
+                uint8_t r13b = 0, r1e = 0;
+                i2c_read_reg(ADDR_BQ25792, 0x13, &r13b, 1);
+                i2c_read_reg(ADDR_BQ25792, 0x1E, &r1e, 1);
+                TEST_INFO("BQ25792 nudge", "readback REG13=0x%02X (EN_ACDRV1 %s)  REG1E=0x%02X",
+                          r13b, (r13b & 0x40) ? "stuck" : "auto-cleared", r1e);
             }
             uint8_t r10 = 0, r0f = 0;
             i2c_read_reg(ADDR_BQ25792, 0x10, &r10, 1);
@@ -358,6 +421,8 @@ static void test_bq25792(void)
             }
         }
     }
+
+    bq_ilim_probe("bq idle");
 
     bq_verbose_dump();
 
@@ -559,6 +624,80 @@ static bool modem_wait_for(const char *needle, char *resp, size_t resp_sz, int t
     return false;
 }
 
+/* Baud sweep: the passive UART level shifter (10k pull-ups, Q402/Q403) limits
+ * rise time, so the usable rate is a hardware property worth measuring per
+ * board. Escalates until a rate fails, then always restores 115200 so the
+ * AT-based shutdown still works. A rate only counts as good after 10/10 clean
+ * AT round-trips plus one multi-line ATI response. */
+static void test_modem_baud_sweep(char *resp, size_t resp_sz)
+{
+    static const uint32_t rates[] = { 230400, 460800, 921600 };
+    uint32_t good = MODEM_BAUD;   /* fastest rate proven reliable */
+    uint32_t cur  = MODEM_BAUD;   /* rate the modem is actually on right now */
+    char cmd[32];
+
+    for (size_t r = 0; r < sizeof(rates) / sizeof(rates[0]); r++) {
+        uint32_t rate = rates[r];
+        snprintf(cmd, sizeof(cmd), "AT+IPR=%lu", (unsigned long)rate);
+        if (!modem_send_at_expect_ok(cmd, resp, resp_sz, 2000)) {
+            TEST_INFO("Baud sweep", "%lu: AT+IPR rejected - stopping", (unsigned long)rate);
+            break;
+        }
+        modem.updateBaudRate(rate);
+        cur = rate;
+        delay(100);
+        while (modem.available()) modem.read();
+        /* Warm-up exchange: the first AT after an IPR switch reliably drops
+         * (measured on hardware); discard it so the score reflects steady state. */
+        modem_send_at_expect_ok("AT", resp, resp_sz, 300);
+
+        int ok = 0;
+        char failed_at[24] = "";
+        for (int i = 0; i < 10; i++) {
+            if (modem_send_at_expect_ok("AT", resp, resp_sz, 300)) {
+                ok++;
+            } else {
+                size_t len = strlen(failed_at);
+                snprintf(failed_at + len, sizeof(failed_at) - len, "%s#%d",
+                         len ? "," : "", i + 1);
+            }
+        }
+        bool ati_ok = modem_send_at_expect_ok("ATI", resp, resp_sz, 1000);
+
+        if (ok == 10 && ati_ok) {
+            TEST_PASS("Baud sweep", "%lu: 10/10 AT + ATI clean", (unsigned long)rate);
+            good = rate;
+        } else {
+            TEST_INFO("Baud sweep", "%lu: %d/10 AT (dropped %s), ATI %s - unreliable, stopping",
+                      (unsigned long)rate, ok, failed_at[0] ? failed_at : "none",
+                      ati_ok ? "ok" : "failed");
+            break;
+        }
+    }
+
+    /* Restore 115200. The modem may be stranded on an unreliable rate; the
+     * ESP->modem direction often still gets a short command through, so send
+     * AT+IPR=115200 at the modem's current rate and retry a few times. */
+    bool back = false;
+    for (int attempt = 0; attempt < 3 && !back; attempt++) {
+        modem_send_at_expect_ok("AT+IPR=115200", resp, resp_sz, 500);
+        modem.updateBaudRate(115200);
+        delay(100);
+        while (modem.available()) modem.read();
+        back = modem_send_at_expect_ok("AT", resp, resp_sz, 500);
+        if (!back) {
+            modem.updateBaudRate(cur);
+            delay(50);
+        }
+    }
+    if (back) {
+        TEST_PASS("Baud restore", "back at 115200; fastest reliable = %lu",
+                  (unsigned long)good);
+    } else {
+        TEST_FAIL("Baud restore", "modem not answering at 115200 - PWRKEY fallback will handle shutdown");
+    }
+}
+
 /* ===================== Modem test ===================== */
 static void test_modem(void)
 {
@@ -725,6 +864,10 @@ static void test_modem(void)
                 }
             }
         }
+
+        bq_ilim_probe("modem+wifi on");
+
+        test_modem_baud_sweep(resp, sizeof(resp));
 
         bool cpof_ok = modem_send_at_expect_ok("AT+CPOF", resp, sizeof(resp), 2000);
         TEST_INFO("AT+CPOF",   "%s", cpof_ok ? "OK" : "no OK / timeout");

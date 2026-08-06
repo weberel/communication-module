@@ -22,7 +22,7 @@ validated in the two projects this repo is built from:
 | Deep sleep + timed wake, RTC-RAM persistence | ✅ | bms_stove |
 | GPIO14 external sensor power switch | ✅ | confirmed on hardware |
 | LTR-303 light + SC7A20 accelerometer read | ✅ | functionality_test |
-| GD25Q256 external flash (JEDEC / read-write) | ✅ | functionality_test |
+| GD25Q128 external flash (JEDEC / read-write) | ✅ | functionality_test |
 | ATECC608B secure element presence/wake | ✅ | functionality_test |
 
 The **hardware and every technique above are known good.** The board works.
@@ -42,8 +42,10 @@ environments but have **not been exercised on a board**.
 | GPS (`ModemA7672::gps*`) | ❌ stub | Not implemented; GPS antenna path unvalidated on this board. |
 
 `functionality_test` in this repo is a near-verbatim copy of the proven
-`functionality_test_arduino` (only hardcoded credentials were moved to `secrets.h`),
-so it is effectively already validated.
+`functionality_test_arduino` (hardcoded credentials were moved to `secrets.h`, and
+the charge "nudge" was fixed to drive EN_ACDRV1 at REG13[6] -- the old copy wrote
+the mislabelled REG12[3]/WKUP_DLY and gated on presence bits that stay 0 while
+ACFET1 is off, so it never actually opened the USB input gate).
 
 ## Bottom line
 

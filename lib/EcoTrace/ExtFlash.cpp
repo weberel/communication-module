@@ -1,6 +1,6 @@
 #include "ExtFlash.h"
 
-/* GD25Q256 command set (3-byte addressing) */
+/* GD25Q128 command set (3-byte addressing) */
 #define FCMD_WREN  0x06
 #define FCMD_RDSR  0x05
 #define FCMD_READ  0x03

@@ -54,6 +54,37 @@ Not a defect, just worth knowing: `GPIO14` drives a populated high-side switch
 SC7A20 + LTR-303 are wired directly to 3V3, **not** this rail, so cutting GPIO14 in
 sleep does not power them down -- put those in low-power mode over I2C instead.
 
+## 🔴 7. USB-C CC pins are floating - no VBUS (no charging) from C-to-C cables
+
+`J201` (USB-C) has **CC1 and CC2 unconnected** in the schematic - there are no 5.1 k
+Rd pulldowns. A spec-compliant USB-C source (laptop port, C-to-C cable, PD charger)
+therefore never detects a sink and **never enables VBUS**: flashing and serial still
+work (USB 2.0 data lines are hardwired and the ESP runs from the battery), but 0 V
+reaches the charger. With a **USB-A to C cable** this erratum does not apply (A ports
+supply 5 V unconditionally).
+
+**Action:** for a respin, add 5.1 k from CC1 to GND and 5.1 k from CC2 to GND at
+J201. Until then, charge via an A-to-C cable or VIN/solar.
+
+**Debugging gotcha (resolved 2026-08-06, keep in mind):** if USB charging doesn't
+start, don't trust a ~2.5 V reading on the `VUSB` net - that is a **phantom
+voltage**, not a sagging 5 V rail. The ESP's D+ idles at 3.3 V and leaks through
+the D212 (USBLC6) internal diode onto the VBUS net (3.3 V - 0.7 V, present even
+with the cable unplugged). Since 2.6 V is below the BQ's ~3.6 V adapter-present
+threshold, `AC1_PRESENT` stays 0 and the charger auto-clears `EN_ACDRV1`. On the
+first Rev A unit the actual cause was a **cable with a broken VBUS wire** - the one
+cable fault that is invisible on a self-powered board, because USB data (flashing,
+serial) keeps working. With a good A-to-C cable the full path was verified: VAC1
+~5.0 V, AC1_PRESENT=1, EN_ACDRV1 latches, fast-charge (CC) at the 500 mA SDP limit.
+The self-test prints VAC1/VAC2 for exactly this diagnosis.
+
+## 🟡 8. SPI flash is a GD25Q128 (16 MB), not the GD25Q256 on the schematic
+
+The schematic symbol says GD25Q256 (32 MB), but the part populated on Rev A boards
+reads JEDEC `C8 40 18` = **GD25Q128, 16 MB** (confirmed by the self-test). The
+`ExtFlash` driver uses 3-byte addressing, which covers the whole 16 MB chip, so
+nothing breaks -- just don't plan around 32 MB of storage.
+
 ---
 
 ### Notes on the old test firmware

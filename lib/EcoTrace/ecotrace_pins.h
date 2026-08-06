@@ -21,19 +21,23 @@
 #define ECO_PIN_I2C_SCL        7
 #define ECO_I2C_FREQ_HZ        100000
 
-/* ---- SPI (external GD25Q256 NOR flash + one spare CS) ----------------------- */
+/* ---- SPI (external GD25Q128 NOR flash + one spare CS) ----------------------- */
 #define ECO_PIN_SPI_MOSI       4     /* SI  */
 #define ECO_PIN_SPI_MISO       5     /* SO  */
 #define ECO_PIN_SPI_CLK        18
-#define ECO_PIN_SPI_CS_FLASH   8     /* GD25Q256; strapping pin, idles HIGH via 10k */
+#define ECO_PIN_SPI_CS_FLASH   8     /* GD25Q128; strapping pin, idles HIGH via 10k */
 #define ECO_PIN_SPI_CS_PERIPH  9     /* NOT POPULATED; strapping + BOOT pad, idles HIGH */
 
 /* ---- A7672E LTE modem (UART1) ----------------------------------------------- */
 #define ECO_PIN_MODEM_TX       20    /* ESP TX  -> modem RX */
 #define ECO_PIN_MODEM_RX       21    /* ESP RX  <- modem TX */
-#define ECO_PIN_MODEM_PWRKEY   22    /* push-pull, idle HIGH; LOW 0.5-1s = on, >=3s = off */
+#define ECO_PIN_MODEM_PWRKEY   22    /* via Q409 low-side inverter: GPIO HIGH = PWRKEY
+                                      * asserted (LOW at modem). Idle-HIGH firmware holds
+                                      * PWRKEY asserted -> modem auto-boots on rail rise */
 #define ECO_PIN_MODEM_PWR_EN   23    /* drives NPN -> P-MOSFET; HIGH = modem rail on */
-#define ECO_PIN_MODEM_STATUS   0     /* modem STATUS out; HIGH = powered. NOTE: strapping pin */
+#define ECO_PIN_MODEM_STATUS   0     /* modem STATUS out; only valid while modem rail on
+                                      * (floats HIGH via pull-up when rail off - use the
+                                      * LOW->HIGH edge, not the level). NOTE: strapping pin */
 #define ECO_MODEM_BAUD         115200
 
 /* ---- Wake / interrupt inputs (all have external pull-ups, idle HIGH) -------- */

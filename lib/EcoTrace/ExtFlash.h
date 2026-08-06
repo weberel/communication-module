@@ -1,11 +1,10 @@
 /*
- * ExtFlash.h  --  driver for the on-board GD25Q256 SPI NOR flash (32 MB, CS = GPIO8).
+ * ExtFlash.h  --  driver for the on-board GD25Q128 SPI NOR flash (16 MB, CS = GPIO8).
  * Survives power loss (unlike RTC RAM), so it is the place for a remote logger's
  * store-and-forward buffer or config.
  *
- * NOTE: this uses 3-byte addressing, which reaches the low 16 MB only. The GD25Q256
- * is 32 MB; to use the upper half you need 4-byte addressing (or the extended address
- * register). The low 16 MB is plenty for logging state; extend if you need more.
+ * NOTE: the schematic symbol is labelled GD25Q256, but the populated part reads
+ * JEDEC C8 40 18 = GD25Q128 (16 MB). 3-byte addressing covers the whole chip.
  *
  * NOR is erase-before-write: a sector (4 KB) must be erased before programming, and
  * you can only program within a 256-byte page per writePage() call.

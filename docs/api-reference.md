@@ -101,10 +101,10 @@ wrapped below.
 | `powerDown()` | low-power |
 | `address()` | detected I2C address |
 
-## ExtFlash - GD25Q256 NOR flash (`ExtFlash.h`)
+## ExtFlash - GD25Q128 NOR flash (`ExtFlash.h`)
 
-Persists across power loss. Erase-before-write; page = 256 B, sector = 4 KB. Low
-16 MB via 3-byte addressing (extend for the upper half).
+Persists across power loss. Erase-before-write; page = 256 B, sector = 4 KB. The
+full 16 MB is reachable via 3-byte addressing.
 
 | Function | Does |
 |----------|------|

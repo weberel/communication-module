@@ -193,6 +193,7 @@ void setup()
         bq.enableADC();
         bq.enableIbatSensing();
         bq.configureCharging(CHARGE_CURRENT_MA, INPUT_LIMIT_MA, CHARGE_VOLTAGE_MV);
+        bq.enableACDRV1(true);   /* USB input sits behind ACFET1, which is off at POR */
 #if MPPT_ENABLE
         bq.enableACDRV2(true);
         bq.setVINDPM_mV(s_vindpm_mv);
