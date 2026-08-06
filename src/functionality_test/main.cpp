@@ -22,8 +22,17 @@
 
 #define PIN_SPI_MOSI         4
 #define PIN_SPI_MISO         5
+/* Overridable for per-unit rework: unit 8C:FD:49:05:CA:AC has open ESP-module
+ * lands on IO8 (flash CS) and IO18 (SCLK) and runs with a 2-wire bypass -
+ * build it with: -DPIN_SPI_CS_FLASH=1 -DPIN_SPI_CLK=9
+ * (CS via a TP410 wire to U602 pin 1; clock via a header jumper CS<->SCLK,
+ * which suspends the CS2 test since GPIO9 is borrowed as clock.) */
+#ifndef PIN_SPI_CLK
 #define PIN_SPI_CLK          18
+#endif
+#ifndef PIN_SPI_CS_FLASH
 #define PIN_SPI_CS_FLASH     8
+#endif
 #define PIN_SPI_CS_PERIPH    9
 
 #define PIN_MODEM_TX         20    /* ESP TX -> modem RX */
@@ -509,8 +518,10 @@ static void spi_init(void)
     spi.begin(PIN_SPI_CLK, PIN_SPI_MISO, PIN_SPI_MOSI, PIN_SPI_CS_FLASH);
     pinMode(PIN_SPI_CS_FLASH, OUTPUT);
     digitalWrite(PIN_SPI_CS_FLASH, HIGH);
-    pinMode(PIN_SPI_CS_PERIPH, OUTPUT);
-    digitalWrite(PIN_SPI_CS_PERIPH, HIGH);
+    if (PIN_SPI_CS_PERIPH != PIN_SPI_CLK) {
+        pinMode(PIN_SPI_CS_PERIPH, OUTPUT);
+        digitalWrite(PIN_SPI_CS_PERIPH, HIGH);
+    }
     TEST_PASS("SPI init", "SPI on MOSI=%d MISO=%d CLK=%d @ %d Hz",
               PIN_SPI_MOSI, PIN_SPI_MISO, PIN_SPI_CLK, SPI_FREQ_HZ);
 }
@@ -518,6 +529,16 @@ static void spi_init(void)
 static void test_gd25q_flash(void)
 {
     uint8_t mfg, type, cap;
+    /* Release from deep power-down first (0xAB): a chip left in DPD by previous
+     * firmware ignores every other command - and DPD survives resets for as long
+     * as the always-on 3V3 rail is up, i.e. until the battery comes off. */
+    spi.beginTransaction(SPISettings(SPI_FREQ_HZ, MSBFIRST, SPI_MODE0));
+    digitalWrite(PIN_SPI_CS_FLASH, LOW);
+    spi.transfer(0xAB);
+    digitalWrite(PIN_SPI_CS_FLASH, HIGH);
+    spi.endTransaction();
+    delayMicroseconds(50);   /* tRES1: chip needs ~20-30 us to wake */
+
     spi.beginTransaction(SPISettings(SPI_FREQ_HZ, MSBFIRST, SPI_MODE0));
     digitalWrite(PIN_SPI_CS_FLASH, LOW);
     spi.transfer(0x9F);
@@ -530,6 +551,175 @@ static void test_gd25q_flash(void)
     if (mfg == 0xFF || mfg == 0x00) {
         TEST_FAIL("SPI flash", "JEDEC=0x%02X 0x%02X 0x%02X - bus floating? check MISO/CS/power",
                   mfg, type, cap);
+        /* Localize the fault: with CS high (chip must not drive SO), fight the
+         * line with the ESP's weak pulls. A healthy released line follows the
+         * pull both ways; a solder bridge to 3V3 (SO pin 2 is next to WP#
+         * pin 3, which is tied to 3V3) wins against the pulldown. */
+        pinMode(PIN_SPI_MISO, INPUT_PULLDOWN);
+        delay(2);
+        int with_pd = digitalRead(PIN_SPI_MISO);
+        pinMode(PIN_SPI_MISO, INPUT_PULLUP);
+        delay(2);
+        int with_pu = digitalRead(PIN_SPI_MISO);
+        if (with_pd == HIGH)
+            TEST_INFO("SPI MISO diag", "line HIGH even against pulldown - hard short to 3V3 (SO-WP# bridge at U602 pins 2-3?)");
+        else if (with_pu == LOW)
+            TEST_INFO("SPI MISO diag", "line LOW even against pullup - hard short to GND (SO-GND bridge at U602 pins 2->4 side?)");
+        else
+            TEST_INFO("SPI MISO diag", "line follows pulls (floating) - SO open joint, or chip not selected/powered (check CS pin 1, VCC pin 8)");
+        /* pinMode() above detached MISO from the SPI matrix, and SPIClass::begin()
+         * early-returns when already initialized - a bare begin() leaves the
+         * peripheral reading a disconnected pin (always 0). Full end+begin. */
+        spi.end();
+        spi.begin(PIN_SPI_CLK, PIN_SPI_MISO, PIN_SPI_MOSI, PIN_SPI_CS_FLASH);
+        pinMode(PIN_SPI_CS_FLASH, OUTPUT);
+        digitalWrite(PIN_SPI_CS_FLASH, HIGH);
+        /* ESP-side self-check: with CS held HIGH (chip deselected), clock a
+         * pattern out MOSI and read MISO. With a jumper across the SPI header's
+         * SI and SO pins, the pattern echoes back - proving this unit's ESP
+         * drivers and the PCB traces end-to-end. Without a jumper this prints
+         * the floating-line noise, which is also informative. */
+        uint8_t echo[4];
+        const uint8_t pat[4] = { 0xA5, 0x5A, 0x0F, 0xF0 };
+        spi.beginTransaction(SPISettings(SPI_FREQ_HZ, MSBFIRST, SPI_MODE0));
+        for (int i = 0; i < 4; i++) echo[i] = spi.transfer(pat[i]);
+        spi.endTransaction();
+        bool match = memcmp(echo, pat, 4) == 0;
+        TEST_INFO("SPI echo diag", "sent A5 5A 0F F0, got %02X %02X %02X %02X -> %s",
+                  echo[0], echo[1], echo[2], echo[3],
+                  match ? "ECHO OK: MOSI+MISO drivers and traces proven"
+                        : "no echo (expected without an SI-SO jumper at the SPI header)");
+
+        /* Line-follow checks for the two signals the echo can't see: with the
+         * jumper moved to CS-SO (or SCLK-SO), MISO must mirror that line as we
+         * toggle it. digitalRead works on MISO even while SPI-attached - the
+         * GPIO input register always reflects the pad. */
+        /* NOTE: the SPI header's CS pin is CS_periferal (GPIO9), NOT the flash
+         * CS (GPIO8) - the flash CS net has no header access. So the jumper
+         * test exercises GPIO9; the flash CS gets a slow meter-probe toggle
+         * below instead. */
+        static const int lv[4] = { HIGH, LOW, HIGH, LOW };
+        bool cs_follow = true;
+        for (int i = 0; i < 4; i++) {
+            digitalWrite(PIN_SPI_CS_PERIPH, lv[i]);
+            delayMicroseconds(100);
+            if (digitalRead(PIN_SPI_MISO) != lv[i]) cs_follow = false;
+        }
+        digitalWrite(PIN_SPI_CS_PERIPH, HIGH);
+
+        pinMode(PIN_SPI_CLK, OUTPUT);           /* detaches SCLK from SPI; restored below */
+        bool clk_follow = true;
+        for (int i = 0; i < 4; i++) {
+            digitalWrite(PIN_SPI_CLK, lv[i]);
+            delayMicroseconds(100);
+            if (digitalRead(PIN_SPI_MISO) != lv[i]) clk_follow = false;
+        }
+        spi.end();
+        spi.begin(PIN_SPI_CLK, PIN_SPI_MISO, PIN_SPI_MOSI, PIN_SPI_CS_FLASH);
+        pinMode(PIN_SPI_CS_FLASH, OUTPUT);
+        digitalWrite(PIN_SPI_CS_FLASH, HIGH);
+
+        TEST_INFO("SPI CS diag",   "MISO %s CS_periph/GPIO9 toggles (header CS-SO jumper; header CS is NOT flash CS)",
+                  cs_follow ? "FOLLOWS" : "does not follow");
+        TEST_INFO("SPI SCLK diag", "MISO %s SCLK toggles (SCLK-SO jumper -> follow = SCLK driver+trace OK)",
+                  clk_follow ? "FOLLOWS" : "does not follow");
+
+        /* Flash CS (GPIO8) has no header pin, so check it meterlessly by reading
+         * back its own pad. (a) Attachment: with the internal ~45k pulldown, an
+         * attached pad loses the divider against R655's 10k pullup and reads
+         * HIGH; a pad orphaned by an open module joint reads LOW. (b) Drive:
+         * output LOW must win against the pullup. */
+        pinMode(PIN_SPI_CS_FLASH, INPUT_PULLDOWN);
+        delay(2);
+        bool cs_attached = digitalRead(PIN_SPI_CS_FLASH) == HIGH;
+        pinMode(PIN_SPI_CS_FLASH, OUTPUT);
+        digitalWrite(PIN_SPI_CS_FLASH, LOW);
+        delayMicroseconds(50);
+        bool cs_sinks = digitalRead(PIN_SPI_CS_FLASH) == LOW;
+        digitalWrite(PIN_SPI_CS_FLASH, HIGH);
+        TEST_INFO("Flash CS diag", "pad %s the CS net (R655 pullup %s vs internal pulldown), driver %s sink LOW",
+                  cs_attached ? "ATTACHED to" : "DETACHED from",
+                  cs_attached ? "visible" : "not visible",
+                  cs_sinks ? "CAN" : "CANNOT");
+
+        /* Same sniff for CS_periph (GPIO9, external 10k R699): IO8/IO9/IO18 are
+         * consecutive MINI-1 castellations (pins 22/23/24), so a second detached
+         * pad points at a cracked joint strip on that module edge. */
+        pinMode(PIN_SPI_CS_PERIPH, INPUT_PULLDOWN);
+        delay(2);
+        bool cs2_attached = digitalRead(PIN_SPI_CS_PERIPH) == HIGH;
+        pinMode(PIN_SPI_CS_PERIPH, OUTPUT);
+        digitalWrite(PIN_SPI_CS_PERIPH, HIGH);
+        TEST_INFO("CS2 pad diag", "GPIO9 pad %s its net (R699 pullup %s)",
+                  cs2_attached ? "ATTACHED to" : "DETACHED from",
+                  cs2_attached ? "visible" : "not visible");
+
+        /* Reverse SCLK check: with a jumper across the header's SI and SCLK
+         * pins, GPIO18's pad should mirror MOSI toggles - tests the SCLK pad's
+         * board connection using the already-proven MOSI as stimulus. */
+        pinMode(PIN_SPI_MOSI, OUTPUT);          /* detaches MOSI from SPI; restored below */
+        bool sclk_pad_follow = true;
+        for (int i = 0; i < 4; i++) {
+            digitalWrite(PIN_SPI_MOSI, lv[i]);
+            delayMicroseconds(100);
+            if (digitalRead(PIN_SPI_CLK) != lv[i]) sclk_pad_follow = false;
+        }
+        spi.end();
+        spi.begin(PIN_SPI_CLK, PIN_SPI_MISO, PIN_SPI_MOSI, PIN_SPI_CS_FLASH);
+        pinMode(PIN_SPI_CS_FLASH, OUTPUT);
+        digitalWrite(PIN_SPI_CS_FLASH, HIGH);
+        TEST_INFO("SCLK pad diag", "GPIO18 pad %s MOSI toggles (SI-SCLK jumper -> follow = SCLK pad attached)",
+                  sclk_pad_follow ? "FOLLOWS" : "does not follow");
+
+        /* Flash-CS net witness: with a wire from R655's chip-side pad to the
+         * header's SO pin, MISO shows what the board-side CS net really does
+         * while GPIO8 toggles. Follow = ESP drive reaches the net (module
+         * joint OK); steady HIGH = net only sees its pullup, joint open. */
+        TEST_INFO("FlashCS follow", "hold wire U602 pin 1 <-> header SO now; sampling starts in 3 s, runs 4 s");
+        delay(3000);
+        int csf_match = 0, csf_hi = 0, csf_n = 16;
+        for (int i = 0; i < csf_n; i++) {
+            int want = (i & 1) ? LOW : HIGH;
+            digitalWrite(PIN_SPI_CS_FLASH, want);
+            delay(250);
+            int rd = digitalRead(PIN_SPI_MISO);
+            if (rd == want) csf_match++;
+            if (rd == HIGH) csf_hi++;
+        }
+        digitalWrite(PIN_SPI_CS_FLASH, HIGH);
+        TEST_INFO("FlashCS follow", "%d/%d samples follow GPIO8, %d/%d read HIGH -> %s",
+                  csf_match, csf_n, csf_hi, csf_n,
+                  (csf_match >= 14) ? "DRIVE REACHES NET - module joint OK, rethink"
+                : (csf_hi >= 14)    ? "steady HIGH: net at pullup only - JOINT OPEN confirmed"
+                : (csf_hi <= 2)     ? "steady LOW: wire touching GND (shield?) - reposition and rerun"
+                                    : "mixed: unstable contact - rerun");
+
+        /* Open-pad vs net-clamped-low discriminator: against only the internal
+         * ~45k pullup, an OPEN pad floats HIGH; a net held down by a shorted
+         * input structure in a dead chip stays LOW. */
+        pinMode(PIN_SPI_CS_FLASH, INPUT_PULLUP);
+        delay(2);
+        int cs_pu = digitalRead(PIN_SPI_CS_FLASH);
+        pinMode(PIN_SPI_CS_FLASH, OUTPUT);
+        digitalWrite(PIN_SPI_CS_FLASH, HIGH);
+        pinMode(PIN_SPI_CLK, INPUT_PULLUP);
+        delay(2);
+        int clk_pu = digitalRead(PIN_SPI_CLK);
+        pinMode(PIN_SPI_CLK, INPUT_PULLDOWN);
+        delay(2);
+        int clk_pd = digitalRead(PIN_SPI_CLK);
+        spi.end();
+        spi.begin(PIN_SPI_CLK, PIN_SPI_MISO, PIN_SPI_MOSI, PIN_SPI_CS_FLASH);
+        pinMode(PIN_SPI_CS_FLASH, OUTPUT);
+        digitalWrite(PIN_SPI_CS_FLASH, HIGH);
+        TEST_INFO("CS clamp diag",   "GPIO8 vs internal pullup reads %s -> %s",
+                  cs_pu ? "HIGH" : "LOW",
+                  cs_pu ? "pad OPEN at module joint (floats on own pullup)"
+                        : "net CLAMPED LOW - dead chip shorting CS, replace U602");
+        TEST_INFO("SCLK clamp diag", "GPIO18 pullup->%s pulldown->%s -> %s",
+                  clk_pu ? "HIGH" : "LOW", clk_pd ? "HIGH" : "LOW",
+                  (!clk_pu) ? "net CLAMPED LOW - dead chip shorting SCLK, replace U602"
+                            : (clk_pd ? "stuck HIGH?" : "follows pulls (open pad or healthy hi-Z net)"));
         return;
     }
     if (mfg != 0xC8) {
@@ -544,6 +734,10 @@ static void test_gd25q_flash(void)
 
 static void test_cs2_empty(void)
 {
+    if (PIN_SPI_CS_PERIPH == PIN_SPI_CLK) {
+        TEST_SKIP("SPI CS2", "GPIO9 borrowed as SCLK (bench bypass)");
+        return;
+    }
     digitalWrite(PIN_SPI_CS_PERIPH, HIGH); delay(1);
     digitalWrite(PIN_SPI_CS_PERIPH, LOW);  delay(1);
     digitalWrite(PIN_SPI_CS_PERIPH, HIGH);
@@ -631,7 +825,7 @@ static bool modem_wait_for(const char *needle, char *resp, size_t resp_sz, int t
  * AT round-trips plus one multi-line ATI response. */
 static void test_modem_baud_sweep(char *resp, size_t resp_sz)
 {
-    static const uint32_t rates[] = { 230400, 460800, 921600 };
+    static const uint32_t rates[] = { 230400, 460800, 921600, 1843200, 3686400 };
     uint32_t good = MODEM_BAUD;   /* fastest rate proven reliable */
     uint32_t cur  = MODEM_BAUD;   /* rate the modem is actually on right now */
     char cmd[32];
