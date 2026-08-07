@@ -23,3 +23,9 @@
 /* Optional: password for WiFi OTA pushes (ArduinoOTA). If set, add
  * `upload_flags = --auth=<password>` to the datalogger_ota env. */
 // #define OTA_PASSWORD "change-me"
+
+/* Optional: a dedicated AP for OTA mode (defaults to WIFI_SSID/WIFI_PASS).
+ * Useful when the site WLAN isolates clients so espota can't reach the board --
+ * e.g. point this at your PC's mobile hotspot for bench flashing. */
+// #define OTA_WIFI_SSID "my-pc-hotspot"
+// #define OTA_WIFI_PASS "hotspot-password"

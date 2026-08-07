@@ -14,7 +14,9 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define REC_MAGIC 0x45434C31u   /* "ECL1" */
+#define REC_MAGIC 0x45434C32u   /* "ECL2" -- bumped when the layout changed
+                                 * (v2: +MS5837 pressure/temperature); records
+                                 * with the old magic are simply not recognised */
 
 /* flags bits */
 #define RECF_SOLAR    0x01   /* solar input present (VAC2) */
@@ -45,7 +47,9 @@ typedef struct __attribute__((packed)) {
     uint16_t light_ch0;    /* LTR-303 visible+IR */
     uint16_t light_ch1;    /* LTR-303 IR */
     int16_t  acc_mg[3];    /* SC7A20 X/Y/Z */
-    uint8_t  rsvd[12];     /* spare for future fields (0xFF) */
+    uint16_t press_dmbar;  /* MS5837 pressure, 0.1 mbar units (0 = no sensor) */
+    int16_t  temp_cC;      /* MS5837 temperature, 0.01 C units */
+    uint8_t  rsvd[8];      /* spare for future fields (0xFF) */
     uint16_t crc;          /* CRC16-CCITT over bytes [0 .. offsetof(crc)-1] */
 } LogRecord;
 

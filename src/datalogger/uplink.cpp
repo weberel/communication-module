@@ -44,7 +44,8 @@ static int recordValues(const LogRecord& r, char* out, size_t cap)
         "\"fault0\":%u,\"fault1\":%u,\"harvest_mah\":%u,"
         "\"solar\":%u,\"usb\":%u,\"weather_good\":%u,\"eco_chg\":%u,"
         "\"light_ch0\":%u,\"light_ch1\":%u,"
-        "\"acc_x_mg\":%d,\"acc_y_mg\":%d,\"acc_z_mg\":%d",
+        "\"acc_x_mg\":%d,\"acc_y_mg\":%d,\"acc_z_mg\":%d,"
+        "\"press_mbar\":%.1f,\"temp_c\":%.2f",
         r.vbat_mv, r.ibat_ma, (long)bat_mw, r.soc_pct,
         r.vbus_mv, r.ibus_ma, r.vac2_mv, r.vsys_mv,
         r.vindpm_mv, r.vreg_mv, r.chg_stat,
@@ -52,7 +53,8 @@ static int recordValues(const LogRecord& r, char* out, size_t cap)
         (r.flags & RECF_SOLAR) ? 1 : 0, (r.flags & RECF_USB) ? 1 : 0,
         (r.flags & RECF_WEATHER) ? 1 : 0, (r.flags & RECF_ECO_CHG) ? 1 : 0,
         r.light_ch0, r.light_ch1,
-        r.acc_mg[0], r.acc_mg[1], r.acc_mg[2]);
+        r.acc_mg[0], r.acc_mg[1], r.acc_mg[2],
+        r.press_dmbar / 10.0f, r.temp_cC / 100.0f);
 }
 
 /* Batch of n pending records -> ThingsBoard array. Returns records included
@@ -131,16 +133,20 @@ static bool wifiPost(const char* json)
     return code >= 200 && code < 300;
 }
 
+static int s_wifi_rssi;   /* captured on connect for the status record */
+
 static bool wifiUp()
 {
     Serial.println("uplink: wifi backup...");
     esp_task_wdt_reset();
     WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);   /* full throughput for the short upload burst */
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     uint32_t t0 = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) delay(250);
     if (WiFi.status() != WL_CONNECTED) { Serial.println("  no wifi"); return false; }
-    Serial.printf("  connected, %d dBm\n", WiFi.RSSI());
+    s_wifi_rssi = WiFi.RSSI();
+    Serial.printf("  connected, %d dBm\n", s_wifi_rssi);
 
     /* Always re-sync, not just on first boot -- see cellUp(). SNTP updates the
      * system clock in the background once it gets an answer. */
@@ -199,16 +205,21 @@ static const char* resetReasonName(uint8_t r)
 static void sendStatus(bool (*post)(const char*), const Result& r, FlashLog& log,
                        const StatusInfo& si)
 {
-    char values[512];
+    const char* transport = (r.sent_cell && r.sent_wifi) ? "cell+wifi" :
+                            r.sent_cell ? "cell" : r.sent_wifi ? "wifi" : "none";
+    char values[560];
     snprintf(values, sizeof(values),
-             "\"rssi_dbm\":%d,\"via_wifi\":%u,\"backlog\":%lu,"
+             "\"rssi_dbm\":%d,\"wifi_rssi_dbm\":%d,\"transport\":\"%s\","
+             "\"sent_cell\":%lu,\"sent_wifi\":%lu,\"via_wifi\":%u,\"backlog\":%lu,"
              "\"boot_id\":%u,\"reset_reason\":\"%s\","
              "\"boot_count\":%u,\"wake_count\":%u,"
              "\"crash_count\":%u,\"wdt_trips\":%u,\"upload_fails\":%u,"
              "\"vbat_min_mv\":%u,\"vbat_max_mv\":%u,"
              "\"awake_ms\":%lu,\"uptime_s\":%lu,"
-             "\"heap_min_free\":%lu,\"fw\":\"datalogger-2\"",
-             r.rssi_dbm, r.used_wifi ? 1 : 0, (unsigned long)log.pendingCount(),
+             "\"heap_min_free\":%lu,\"fw\":\"" FW_VERSION "\"",
+             r.rssi_dbm, r.wifi_rssi_dbm, transport,
+             (unsigned long)r.sent_cell, (unsigned long)r.sent_wifi,
+             r.used_wifi ? 1 : 0, (unsigned long)log.pendingCount(),
              si.boot_id, resetReasonName(si.reset_reason),
              si.boot_count, si.wake_count,
              si.crash_count, si.wdt_trips, si.upload_fails,
@@ -225,27 +236,35 @@ static void sendStatus(bool (*post)(const char*), const Result& r, FlashLog& log
     post(s_json);
 }
 
-Result uploadAll(FlashLog& log, uint32_t interval_s, const StatusInfo& info)
+Result uploadAll(FlashLog& log, uint32_t interval_s, const StatusInfo& info,
+                 bool skip_cellular)
 {
     Result r = {};
 
-    /* 1. Cellular (primary). */
-    bool cell_ok = cellUp(r.rssi_dbm);
-    if (cell_ok) {
-        uint32_t sent = drain(log, interval_s, cellPost);
-        r.sent += sent;
-        if (sent) r.any_success = true;
-        if (log.pendingCount() == 0) sendStatus(cellPost, r, log, info);
+    /* 1. Cellular (primary), unless it just crashed the board. */
+    if (skip_cellular) {
+        Serial.println("uplink: skipping cellular (last attempt crashed) -- wifi only");
+    } else {
+        bool cell_ok = cellUp(r.rssi_dbm);
+        if (cell_ok) {
+            uint32_t sent = drain(log, interval_s, cellPost);
+            r.sent      += sent;
+            r.sent_cell += sent;
+            if (sent) r.any_success = true;
+            if (log.pendingCount() == 0) sendStatus(cellPost, r, log, info);
+        }
+        s_modem.powerOff();
     }
-    s_modem.powerOff();
 
     /* 2. WiFi backup for whatever cellular didn't deliver. */
 #if UPLINK_HAS_WIFI
     if (log.pendingCount() > 0) {
         if (wifiUp()) {
-            r.used_wifi = true;
+            r.used_wifi     = true;
+            r.wifi_rssi_dbm = s_wifi_rssi;
             uint32_t sent = drain(log, interval_s, wifiPost);
-            r.sent += sent;
+            r.sent      += sent;
+            r.sent_wifi += sent;
             if (sent) r.any_success = true;
             if (log.pendingCount() == 0) sendStatus(wifiPost, r, log, info);
         }

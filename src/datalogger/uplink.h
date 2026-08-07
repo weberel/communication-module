@@ -25,7 +25,10 @@ struct Result {
     bool     all_sent;       /* backlog fully drained */
     bool     used_wifi;
     uint32_t sent;
-    int      rssi_dbm;       /* cellular RSSI if the modem came up, else 0 */
+    uint32_t sent_cell;      /* records delivered over cellular */
+    uint32_t sent_wifi;      /* records delivered over the WiFi backup */
+    int      rssi_dbm;       /* cellular RSSI if the modem attached, else 0 */
+    int      wifi_rssi_dbm;  /* WiFi RSSI if the backup was used, else 0 */
 };
 
 /* Device-health telemetry sent as one extra record with every upload. This is
@@ -45,6 +48,10 @@ struct StatusInfo {
     uint32_t uptime_s;
 };
 
-Result uploadAll(FlashLog& log, uint32_t interval_s, const StatusInfo& info);
+/* skip_cellular: set when a previous upload attempt crashed the board (modem
+ * hang or a brownout during the registration burst) -- go straight to WiFi so
+ * one flaky path can't take the whole uplink down. */
+Result uploadAll(FlashLog& log, uint32_t interval_s, const StatusInfo& info,
+                 bool skip_cellular = false);
 
 }  // namespace Uplink

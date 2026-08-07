@@ -49,8 +49,8 @@ renders, and JLCPCB fab files are in [`hardware/`](hardware/).
 
 **1. The datalogger** (`src/datalogger/`) - the main application. Every 5-minute
 wake it:
-- reads the full battery + charger state (BQ25792) and the on-board I2C sensors
-  (LTR-303 light, SC7A20 accel),
+- reads the full battery + charger state (BQ25792) and the I2C sensors
+  (LTR-303 light, SC7A20 accel, MS5837 pressure + temperature on the hat header),
 - runs a solar-management pass: **MPPT** (fractional-Voc + perturb-&-observe on
   VINDPM) to maximise input power, per-day **harvest accounting**, and a
   **weather-adaptive charge target** - good weather caps charging at ~80 % SoC to
@@ -110,8 +110,11 @@ cp lib/EcoTrace/secrets.example.h lib/EcoTrace/secrets.h   # then edit it
 pio run -e datalogger -t upload && pio device monitor
 
 # 5. reflash over WiFi later (bench convenience): press the QON button 3x
-#    (board joins WiFi and blinks once per second), then:
-pio run -e datalogger_ota -t upload
+#    (board joins WiFi, blinks once per second, prints its IP on serial), then:
+pio run -e datalogger        # build the new image
+curl -F "image=@.pio/build/datalogger/firmware.bin" http://<board-ip>/update
+#    (espota / `pio run -e datalogger_ota -t upload` also exists but its UDP
+#     handshake proved unreliable on real networks -- prefer the curl path)
 ```
 
 Without a `POST_URL` in `secrets.h` the datalogger runs in bench mode: it samples and

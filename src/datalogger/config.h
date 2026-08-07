@@ -11,6 +11,9 @@
  * battery/charger state), appends one record to the SPI-flash ring log, runs one
  * solar-management pass, and deep-sleeps. Below CRITICAL_VBAT_MV the interval is
  * stretched to save the last of the battery (logging continues, slower). */
+#define FW_VERSION              "dl-2.9"   /* printed at boot + sent with telemetry;
+                                            * bump before an OTA push to see it took */
+
 #define SAMPLE_INTERVAL_S       300     /* 5 min */
 #define CRITICAL_VBAT_MV        3350
 #define CRITICAL_INTERVAL_MULT  6       /* -> 30 min when critical */

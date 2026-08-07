@@ -38,10 +38,12 @@
 #include "esp_random.h"
 #include "esp_system.h"
 #include "esp_task_wdt.h"
+#include "esp_ota_ops.h"
 #include "EcoTraceBoard.h"
 #include "BQ25792.h"
 #include "LTR303.h"
 #include "SC7A20.h"
+#include "MS5837.h"
 #include "config.h"
 #include "record.h"
 #include "flash_log.h"
@@ -67,10 +69,16 @@ static RTC_DATA_ATTR uint16_t s_upload_fails;      /* consecutive failed attempt
 static RTC_DATA_ATTR uint16_t s_vbat_min_mv;       /* envelope since last upload */
 static RTC_DATA_ATTR uint16_t s_vbat_max_mv;
 static RTC_DATA_ATTR uint32_t s_awake_ms;          /* awake time since last upload */
+static RTC_DATA_ATTR uint8_t  s_upload_inflight;   /* set around uploadAll(): if a crash
+                                                    * reboot sees it, the upload (likely
+                                                    * the modem burst) caused the crash */
+static RTC_DATA_ATTR uint8_t  s_upload_crashed;    /* -> next attempt skips cellular ONCE;
+                                                    * cellular stays the primary path */
 
 BQ25792  bq;
 LTR303   light;
 SC7A20   accel;
+MS5837   baro;
 FlashLog flog;
 
 /* Watch the whole wake: if anything hangs, panic-reboot instead of draining the
@@ -137,6 +145,18 @@ static void readSample(LogRecord& r, const Solar::Status& sol)
         }
         accel.powerDown();
     }
+
+    /* MS5837 barometer on the I2C hat header (always-on rail, ~0.1 uA idle --
+     * nothing to power down). Optional: zeros if not fitted. */
+    r.press_dmbar = 0;
+    r.temp_cC     = 0;
+    if (baro.begin()) {
+        float mbar, degC;
+        if (baro.read(mbar, degC)) {           /* blocks ~40 ms */
+            r.press_dmbar = (uint16_t)(mbar * 10.0f + 0.5f);
+            r.temp_cC     = (int16_t)(degC * 100.0f + (degC >= 0 ? 0.5f : -0.5f));
+        }
+    }
 }
 
 /* QON button (GPIO2, shared with the BQ25792's QON input; external pull-up,
@@ -144,13 +164,44 @@ static void readSample(LogRecord& r, const Solar::Status& sol)
  * BUTTON_OTA_PRESSES presses in a row = WiFi OTA mode (testing convenience).
  * Held BUTTON_SHIP_HOLD_MS = power off via BQ ship mode (BATFET opens,
  * ~129 uA); wake by holding the button ~1 s (BQ tSM_EXIT). A ~10 s hold
- * triggers the BQ's own hardware power cycle regardless of firmware. */
-static void handleButton(void)
+ * triggers the BQ's own hardware power cycle regardless of firmware.
+ *
+ * Presses 2..n of a multi-press land while the firmware is still booting
+ * (~0.5-1 s of init before handleButton runs), so earlyButtonWatch() hangs an
+ * interrupt on the pin in the very first lines of setup() to catch them; only
+ * the ~300 ms ROM-loader window is truly blind. */
+static volatile uint32_t s_btn_isr_last_ms;
+static volatile uint8_t  s_btn_isr_presses;
+
+static void IRAM_ATTR buttonIsr()
+{
+    uint32_t now = millis();
+    if (now - s_btn_isr_last_ms > 120)   /* debounce; also swallows the wake
+                                          * press's release bounce right after
+                                          * attach (last_ms starts at 0) */
+        s_btn_isr_presses = s_btn_isr_presses + 1;
+    s_btn_isr_last_ms = now;
+}
+
+static void earlyButtonWatch(void)
 {
     pinMode(ECO_PIN_QON, INPUT);
-    if (!EcoTrace::wokeFromButton() && digitalRead(ECO_PIN_QON) == HIGH)
-        return;
-    uint8_t presses = 1;   /* the press that woke us (it may already be released) */
+    attachInterrupt(digitalPinToInterrupt(ECO_PIN_QON), buttonIsr, FALLING);
+}
+
+/* Returns the short-press count (0 = button not involved in this wake). A short
+ * press means "sample AND phone home now" -- handy on the bench and in the
+ * field to check a unit is alive without waiting for the 12 h schedule. */
+static uint8_t handleButton(void)
+{
+    detachInterrupt(digitalPinToInterrupt(ECO_PIN_QON));
+    uint8_t early = s_btn_isr_presses;
+
+    if (!EcoTrace::wokeFromButton() && early == 0 && digitalRead(ECO_PIN_QON) == HIGH)
+        return 0;
+    /* the wake press itself + whatever the boot-time interrupt caught */
+    uint8_t presses = (EcoTrace::wokeFromButton() ? 1 : 0) + early;
+    if (presses == 0) presses = 1;   /* pin low at a non-button boot */
 
     /* If that press is still held, watch for the ship-mode hold. */
     uint32_t t0 = millis();
@@ -205,13 +256,15 @@ static void handleButton(void)
     if (presses >= BUTTON_OTA_PRESSES) {
         Serial.printf("button: %u presses - WiFi OTA mode\n", presses);
         Ota::runWindow();   /* reboots on a successful push, else returns */
-    } else {
-        Serial.printf("button: %u press(es) - extra sample\n", presses);
+        return 0;           /* OTA window done -- no forced upload on top */
     }
+    Serial.printf("button: %u press(es) - extra sample + upload\n", presses);
+    return presses;
 }
 
 void setup()
 {
+    earlyButtonWatch();   /* first thing: catch multi-press taps during init */
     Serial.begin(115200);
     wdtBegin();
 
@@ -231,8 +284,10 @@ void setup()
 #endif
     EcoTrace::beginI2C();
     EcoTrace::beginSPI();
+    Serial.printf("ecoTrace datalogger %s (%s slot)\n", FW_VERSION,
+                  esp_ota_get_running_partition()->label);
 
-    handleButton();
+    uint8_t button_presses = handleButton();
 
     if (cold) {
         s_uptime_s         = 0;
@@ -248,6 +303,8 @@ void setup()
         s_vbat_min_mv      = 0xFFFF;
         s_vbat_max_mv      = 0;
         s_awake_ms         = 0;
+        s_upload_inflight  = 0;
+        s_upload_crashed   = 0;
         Solar::reset();
         s_rtc_magic = RTC_STATE_MAGIC;
         Serial.printf("cold boot (id %u, reset reason %d)\n", s_boot_id, (int)why);
@@ -262,6 +319,10 @@ void setup()
         if (why == ESP_RST_TASK_WDT || why == ESP_RST_INT_WDT ||
             why == ESP_RST_WDT || why == ESP_RST_PANIC)
             s_wdt_trips++;
+        if (s_upload_inflight) {   /* the upload (modem burst?) killed us */
+            s_upload_crashed  = 1;
+            s_upload_inflight = 0;
+        }
         if (s_next_upload_in_s <= 0) s_next_upload_in_s = UPLOAD_RETRY_S;
         Serial.printf("recovered from abnormal reset (reason %d, %u in a row)\n",
                       (int)why, s_crash_count);
@@ -306,15 +367,19 @@ void setup()
     }
     Serial.printf("seq %lu: VBAT=%umV IBAT=%+dmA SOC=%u%% | in: %s VINDPM=%umV "
                   "IBUS=%dmA | harvest %umAh (prev %u) weather=%s target=%umV | "
-                  "lux0=%u acc=[%d,%d,%d] | pending %lu\n",
+                  "lux0=%u acc=[%d,%d,%d] P=%.1fmbar T=%.2fC | pending %lu\n",
                   (unsigned long)r.seq, r.vbat_mv, r.ibat_ma, r.soc_pct,
                   sol.usb_present ? "USB" : sol.solar_present ? "solar" : "none",
                   r.vindpm_mv, r.ibus_ma,
                   sol.harvest_today_mah, sol.harvest_prev_mah,
                   sol.weather_good ? "good" : "bad", r.vreg_mv,
                   r.light_ch0, r.acc_mg[0], r.acc_mg[1], r.acc_mg[2],
+                  r.press_dmbar / 10.0f, r.temp_cC / 100.0f,
                   (unsigned long)flog.pendingCount());
     esp_task_wdt_reset();
+
+    /* A short button press means "phone home now". */
+    if (button_presses > 0) s_next_upload_in_s = 0;
 
     /* Upload if due -- and only if the battery can afford the modem burst. */
     if (s_next_upload_in_s <= 0) {
@@ -337,7 +402,11 @@ void setup()
             si.awake_ms     = s_awake_ms + millis();
             si.uptime_s     = s_uptime_s;
 
-            Uplink::Result u = Uplink::uploadAll(flog, SAMPLE_INTERVAL_S, si);
+            s_upload_inflight = 1;
+            Uplink::Result u = Uplink::uploadAll(flog, SAMPLE_INTERVAL_S, si,
+                                                 s_upload_crashed != 0);
+            s_upload_inflight = 0;
+            s_upload_crashed  = 0;   /* one-shot: cellular is primary again */
             if (u.all_sent) {
                 s_next_upload_in_s = UPLOAD_PERIOD_S;
                 s_retries_left     = UPLOAD_MAX_RETRIES;
