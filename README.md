@@ -1,19 +1,19 @@
 # ecoTrace Communication Module
 
-> ## 🚧 PARTIALLY TESTED - read this
-> The **PCB works**, and so does the **reference firmware this repo is built from**:
-> the board self-test (`functionality_test`) and the `bms_stove` ESP-IDF datalogger
-> have run on real hardware - including USB + solar charging, cellular upload, deep
-> sleep, and the GPIO14 sensor switch.
+> ## 🚧 HARDWARE VALIDATED, APPLICATION NOT YET - read this
+> As of the **2026-08-06/07** bring-up campaign the **board is fully validated on
+> real hardware**: both charge inputs (USB and solar, incl. VINDPM/MPPT control),
+> cellular, WiFi, all I2C sensors, the SPI flash, deep sleep, and the QON button
+> (wake / OTA mode / ship-mode power-off). GPS is the only untested block.
+> The `lib/EcoTrace` drivers underneath all of that ran on hardware too.
 >
-> What has **NOT been run on hardware yet** is this repo's Arduino rewrite: the
-> **`datalogger`** app and the **`lib/EcoTrace`** driver library. They compile cleanly
-> but have not been exercised on a board. Validate before relying on them. The
-> highest-risk piece is the **BQ25792 charging path** - this driver uses corrected
-> registers that differ from the older (proven) code, so charging specifically has
-> never been run as written here.
+> What has **NOT been exercised end-to-end** is the **`datalogger` application
+> itself**: the 5-minute duty cycle, the flash ring log across power loss, MPPT
+> tracking over a real day, the twice-daily ThingsBoard upload with clock sync,
+> and watchdog/crash recovery. It compiles and boots; treat it as a scaffold to
+> validate, not as proven.
 >
-> Full proven-vs-unproven breakdown: [`docs/testing-status.md`](docs/testing-status.md).
+> Full breakdown, including the measured numbers: [`docs/testing-status.md`](docs/testing-status.md).
 
 Firmware and board-support for the **ecoTrace Communication Module** - a small,
 battery- and solar-powered ESP32-C6 board with an LTE modem, built for **logging
@@ -80,6 +80,7 @@ on the board. Pull in only what you need. Full list: [`docs/api-reference.md`](d
 | `LTR303` | ambient light (CH0/CH1, lux) - datalogger's example sensor | ✅ |
 | `SC7A20` | accelerometer (X/Y/Z mg) | ✅ |
 | `ExtFlash` | GD25Q128 read/erase/program, power-down | ✅ (full 16 MB) |
+| `MS5837` | MS5837-02BA barometer (pressure, temperature, altitude) | ✅ |
 | `ATECC608B` | secure element presence/wake | 🔹 thin (crypto via CryptoAuthLib) |
 | `EcoTraceBoard` | safe init, I2C/SPI bring-up, deep sleep | ✅ |
 

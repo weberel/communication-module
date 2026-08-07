@@ -33,6 +33,10 @@ EcoTrace::beginSPI();     // SPI on GPIO18/5/4 (only if you use the flash)
 | `sensorRail(bool)` | external sensor rail (GPIO14) on/off |
 | `deepSleepSeconds(s)` | hold rails off and deep-sleep; never returns |
 | `wokeFromTimer()` | true if this boot was a timer wake (vs power-on/reset) |
+| `wokeFromButton()` | true if the QON button woke us (EXT1 on GPIO2) |
+
+`deepSleepSeconds()` arms both the timer and the QON button, so a short press
+always wakes the board early.
 
 ## BQ25792 charger / PMIC (`BQ25792.h`)
 
@@ -53,8 +57,18 @@ the TI datasheet.
 | `setVINDPM_mV() / getVINDPM_mV()` | input-voltage regulation point (used for MPPT) |
 | `enableCharging(on) setHIZ(on) disableWatchdog()` | control |
 | `enableACDRV1(on) enableACDRV2(on)` | gate USB (AC1) / solar (AC2) input FETs |
+| `enableExtILIM(on)` | ILIM_HIZ pin current clamp (cleared by `configureCharging`) |
+| `setShipFETPresent(on=true)` | declare the external ship FET - **required** before any ship/reset action |
+| `enterShipMode(immediate=true)` | power the board off: battery disconnected, ~129 µA |
+| `systemPowerReset()` | hardware power-cycle everything on VSYS (~350 ms) |
 | `configureCharging(ichg,iindpm,vreg)` | one-call: WD off, HIZ off, set limits, charge on |
 | `readReg8/16 writeReg8/16 setBits` | raw register access for experimentation |
+
+> ⚠️ **Ship mode gotcha.** `SDRV_CTRL` writes are silently discarded unless
+> `SFET_PRESENT` (REG14 bit 7) is set first - the write is ACKed, the field reads
+> back 0, and nothing happens. `enterShipMode()` / `systemPowerReset()` set it for
+> you. Ship mode also requires **no input present** (USB or solar refuses it), and
+> the board wakes on a ~1 s QON press *or* on any adapter being plugged in.
 
 Solar note: the BQ25792 has no true MPPT. Track the panel's max-power point by
 hill-climbing `setVINDPM_mV()` (see `mpptStep()` in the datalogger).
@@ -114,6 +128,23 @@ full 16 MB is reachable via 3-byte addressing.
 | `eraseSector(addr)` | erase 4 KB to 0xFF |
 | `writePage(addr,buf,n)` | program <=256 B within one page |
 | `powerDown() / wake()` | deep power-down for sleep |
+
+## MS5837-02BA barometer (`MS5837.h`)
+
+Off-board pressure / temperature sensor on the I2C hat header (J401), fixed
+address 0x76. Handles the factory PROM (with CRC-4 check) and the full first- and
+second-order compensation.
+
+| Function | Does |
+|----------|------|
+| `begin()` | reset, read calibration PROM, verify CRC-4 |
+| `read(mbar, degC)` | one conversion pair at OSR 4096 (blocks ~40 ms) |
+| `altitudeM(mbar, sea_level=1013.25)` | ISA altitude estimate |
+| `isPresent() / coefficient(i)` | probe / raw calibration words |
+
+Note it sits on the **always-on** 3V3 rail, so it cannot be switched off in deep
+sleep; it idles at ~0.1 µA between conversions, which is negligible next to the
+board's ~198 µA sleep current.
 
 ## ATECC608B secure element (`ATECC608B.h`)
 

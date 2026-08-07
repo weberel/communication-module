@@ -80,6 +80,12 @@ public:
     void enableACDRV2(bool on = true);     /* solar path gate */
     void enableExtILIM(bool on = true);    /* ILIM_HIZ pin current clamp (REG14[1]) */
 
+    /* Tell the charger an external ship FET is fitted (REG14 SFET_PRESENT).
+     * Required before ANY SDRV_CTRL action -- without it ship mode and system
+     * power reset are silently ignored. Set automatically by the two calls
+     * below. */
+    void setShipFETPresent(bool present = true);
+
     /* Ship mode: opens the BATFET, disconnecting the battery (~129 uA board
      * total). Wake: hold QON low ~1 s (tSM_EXIT), or plug in an adapter. With
      * an adapter present the system stays powered from VBUS and only goes dark

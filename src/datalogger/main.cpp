@@ -156,17 +156,31 @@ static void handleButton(void)
     uint32_t t0 = millis();
     while (digitalRead(ECO_PIN_QON) == LOW) {
         if (millis() - t0 >= BUTTON_SHIP_HOLD_MS) {
-            EcoTrace::ledOn();   /* feedback: power-off armed */
-            Serial.println("button held: entering ship mode (hold ~1 s to wake)");
+            /* "armed" feedback: flicker off-on against the steady awake LED */
+            for (int i = 0; i < 3; i++) {
+                EcoTrace::ledOff(); delay(80);
+                EcoTrace::ledOn();  delay(80);
+            }
+            Serial.println("button held: release to power off");
             Serial.flush();
-            bq.enterShipMode();
-            delay(1000);
-            /* Still running means an adapter is holding VSYS up. The BATFET is
-             * already open (note: battery does NOT charge in ship mode), so the
-             * board goes dark the moment the cable is pulled. Park cheaply. */
-            Serial.println("adapter present - board powers off once unplugged");
+            /* QON low for ~1 s is the BQ's wake-FROM-ship signal, so never
+             * command ship mode while the button is still down. */
+            while (digitalRead(ECO_PIN_QON) == LOW) delay(10);
+            delay(150);          /* debounce + let QON settle high */
+            bq.enterShipMode();  /* sets SFET_PRESENT; battery disconnects here */
+            delay(1200);
+
+            /* Only reached with an adapter attached: ship mode needs no input
+             * present, so the charger refused. The board is still on VBUS and
+             * will power off as soon as the cable is pulled -- but it would
+             * also wake on the next plug-in, so just resume normal logging. */
+            Serial.println("still powered (adapter present) -- unplug to finish power-off");
+            for (int i = 0; i < 3; i++) {
+                EcoTrace::ledOff(); delay(150);
+                EcoTrace::ledOn();  delay(150);
+            }
             EcoTrace::ledOff();
-            EcoTrace::deepSleepSeconds(UPLOAD_PERIOD_S);
+            EcoTrace::deepSleepSeconds(SAMPLE_INTERVAL_S);
         }
         delay(10);
     }
@@ -212,6 +226,9 @@ void setup()
     if (cold) delay(1500);   /* give USB CDC time to enumerate on the bench only */
 
     EcoTrace::beginBoard();
+#if LED_SHOW_AWAKE
+    EcoTrace::ledOn();      /* stays on until deepSleepSeconds() latches it off */
+#endif
     EcoTrace::beginI2C();
     EcoTrace::beginSPI();
 
@@ -234,6 +251,10 @@ void setup()
         Solar::reset();
         s_rtc_magic = RTC_STATE_MAGIC;
         Serial.printf("cold boot (id %u, reset reason %d)\n", s_boot_id, (int)why);
+        /* Cold boot (e.g. waking from ship mode with no serial attached): hold
+         * the LED solid for a few seconds so it is unmistakable. */
+        EcoTrace::ledOn();
+        delay(3000);
     } else if (crashed) {
         /* The previous wake died (watchdog, panic, brownout, manual reset). Keep
          * all state, note it, and don't retry the likely culprit immediately. */

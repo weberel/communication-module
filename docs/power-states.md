@@ -22,9 +22,23 @@ pull-up):
 | Action | Effect | Implemented by |
 |---|---|---|
 | short press (asleep) | wakes the ESP for an immediate sample | EXT1 deep-sleep wake on GPIO2 |
-| hold ~3 s (awake/asleep) | **power off**: BQ ship mode, BATFET opens, ~129 µA | firmware (`BQ25792::enterShipMode`, I²C - ship entry is not possible via the pin) |
+| 3 presses in ~2.5 s | WiFi **OTA mode** for 5 min (`pio run -e datalogger_ota -t upload`) | firmware (`ota.cpp`) |
+| hold ~3 s, then release | **power off**: BQ ship mode, battery disconnected, ~129 µA | firmware (`BQ25792::enterShipMode`) |
 | hold ~1 s (while off) | **power on**: BQ exits ship mode, board cold-boots | BQ hardware (tSM_EXIT) |
-| hold ~10 s (any time) | full hardware power cycle (BATFET off 350 ms) - the unbrick reset | BQ hardware (tRST), cannot be disabled |
+| plug in USB or solar (while off) | also exits ship mode - a shipped board revives itself in the field | BQ hardware, not disableable |
+| hold ~10 s (any time) | full hardware power cycle (ship FET off 350 ms) - the unbrick reset | BQ hardware (tRST), cannot be disabled |
+
+> **`SFET_PRESENT` (REG14 bit 7) must be set before any `SDRV_CTRL` action.** It
+> tells the charger that an external ship FET (Q204) is fitted. Without it every
+> ship-mode / shutdown / system-power-reset write is silently discarded: the
+> write is ACKed, the field reads back 0, and nothing happens. This cost a full
+> debugging session on 2026-08-07; `BQ25792::enterShipMode()` and
+> `systemPowerReset()` now set it automatically.
+
+Ship mode entry requires **no input present** - with USB or solar connected the
+charger refuses (documented), so the board only powers down once unplugged. The
+button never enters ship mode while it is still held down, because QON low for
+~1 s is the charger's wake-from-ship signal.
 
 Notes: ship mode disconnects only the battery - with USB/solar plugged the board
 stays powered and only goes dark when unplugged; the battery does **not** charge

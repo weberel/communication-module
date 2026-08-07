@@ -45,7 +45,10 @@ Exposed GPIOs on the MINI-1 module: `0,1,2,3,4,5,6,7,8,9,12,13,14,15,18,19,20,21
 
 Top-edge and side headers, per the board silkscreen:
 
-- **SENSOR / I2C**: `GND · VSYS · SCL · SDA · 3V3`
+- **SENSOR / I2C** (J401, the "hat" header): `GND · 3V3 · SCL · SDA` - the 3V3 pin is
+  the **always-on** LDO rail, *not* the GPIO14-switched one, so devices here stay
+  powered in deep sleep (put them in their own low-power mode instead). The separate
+  J404 connector is the one switched by GPIO14.
 - **SPI**: `GND · 3V3 · SCLK · SI · SO · CS`
 - **BTN**: `GND · QON`
 - **USB**: `GND · VUSB · DN · DP`

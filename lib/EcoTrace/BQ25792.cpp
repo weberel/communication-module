@@ -168,6 +168,13 @@ void BQ25792::enableExtILIM(bool on)  { setBits(REG_CHG_CTRL5, on ? 0x02 : 0x00,
 
 void BQ25792::enterShipMode(bool immediate)
 {
+    /* SFET_PRESENT MUST be set first. It tells the charger an external ship
+     * FET (Q204) exists; without it every SDRV_CTRL write is silently
+     * discarded -- the field reads back 0 and nothing happens. Measured on
+     * hardware 2026-08-07: this single bit was the difference between "ship
+     * mode does nothing" and working. */
+    setShipFETPresent(true);
+    disableWatchdog();
     /* REG11 SDRV_CTRL[2:1]: 0=idle 1=shutdown 2=ship 3=system power reset.
      * SDRV_DLY[0]: 1 = do NOT add the 10 s delay. Ship (not shutdown) so the
      * QON button can wake the board again. Takes effect on write. */
@@ -176,8 +183,15 @@ void BQ25792::enterShipMode(bool immediate)
     writeReg8(REG_CHG_CTRL2, v);
 }
 
+void BQ25792::setShipFETPresent(bool present)
+{
+    setBits(REG_CHG_CTRL5, present ? 0x80 : 0x00, present ? 0x00 : 0x80);
+}
+
 void BQ25792::systemPowerReset()
 {
+    setShipFETPresent(true);    /* same requirement as ship mode */
+    disableWatchdog();
     uint8_t v = readReg8(REG_CHG_CTRL2);
     v = (v & ~0x07) | (0x03 << 1) | 0x01;
     writeReg8(REG_CHG_CTRL2, v);

@@ -11,6 +11,7 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include "MS5837.h"
 #include <SPI.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -52,6 +53,7 @@
 #define ADDR_SC7A20_LO       0x18
 #define ADDR_SC7A20_HI       0x19
 #define ADDR_LTR303          0x29
+#define ADDR_MS5837          0x76    /* MS5837-02BA barometer (SENSOR header) */
 #define ADDR_ATECC608B_A     0x60
 #define ADDR_ATECC608B_B     0x35
 #define ADDR_BQ25792         0x6B
@@ -170,7 +172,7 @@ static void test_power_rails(void)
     digitalWrite(PIN_MODEM_PWR_EN, LOW);
     pinMode(PIN_MODEM_PWRKEY, OUTPUT);
     digitalWrite(PIN_MODEM_PWRKEY, HIGH);
-    TEST_INFO("SENSOR_PWR",   "GPIO%d ext-sensor rail switch (populated); on-board sensors on 3V3", PIN_SENSOR_PWR);
+    TEST_INFO("SENSOR_PWR",   "GPIO%d ext-sensor rail switch (populated, off); feeds J404 only -- the I2C header J401 is on always-on 3V3", PIN_SENSOR_PWR);
     TEST_INFO("MODEM_PWR_EN", "GPIO%d -> LOW  (modem rail off)", PIN_MODEM_PWR_EN);
     TEST_INFO("MODEM_PWRKEY", "GPIO%d -> HIGH (idle)",           PIN_MODEM_PWRKEY);
 }
@@ -221,6 +223,7 @@ static void test_i2c_scan(void)
         else if (a == ADDR_ATECC608B_A)                        name = "ATECC608B?";
         else if (a == ADDR_ATECC608B_B)                        name = "ATECC608B?";
         else if (a == ADDR_BQ25792)                            name = "BQ25792";
+        else if (a == ADDR_MS5837)                             name = "MS5837-02BA";
         char line[48];
         int n = snprintf(line, sizeof(line), "  0x%02X  %s\n", a, name);
         log_emit(line, n);
@@ -664,6 +667,35 @@ static void test_ltr303(void)
     uint16_t ch0 = ((uint16_t)d[3] << 8) | d[2];
     TEST_PASS("LTR-303ALS read", "CH0(vis+IR)=%5u  CH1(IR)=%5u  (cover sensor to see drop)",
               ch0, ch1);
+}
+
+/* ===================== MS5837-02BA barometer (SENSOR header) ============= */
+static void test_ms5837(void)
+{
+    MS5837 baro;
+    if (!baro.isPresent()) {
+        TEST_SKIP("MS5837", "no device at 0x%02X (not fitted on the I2C header)", ADDR_MS5837);
+        return;
+    }
+    if (!baro.begin()) {
+        TEST_FAIL("MS5837 PROM", "reset/PROM read failed or CRC-4 mismatch");
+        return;
+    }
+    TEST_PASS("MS5837 PROM", "CRC-4 ok, C1..C6 = %u %u %u %u %u %u",
+              baro.coefficient(1), baro.coefficient(2), baro.coefficient(3),
+              baro.coefficient(4), baro.coefficient(5), baro.coefficient(6));
+
+    float mbar = 0, degC = 0;
+    if (!baro.read(mbar, degC)) {
+        TEST_FAIL("MS5837 read", "conversion failed");
+        return;
+    }
+    /* Sanity: the 02BA spans 300-1200 mbar; ~950-1000 mbar at Zurich altitude. */
+    if (mbar > 300.0f && mbar < 1200.0f && degC > -20.0f && degC < 60.0f)
+        TEST_PASS("MS5837 read", "%.2f mbar, %.2f C (~%.0f m ASL)",
+                  mbar, degC, MS5837::altitudeM(mbar));
+    else
+        TEST_FAIL("MS5837 read", "implausible: %.2f mbar, %.2f C", mbar, degC);
 }
 
 /* ===================== SPI flash ===================== */
@@ -1299,6 +1331,7 @@ void setup(void)
     test_bq25792();
     test_sc7a20();
     test_ltr303();
+    test_ms5837();
 
     SECTION("SPI init");
     spi_init();

@@ -79,6 +79,11 @@
  * firmware, a ~10 s hold makes the BQ hardware-power-cycle the whole board
  * (built-in unbrick/reset). */
 #define BUTTON_SHIP_HOLD_MS         3000
+
+/* LED on for the whole time the ESP is awake: a working board visibly pulses
+ * once per wake, and a board in ship mode stays dark. Costs ~2 mA for the ~2 s
+ * of each wake -- negligible on the bench, set to 0 for deployment. */
+#define LED_SHOW_AWAKE              1
 #define BUTTON_OTA_PRESSES          3
 #define BUTTON_MULTIPRESS_WINDOW_MS 2500
 
