@@ -13,7 +13,7 @@ Exposed GPIOs on the MINI-1 module: `0,1,2,3,4,5,6,7,8,9,12,13,14,15,18,19,20,21
 |-----:|-----|-------|
 | 0 | MODEM_STATUS | A7672 STATUS out, but **only valid while the modem rail is on**: the translator (Q408) is gated by the modem's own 1V8, so with the rail off the line floats HIGH via R423 - indistinguishable from "modem running". Detect boot as the LOW→HIGH edge (or an AT response), never as a HIGH level. **Also a boot strap** - read briefly only |
 | 1 | LED | status LED, active HIGH |
-| 2 | QON | BQ25792 QON - pull LOW to wake. **Do not hold LOW > 2 s** (ship-mode risk). Pad TP404 |
+| 2 | QON | shared button net: BQ25792 QON + ESP deep-sleep wake (EXT1). BQ hardware behavior: LOW ~1 s exits ship mode, LOW ~10 s = full power cycle (tRST); shorter holds are ignored by the BQ, so firmware defines the long-press action (datalogger: 3 s hold = enter ship mode via I²C). Pad TP404 |
 | 3 | INT_shared | shared interrupt: SC7A20 accel + LTR-303 light |
 | 4 | SPI_MOSI (SI) | to GD25Q128 flash |
 | 5 | SPI_MISO (SO) | from GD25Q128 flash |

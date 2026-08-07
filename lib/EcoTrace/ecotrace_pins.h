@@ -41,7 +41,11 @@
 #define ECO_MODEM_BAUD         115200
 
 /* ---- Wake / interrupt inputs (all have external pull-ups, idle HIGH) -------- */
-#define ECO_PIN_QON            2     /* BQ25792 QON; pull LOW to wake. DO NOT hold LOW > 2 s */
+#define ECO_PIN_QON            2     /* shared button net: BQ25792 QON + ESP wake input.
+                                      * LOW ~1 s wakes the BQ from ship mode; LOW ~10 s =
+                                      * BQ hardware full power cycle (tRST). In between the
+                                      * BQ ignores it - firmware defines the long press.
+                                      * Ship-mode ENTRY is I2C only (BQ25792::enterShipMode) */
 #define ECO_PIN_INT_SHARED     3     /* shared INT: SC7A20 accel + LTR-303 light */
 #define ECO_PIN_INT_BQ         19    /* BQ25792 fault / charge interrupt */
 

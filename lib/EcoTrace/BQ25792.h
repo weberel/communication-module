@@ -80,6 +80,16 @@ public:
     void enableACDRV2(bool on = true);     /* solar path gate */
     void enableExtILIM(bool on = true);    /* ILIM_HIZ pin current clamp (REG14[1]) */
 
+    /* Ship mode: opens the BATFET, disconnecting the battery (~129 uA board
+     * total). Wake: hold QON low ~1 s (tSM_EXIT), or plug in an adapter. With
+     * an adapter present the system stays powered from VBUS and only goes dark
+     * when unplugged. immediate=false adds the BQ's 10 s entry delay. */
+    void enterShipMode(bool immediate = true);
+    /* Hardware power cycle: BATFET off ~350 ms, then back on - full cold
+     * restart of everything on VSYS. (Also available without firmware: hold
+     * QON low ~10 s.) */
+    void systemPowerReset();
+
     /* Convenience: disable watchdog, clear HIZ, enable charging, apply limits.
      * Pass 0 for any limit you want left at its current value. */
     void configureCharging(uint16_t ichg_ma, uint16_t iindpm_ma, uint16_t vreg_mv = 0);
@@ -101,6 +111,7 @@ public:
     static constexpr uint8_t REG_TIMER     = 0x0E;
     static constexpr uint8_t REG_CHG_CTRL0 = 0x0F;  /* EN_CHG[5] EN_HIZ[2] EN_TERM[1] */
     static constexpr uint8_t REG_CHG_CTRL1 = 0x10;  /* WATCHDOG[2:0] */
+    static constexpr uint8_t REG_CHG_CTRL2 = 0x11;  /* SDRV_CTRL[2:1] SDRV_DLY[0] */
     static constexpr uint8_t REG_CHG_CTRL3 = 0x12;
     static constexpr uint8_t REG_CHG_CTRL4 = 0x13;  /* EN_ACDRV2[7] EN_ACDRV1[6] */
     static constexpr uint8_t REG_CHG_CTRL5 = 0x14;  /* EN_IBAT[5] */

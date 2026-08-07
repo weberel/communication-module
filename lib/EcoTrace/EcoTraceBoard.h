@@ -43,4 +43,7 @@ void deepSleepSeconds(uint32_t seconds);
 /* True if this boot came from the deep-sleep timer (vs power-on / reset / brownout). */
 bool wokeFromTimer();
 
+/* True if this boot came from the QON button (EXT1 wake on GPIO2 low). */
+bool wokeFromButton();
+
 }  // namespace EcoTrace

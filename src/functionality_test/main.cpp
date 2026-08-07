@@ -296,6 +296,110 @@ static void bq_ilim_probe(const char *tag)
     i2c_write_reg(ADDR_BQ25792, 0x07, save_iindpm[1]);
 }
 
+static uint16_t bq_rd16(uint8_t reg)
+{
+    uint8_t b[2] = {0, 0};
+    i2c_read_reg(ADDR_BQ25792, reg, b, 2);
+    return ((uint16_t)b[0] << 8) | b[1];
+}
+
+/* Solar / VIN input check + panel-agnostic MPPT sweep.
+ * 1. Hold both input FETs off so VAC2 shows the panel's true open-circuit
+ *    voltage (Voc) - no prior knowledge of the panel needed.
+ * 2. Route the charger to the solar input (ACFET2) and see if VBUS comes up.
+ *    A weak panel SAGS under the qualification load (INFO, not a fault); a
+ *    dead FET path leaves the panel voltage untouched (FAIL).
+ * 3. Sweep VINDPM across 60-92 % of Voc measuring real input power; the peak
+ *    is the panel's MPP at current illumination. (Fractional-Voc says Vmp is
+ *    typically ~76 % of Voc for silicon - the sweep verifies empirically.)
+ * Restores charger input routing and limits afterwards. */
+static void test_solar_mppt(void)
+{
+    uint8_t r13o = 0, r14o = 0, iindpm_o[2], vindpm_o = 0;
+    i2c_read_reg(ADDR_BQ25792, 0x13, &r13o, 1);
+    i2c_read_reg(ADDR_BQ25792, 0x14, &r14o, 1);
+    i2c_read_reg(ADDR_BQ25792, 0x06, iindpm_o, 2);
+    i2c_read_reg(ADDR_BQ25792, 0x05, &vindpm_o, 1);
+
+    /* Voc: both ACFETs off, panel unloaded */
+    i2c_write_reg(ADDR_BQ25792, 0x13, r13o & ~0xC0);
+    delay(400);
+    uint16_t voc = bq_rd16(0x39);
+    if (voc < 1000) {
+        i2c_write_reg(ADDR_BQ25792, 0x13, r13o);
+        TEST_SKIP("Solar input", "no source on VIN (VAC2=%u mV) - feed a panel / 5-20 V to test", voc);
+        return;
+    }
+    TEST_INFO("Solar Voc", "%u mV open-circuit (panel unloaded)", voc);
+    if (voc < 3800) {
+        i2c_write_reg(ADDR_BQ25792, 0x13, r13o);
+        TEST_INFO("Solar input", "Voc below the charger's ~3.6 V adapter-present threshold - too little light (or wiring/polarity); cannot exercise the path");
+        return;
+    }
+
+    /* room to draw: input limit 2 A, pin-clamp off, VINDPM at floor for now */
+    i2c_write_reg(ADDR_BQ25792, 0x14, r14o & ~0x02);   /* EN_EXT_ILIM off */
+    i2c_write_reg(ADDR_BQ25792, 0x06, 0);
+    i2c_write_reg(ADDR_BQ25792, 0x07, 200);            /* IINDPM = 2000 mA */
+    i2c_write_reg(ADDR_BQ25792, 0x05, 36);             /* VINDPM = 3.6 V floor */
+
+    /* solar input only: ACFET1 off, ACFET2 on */
+    i2c_write_reg(ADDR_BQ25792, 0x13, (r13o & ~0x40) | 0x80);
+    delay(1500);
+
+    uint16_t vbus = bq_rd16(0x35);
+    uint8_t r13v = 0;
+    i2c_read_reg(ADDR_BQ25792, 0x13, &r13v, 1);
+    if (vbus > voc + 300) {
+        /* VBUS above the panel's own Voc can only come from another input -
+         * the BQ fell back to USB despite our routing. Don't measure that. */
+        TEST_INFO("Solar input", "VBUS=%u mV exceeds panel Voc=%u mV - another input is feeding the charger (EN_ACDRV2 %s); result invalid, retry with stronger light",
+                  vbus, voc, (r13v & 0x80) ? "still set" : "auto-cleared");
+    } else if (vbus < 3000) {
+        uint16_t vac2_loaded = bq_rd16(0x39);
+        if (vac2_loaded + 500 < voc)
+            TEST_INFO("Solar input", "panel sags %u -> %u mV under load - source too weak to qualify (needs more light); path itself not disproven",
+                      voc, vac2_loaded);
+        else
+            TEST_FAIL("Solar input", "VAC2 steady at %u mV but VBUS=%u mV - ACFET2 path dead (check Q202/Q203/R213/D204)",
+                      voc, vbus);
+    } else {
+        uint8_t s[2] = {0, 0};
+        i2c_read_reg(ADDR_BQ25792, 0x1B, s, 2);
+        TEST_PASS("Solar input", "panel powers VBUS: %u mV, state: %s",
+                  vbus, chg_names[(s[1] >> 5) & 0x07]);
+
+        /* MPPT sweep: highest power wins */
+        uint16_t best_v = 0, best_vbus = 0;
+        int16_t  best_i = 0;
+        int32_t  best_p = -1;
+        for (int pct = 60; pct <= 92; pct += 4) {
+            uint16_t vin = (uint16_t)((uint32_t)voc * pct / 100);
+            if (vin < 3600) vin = 3600;
+            i2c_write_reg(ADDR_BQ25792, 0x05, (uint8_t)(vin / 100));
+            delay(400);
+            uint16_t v = bq_rd16(0x35);
+            int16_t  i = (int16_t)bq_rd16(0x31);
+            int32_t  p = (int32_t)v * i / 1000;   /* mW */
+            TEST_INFO("MPPT sweep", "VINDPM %u%% of Voc (%u mV): VBUS=%u mV IBUS=%d mA P=%ld mW",
+                      pct, vin, v, i, (long)p);
+            if (p > best_p) { best_p = p; best_v = vin; best_vbus = v; best_i = i; }
+        }
+        TEST_PASS("Solar MPPT", "max %ld mW at VINDPM=%u mV (%lu%% of Voc) - IBUS=%d mA",
+                  (long)best_p, best_v, (unsigned long)((uint32_t)best_v * 100 / voc), best_i);
+        int16_t ibat = (int16_t)bq_rd16(0x33);
+        if (ibat >= 0 && ibat < 200)
+            TEST_INFO("Solar MPPT", "note: battery draw only %+d mA (nearly full?) - real MPP may be higher than measured", ibat);
+    }
+
+    /* restore */
+    i2c_write_reg(ADDR_BQ25792, 0x05, vindpm_o);
+    i2c_write_reg(ADDR_BQ25792, 0x06, iindpm_o[0]);
+    i2c_write_reg(ADDR_BQ25792, 0x07, iindpm_o[1]);
+    i2c_write_reg(ADDR_BQ25792, 0x14, r14o);
+    i2c_write_reg(ADDR_BQ25792, 0x13, r13o | 0x40);    /* USB gate back on */
+}
+
 static void bq_verbose_dump(void)
 {
     uint8_t r[7];
@@ -428,8 +532,60 @@ static void test_bq25792(void)
                 if (st != 0) TEST_PASS("BQ25792 nudge", "after nudge: %s", chg_names[st]);
                 else         TEST_INFO("BQ25792 nudge", "still not charging - check NTC, VAC1/VBUS routing");
             }
+
+            /* Qualification watch: adapter present at VAC1 but VBUS dead means
+             * either the ACFET path never conducts (bad joint at Q201/Q206/
+             * R214/D203) or the source folds under the BQ's qualification
+             * load. Force re-detection via an EN_HIZ pulse, then poll the
+             * comparator status fast (~1 ms) and the ADC occasionally; a
+             * folding source dips VAC1 / blips VBUS, a dead FET path shows a
+             * rock-steady VAC1 with VBUS never twitching. */
+            uint8_t vv[2];
+            uint16_t vac1_now = 0;
+            if (i2c_read_reg(ADDR_BQ25792, 0x37, vv, 2))
+                vac1_now = ((uint16_t)vv[0] << 8) | vv[1];
+            if (st == 0 && vac1_now > 4000) {
+                uint8_t r0f2 = 0;
+                i2c_read_reg(ADDR_BQ25792, 0x0F, &r0f2, 1);
+                i2c_write_reg(ADDR_BQ25792, 0x0F, r0f2 | 0x04);   /* EN_HIZ=1 */
+                delay(100);
+                i2c_write_reg(ADDR_BQ25792, 0x0F, r0f2 & ~0x04);  /* EN_HIZ=0: re-detect */
+
+                bool saw_pres = false;
+                uint16_t stat_mask = 0, vbus_max = 0, vac1_min = 65535;
+                unsigned long t0 = millis(), last_adc = 0;
+                while (millis() - t0 < 2500) {
+                    uint8_t s[2];
+                    if (i2c_read_reg(ADDR_BQ25792, 0x1B, s, 2)) {
+                        if (s[0] & 0x01) saw_pres = true;
+                        stat_mask |= (uint16_t)1 << ((s[1] >> 1) & 0x0F);
+                    }
+                    if (millis() - last_adc >= 50) {
+                        last_adc = millis();
+                        if (i2c_read_reg(ADDR_BQ25792, 0x35, s, 2)) {
+                            uint16_t v = ((uint16_t)s[0] << 8) | s[1];
+                            if (v > vbus_max) vbus_max = v;
+                        }
+                        if (i2c_read_reg(ADDR_BQ25792, 0x37, s, 2)) {
+                            uint16_t v = ((uint16_t)s[0] << 8) | s[1];
+                            if (v && v < vac1_min) vac1_min = v;
+                        }
+                    }
+                }
+                TEST_INFO("BQ qual watch", "2.5 s after HIZ pulse: VBUS_PRESENT %s, VBUS_STAT mask=0x%03X, VBUSmax=%u mV, VAC1min=%u mV",
+                          saw_pres ? "seen" : "never", stat_mask, vbus_max, vac1_min);
+                TEST_INFO("BQ qual watch", "%s",
+                          (vbus_max > 4000) ? "VBUS rose: FETs conduct - source folds under load (weak supply?)"
+                        : (vac1_min < 4200 && vac1_min != 65535) ? "VAC1 sags: source folding even before the FETs"
+                        : "VAC1 steady, VBUS never rose: ACFET path dead - check Q201/Q206/R214/D203 joints");
+            }
         }
     }
+
+    /* Solar / VIN input + panel-agnostic MPPT sweep (SKIPs with nothing on
+     * VIN). Mind the SWAPPED +/- silkscreen, errata #1 - the true negative
+     * terminal is the one that beeps to GND. */
+    test_solar_mppt();
 
     bq_ilim_probe("bq idle");
 

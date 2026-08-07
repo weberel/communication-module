@@ -166,6 +166,23 @@ void BQ25792::enableACDRV1(bool on)   { setBits(REG_CHG_CTRL4, on ? 0x40 : 0x00,
 void BQ25792::enableACDRV2(bool on)   { setBits(REG_CHG_CTRL4, on ? 0x80 : 0x00, on ? 0x00 : 0x80); }
 void BQ25792::enableExtILIM(bool on)  { setBits(REG_CHG_CTRL5, on ? 0x02 : 0x00, on ? 0x00 : 0x02); }
 
+void BQ25792::enterShipMode(bool immediate)
+{
+    /* REG11 SDRV_CTRL[2:1]: 0=idle 1=shutdown 2=ship 3=system power reset.
+     * SDRV_DLY[0]: 1 = do NOT add the 10 s delay. Ship (not shutdown) so the
+     * QON button can wake the board again. Takes effect on write. */
+    uint8_t v = readReg8(REG_CHG_CTRL2);
+    v = (v & ~0x07) | (0x02 << 1) | (immediate ? 0x01 : 0x00);
+    writeReg8(REG_CHG_CTRL2, v);
+}
+
+void BQ25792::systemPowerReset()
+{
+    uint8_t v = readReg8(REG_CHG_CTRL2);
+    v = (v & ~0x07) | (0x03 << 1) | 0x01;
+    writeReg8(REG_CHG_CTRL2, v);
+}
+
 void BQ25792::configureCharging(uint16_t ichg_ma, uint16_t iindpm_ma, uint16_t vreg_mv)
 {
     disableWatchdog();          /* stop the WD from resetting our config every 40 s */

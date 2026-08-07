@@ -68,12 +68,21 @@ void deepSleepSeconds(uint32_t seconds)
     gpio_hold_en((gpio_num_t)ECO_PIN_LED);
 
     esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
+    /* The QON button (GPIO2, external pull-up, shared with the BQ25792's QON
+     * input) also wakes us: GPIO2 is in the C6's LP domain, so EXT1 can watch
+     * it through deep sleep. */
+    esp_sleep_enable_ext1_wakeup(1ULL << ECO_PIN_QON, ESP_EXT1_WAKEUP_ANY_LOW);
     esp_deep_sleep_start();   /* never returns */
 }
 
 bool wokeFromTimer()
 {
     return esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER;
+}
+
+bool wokeFromButton()
+{
+    return esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1;
 }
 
 }  // namespace EcoTrace

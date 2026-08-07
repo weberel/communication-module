@@ -47,19 +47,28 @@ renders, and JLCPCB fab files are in [`hardware/`](hardware/).
 
 ## What you get
 
-**1. The datalogger** (`src/datalogger/`) - the main application. Every cycle it:
-- reads battery + charger state (BQ25792) and **your sensor**,
-- keeps the battery charging from USB or solar (software MPPT for solar),
-- buffers the sample in RTC RAM,
-- uploads the buffer over cellular every N samples (HTTP POST),
-- deep-sleeps in between.
+**1. The datalogger** (`src/datalogger/`) - the main application. Every 5-minute
+wake it:
+- reads the full battery + charger state (BQ25792) and the on-board I2C sensors
+  (LTR-303 light, SC7A20 accel),
+- runs a solar-management pass: **MPPT** (fractional-Voc + perturb-&-observe on
+  VINDPM) to maximise input power, per-day **harvest accounting**, and a
+  **weather-adaptive charge target** - good weather caps charging at ~80 % SoC to
+  age the LiPo slower, bad weather allows 100 % for reserve,
+- appends one 64-byte record to a **ring log on the 16 MB SPI flash**
+  (power-loss safe, ~2.5 years of capacity),
+- twice a day drains the backlog to **ThingsBoard** in timestamped batches -
+  cellular first, **WiFi as backup** - and syncs the wall clock from the network,
+- deep-sleeps in between with everything powered down (modem rail, flash,
+  sensors, charger ADC); the BQ25792 keeps charging autonomously.
 
-It is a **plain, hackable starting point** - fork it and change whatever you need.
-It logs the on-board LTR-303 light sensor as an example; to log your own sensor,
-change `readSample()` (read it), the `LogRecord` struct (store it), and `buildJson()`
-(send it) in [`src/datalogger/main.cpp`](src/datalogger/main.cpp). Connect external
-sensors on the SENSOR (I2C) or SPI header. Tune the duty cycle / charge profile in
-[`config.h`](src/datalogger/config.h).
+It is a **hackable starting point** - fork it and change whatever you need. To log
+your own sensor: extend `LogRecord` in [`record.h`](src/datalogger/record.h) (spare
+bytes are reserved), read it in `readSample()` in
+[`main.cpp`](src/datalogger/main.cpp), and send it in `recordValues()` in
+[`uplink.cpp`](src/datalogger/uplink.cpp). Connect external sensors on the SENSOR
+(I2C) or SPI header. Tune the duty cycle / charge profile / MPPT / weather
+thresholds in [`config.h`](src/datalogger/config.h).
 
 **2. The driver library** (`lib/EcoTrace/`) - ready-to-call functions for every part
 on the board. Pull in only what you need. Full list: [`docs/api-reference.md`](docs/api-reference.md).
@@ -98,6 +107,10 @@ pio run -e functionality_test -t upload && pio device monitor
 # 4. set your SIM APN + upload URL, then run the logger:
 cp lib/EcoTrace/secrets.example.h lib/EcoTrace/secrets.h   # then edit it
 pio run -e datalogger -t upload && pio device monitor
+
+# 5. reflash over WiFi later (bench convenience): press the QON button 3x
+#    (board joins WiFi and blinks once per second), then:
+pio run -e datalogger_ota -t upload
 ```
 
 Without a `POST_URL` in `secrets.h` the datalogger runs in bench mode: it samples and
@@ -114,7 +127,13 @@ lib/EcoTrace/      board support: pin map + drivers (the reusable core)
   LTR303.* SC7A20.* ATECC608B.* ExtFlash.*   peripheral drivers
   secrets.example.h  copy to secrets.h and fill in (gitignored)
 src/
-  datalogger/        the main application (+ config.h)
+  datalogger/        the main application
+    config.h           duty cycle, charge profile, MPPT, weather, upload tunables
+    record.h           the 64-byte on-flash log record (+ CRC)
+    flash_log.*        power-loss-safe ring log on the 16 MB SPI flash
+    solar.*            MPPT + harvest tracking + weather-adaptive charge target
+    uplink.*           ThingsBoard upload: cellular first, WiFi backup, clock sync
+    main.cpp           the wake/sample/sleep cycle
   functionality_test/  board bring-up self-test
 docs/              getting started, pinout, errata, api reference, testing status
 hardware/          KiCad project + exports

@@ -1,233 +1,362 @@
 /*
  * ecoTrace datalogger
  * ===================
- * A working starting point. Fork it and change whatever you need - this is your app,
- * not a framework. Each wake it:
- *   1. reads the battery + charger state (BQ25792) and a sensor (the on-board
- *      LTR-303 light sensor, as an example),
- *   2. keeps the battery charging from whatever input is present (USB or solar, with
- *      a software MPPT step for solar),
- *   3. buffers the sample in RTC RAM (survives deep sleep),
- *   4. every SAMPLES_PER_UPLOAD samples, powers the A7672E modem and uploads the
- *      buffer over cellular (HTTP POST, one JSON object per record),
- *   5. deep-sleeps until the next sample.
+ * Solar-powered remote logger: samples everything every 5 minutes, stores to SPI
+ * flash, uploads to ThingsBoard twice a day, deep-sleeps in between.
  *
- * To log YOUR sensor: change readSample() (read it), the LogRecord struct (store it),
- * and buildJson() (send it). Drivers for the on-board parts are in lib/EcoTrace; see
- * docs/api-reference.md. Connect external sensors on the SENSOR (I2C) or SPI header.
+ * Each wake:
+ *   1. read the full battery/charger state (BQ25792) + the on-board I2C sensors
+ *      (LTR-303 light, SC7A20 accel),
+ *   2. run one solar-management pass (solar.cpp): MPPT step to maximise input
+ *      power, per-day harvest accounting, and the weather-adaptive charge target
+ *      (good weather -> stop at ~80 % SoC, bad weather -> allow 100 %),
+ *   3. append one 64-byte record to the ring log on the 16 MB SPI flash
+ *      (flash_log.cpp -- power-loss safe, ~2.5 years of capacity),
+ *   4. if an upload is due (every 12 h, or first boot, with retry/backoff), drain
+ *      the backlog to ThingsBoard: cellular first, WiFi backup (uplink.cpp),
+ *      plus one device-health record. Every upload re-syncs the wall clock
+ *      (modem NITZ / SNTP) -- the C6 sleep timer drifts, the 2x/day sync keeps
+ *      timestamps honest.
+ *   5. deep-sleep until the next sample (everything powered down; the BQ25792
+ *      keeps charging autonomously with the settings we left it).
  *
- * Config lives in config.h. Credentials (SIM_APN, POST_URL) live in secrets.h.
+ * Robustness: a task watchdog (WDT_TIMEOUT_S) reboots the board if any wake
+ * hangs. RTC RAM survives such resets, so the log cursor and schedule carry on;
+ * boot classification below distinguishes a clean timer wake, a crash reboot
+ * (state intact -> count it, defer the upload, carry on), and a true cold boot
+ * (RTC lost -> full re-init, recover the log from flash).
  *
+ * Note on "constant" sampling: the C6's LP core could sample the LP-I2C sensors
+ * while the HP core sleeps, but LP-core binaries can't be built in this
+ * Arduino/PlatformIO toolchain -- so "constant" here means every wake. The
+ * planned ESP-IDF port lifts that limitation.
+ *
+ * Config in config.h; credentials (SIM_APN, POST_URL, WIFI_*) in secrets.h.
  * Build/flash:  pio run -e datalogger -t upload && pio device monitor
  */
 #include <Arduino.h>
+#include "esp_random.h"
+#include "esp_system.h"
+#include "esp_task_wdt.h"
 #include "EcoTraceBoard.h"
 #include "BQ25792.h"
 #include "LTR303.h"
-#include "ModemA7672.h"
+#include "SC7A20.h"
 #include "config.h"
+#include "record.h"
+#include "flash_log.h"
+#include "solar.h"
+#include "uplink.h"
+#include "ota.h"
+#include "timeutil.h"
 
-#if __has_include("secrets.h")
-#include "secrets.h"
-#endif
-#ifndef SIM_APN
-#define SIM_APN "internet"
-#endif
+/* ---- state that survives deep sleep (and crash reboots) ---- */
+static constexpr uint32_t RTC_STATE_MAGIC = 0x8BADF00D;
+static RTC_DATA_ATTR uint32_t s_rtc_magic;         /* valid-state sentinel */
+static RTC_DATA_ATTR uint32_t s_uptime_s;          /* approx seconds since cold boot */
+static RTC_DATA_ATTR uint32_t s_last_sleep_s;      /* duration of the sleep just ended */
+static RTC_DATA_ATTR int32_t  s_next_upload_in_s;  /* countdown to the next upload */
+static RTC_DATA_ATTR uint8_t  s_retries_left;
+static RTC_DATA_ATTR uint8_t  s_boot_id;
+/* health telemetry */
+static RTC_DATA_ATTR uint16_t s_boot_count;
+static RTC_DATA_ATTR uint16_t s_wake_count;
+static RTC_DATA_ATTR uint16_t s_crash_count;       /* consecutive abnormal resets */
+static RTC_DATA_ATTR uint16_t s_wdt_trips;
+static RTC_DATA_ATTR uint16_t s_upload_fails;      /* consecutive failed attempts */
+static RTC_DATA_ATTR uint16_t s_vbat_min_mv;       /* envelope since last upload */
+static RTC_DATA_ATTR uint16_t s_vbat_max_mv;
+static RTC_DATA_ATTR uint32_t s_awake_ms;          /* awake time since last upload */
 
-/* ===================== record + RTC-persistent state ===================== */
-/* One sample. Add/remove fields here to log what you want. Kept in RTC RAM, so it
- * survives deep sleep but is lost on a full power cut. */
-typedef struct {
-    uint32_t uptime_s;     /* board uptime at sample time (for timestamping) */
-    uint16_t vbat_mv;
-    int16_t  ibat_ma;      /* + charging, - discharging */
-    uint16_t vbus_mv;
-    int16_t  ibus_ma;
-    uint8_t  chg_stat;     /* BQ25792::ChgStat */
-    uint8_t  fault0;
-    uint8_t  fault1;
-    int8_t   soc_pct;      /* crude voltage-based estimate */
-    uint16_t light_ch0;    /* EXAMPLE sensor: LTR-303 visible+IR. Replace with yours. */
-} LogRecord;
+BQ25792  bq;
+LTR303   light;
+SC7A20   accel;
+FlashLog flog;
 
-static RTC_DATA_ATTR LogRecord s_buf[BUFFER_SIZE];
-static RTC_DATA_ATTR uint16_t  s_count;
-static RTC_DATA_ATTR uint16_t  s_samples_since_upload;
-static RTC_DATA_ATTR uint32_t  s_uptime_s;
-static RTC_DATA_ATTR uint16_t  s_vindpm_mv;
-static RTC_DATA_ATTR int8_t    s_mppt_dir;
-static RTC_DATA_ATTR int32_t   s_mppt_last_pwr;
+/* Watch the whole wake: if anything hangs, panic-reboot instead of draining the
+ * battery at run current. Long stages feed it at checkpoints. */
+static void wdtBegin()
+{
+    esp_task_wdt_config_t cfg = {};
+    cfg.timeout_ms    = (uint32_t)WDT_TIMEOUT_S * 1000;
+    cfg.idle_core_mask = 0;
+    cfg.trigger_panic = true;
+    if (esp_task_wdt_init(&cfg) != ESP_OK)   /* already running (Arduino default) */
+        esp_task_wdt_reconfigure(&cfg);
+    esp_task_wdt_add(NULL);
+}
 
-BQ25792    bq;
-LTR303     light;
-ModemA7672 modem;
-
-/* ===================== helpers ===================== */
-
-/* Very crude 1S LiPo SoC from resting voltage. Replace with an OCV table or a
- * coulomb counter if you need accuracy; under load this reads low. */
-static int8_t socFromVoltage(uint16_t vbat_mv)
+/* Very crude 1S LiPo SoC from voltage. Good enough for thresholds + trends. */
+static uint8_t socFromVoltage(uint16_t vbat_mv)
 {
     if (vbat_mv >= 4200) return 100;
     if (vbat_mv <= 3300) return 0;
-    return (int8_t)((vbat_mv - 3300) * 100 / (4200 - 3300));
+    return (uint8_t)((vbat_mv - 3300) * 100 / (4200 - 3300));
 }
 
-/* One MPPT hill-climb step. Call only when charging from solar (VAC2). */
-static void mpptStep()
+static void readSample(LogRecord& r, const Solar::Status& sol)
 {
-    int32_t vbus = bq.readVbus_mV();
-    int32_t ibus = bq.readIbus_mA();
-    int32_t pwr  = vbus * (ibus > 0 ? ibus : 0);
-    if (s_mppt_last_pwr >= 0 && pwr < s_mppt_last_pwr) s_mppt_dir = -s_mppt_dir;
-    int32_t next = (int32_t)s_vindpm_mv + s_mppt_dir * MPPT_VINDPM_STEP_MV;
-    if (next < MPPT_VINDPM_MIN_MV) { next = MPPT_VINDPM_MIN_MV; s_mppt_dir = +1; }
-    if (next > MPPT_VINDPM_MAX_MV) { next = MPPT_VINDPM_MAX_MV; s_mppt_dir = -1; }
-    s_vindpm_mv     = (uint16_t)next;
-    s_mppt_last_pwr = pwr;
-    bq.setVINDPM_mV(s_vindpm_mv);
-}
+    memset(&r, 0xFF, sizeof(r));   /* spare bytes stay 0xFF (NOR-friendly) */
 
-/* Fill one record from the sensors. */
-static void readSample(LogRecord& r)
-{
+    r.ts_s     = clockValid() ? (uint32_t)time(nullptr) : 0;
     r.uptime_s = s_uptime_s;
+    r.boot_id  = s_boot_id;
 
-    /* Battery + charger (always logged). */
-    r.vbat_mv  = bq.readVbat_mV();
-    r.ibat_ma  = bq.readIbat_mA();
-    r.vbus_mv  = bq.readVbus_mV();
-    r.ibus_ma  = bq.readIbus_mA();
-    r.chg_stat = (uint8_t)bq.chargeState();
+    r.vbat_mv   = bq.readVbat_mV();
+    r.ibat_ma   = bq.readIbat_mA();
+    r.vbus_mv   = bq.readVbus_mV();
+    r.ibus_ma   = bq.readIbus_mA();
+    r.vac2_mv   = bq.readVac2_mV();
+    r.vsys_mv   = bq.readVsys_mV();
+    r.chg_stat  = (uint8_t)bq.chargeState();
     bq.readFaults(r.fault0, r.fault1);
-    r.soc_pct  = socFromVoltage(r.vbat_mv);
+    r.soc_pct   = socFromVoltage(r.vbat_mv);
 
-    /* --- YOUR SENSOR --------------------------------------------------------
-     * Example: the on-board LTR-303 light sensor. Swap this for whatever you
-     * attached (I2C on the SENSOR header, SPI, an analog pin, ...). Use
-     * EcoTrace::sensorRail(true/false) if it is on the switched sensor rail. */
-    r.light_ch0 = light.begin() ? light.readCh0() : 0;
-    light.powerDown();
-}
+    r.vindpm_mv   = sol.vindpm_mv;
+    r.vreg_mv     = sol.vreg_mv;
+    r.harvest_mah = sol.harvest_today_mah;
+    r.flags = (sol.solar_present ? RECF_SOLAR   : 0) |
+              (sol.usb_present   ? RECF_USB     : 0) |
+              (sol.weather_good  ? RECF_WEATHER : 0) |
+              (sol.eco_target    ? RECF_ECO_CHG : 0);
 
-/* Build the telemetry JSON for one record. ts (unix ms) is added when we have
- * network time; otherwise the server timestamps on receipt. */
-static void buildJson(const LogRecord& r, int64_t now_ms, uint32_t uptime_now,
-                      char* out, size_t len)
-{
-    float pwr_mw = (float)r.vbat_mv / 1000.0f * (float)r.ibat_ma;
-    char values[320];
-    snprintf(values, sizeof(values),
-        "\"vbat_mv\":%u,\"ibat_ma\":%d,\"bat_power_mw\":%.0f,\"soc_pct\":%d,"
-        "\"vbus_mv\":%u,\"ibus_ma\":%d,\"chg_stat\":%u,\"fault0\":%u,\"fault1\":%u,"
-        "\"light_ch0\":%u",                       /* <- your sensor field(s) here */
-        r.vbat_mv, r.ibat_ma, pwr_mw, r.soc_pct,
-        r.vbus_mv, r.ibus_ma, r.chg_stat, r.fault0, r.fault1,
-        r.light_ch0);
-
-    if (now_ms > 0) {
-        int64_t ts = now_ms - (int64_t)(uptime_now - r.uptime_s) * 1000;
-        snprintf(out, len, "{\"ts\":%lld,\"values\":{%s}}", (long long)ts, values);
-    } else {
-        snprintf(out, len, "{%s}", values);
+    /* On-board I2C sensors (always-on 3V3 rail; low-powered between reads). */
+    r.light_ch0 = r.light_ch1 = 0;
+    if (light.begin()) {
+        delay(120);   /* one ALS integration period after leaving standby */
+        uint16_t c0, c1;
+        if (light.read(c0, c1)) { r.light_ch0 = c0; r.light_ch1 = c1; }
+        light.powerDown();
     }
-}
-
-/* Power the modem, attach, POST every buffered record, clear on success. */
-static void uploadBuffer()
-{
-#ifdef POST_URL
-    Serial.println("Upload: powering modem...");
-    if (!modem.begin()) { Serial.println("  modem did not boot"); modem.powerOff(); return; }
-    if (!modem.simReady() || !modem.waitForNetwork(30000)) {
-        Serial.println("  no SIM / not registered"); modem.powerOff(); return;
-    }
-    if (!modem.connectGPRS(SIM_APN)) { Serial.println("  PDP failed"); modem.powerOff(); return; }
-    Serial.printf("  attached, %d dBm\n", modem.signalQuality_dBm());
-
-    int64_t now_ms = modem.getUnixTimeMs();   /* 0 if network time unavailable */
-
-    uint16_t sent = 0;
-    for (uint16_t i = 0; i < s_count; i++) {
-        char json[420];
-        buildJson(s_buf[i], now_ms, s_uptime_s, json, sizeof(json));
-        int status;
-        if (!modem.httpPost(POST_URL, "application/json", json, status)) {
-            Serial.printf("  POST failed at record %u (HTTP %d)\n", i, status);
-            break;
+    r.acc_mg[0] = r.acc_mg[1] = r.acc_mg[2] = 0;
+    if (accel.begin()) {
+        delay(20);    /* first sample at 100 Hz */
+        int16_t ax, ay, az;
+        if (accel.readMilliG(ax, ay, az)) {
+            r.acc_mg[0] = ax; r.acc_mg[1] = ay; r.acc_mg[2] = az;
         }
-        sent++;
+        accel.powerDown();
     }
-    Serial.printf("  uploaded %u/%u records\n", sent, s_count);
-    if (sent == s_count) s_count = 0;         /* clear only on full success */
-    modem.powerOff();
-#else
-    Serial.println("Upload skipped: POST_URL not set in secrets.h (bench mode).");
-    s_count = 0;   /* drop the buffer so it doesn't overflow on the bench */
-#endif
 }
 
-/* ===================== main ===================== */
+/* QON button (GPIO2, shared with the BQ25792's QON input; external pull-up,
+ * button pulls low). Short press while asleep = wake for an immediate sample.
+ * BUTTON_OTA_PRESSES presses in a row = WiFi OTA mode (testing convenience).
+ * Held BUTTON_SHIP_HOLD_MS = power off via BQ ship mode (BATFET opens,
+ * ~129 uA); wake by holding the button ~1 s (BQ tSM_EXIT). A ~10 s hold
+ * triggers the BQ's own hardware power cycle regardless of firmware. */
+static void handleButton(void)
+{
+    pinMode(ECO_PIN_QON, INPUT);
+    if (!EcoTrace::wokeFromButton() && digitalRead(ECO_PIN_QON) == HIGH)
+        return;
+    uint8_t presses = 1;   /* the press that woke us (it may already be released) */
+
+    /* If that press is still held, watch for the ship-mode hold. */
+    uint32_t t0 = millis();
+    while (digitalRead(ECO_PIN_QON) == LOW) {
+        if (millis() - t0 >= BUTTON_SHIP_HOLD_MS) {
+            EcoTrace::ledOn();   /* feedback: power-off armed */
+            Serial.println("button held: entering ship mode (hold ~1 s to wake)");
+            Serial.flush();
+            bq.enterShipMode();
+            delay(1000);
+            /* Still running means an adapter is holding VSYS up. The BATFET is
+             * already open (note: battery does NOT charge in ship mode), so the
+             * board goes dark the moment the cable is pulled. Park cheaply. */
+            Serial.println("adapter present - board powers off once unplugged");
+            EcoTrace::ledOff();
+            EcoTrace::deepSleepSeconds(UPLOAD_PERIOD_S);
+        }
+        delay(10);
+    }
+
+    /* Count further presses; each one restarts the window. The boot after the
+     * wake press takes a few hundred ms, so "press 3x" in a normal rhythm lands
+     * presses 2 and 3 in here. */
+    uint32_t window_end = millis() + BUTTON_MULTIPRESS_WINDOW_MS;
+    while ((int32_t)(window_end - millis()) > 0 && presses < BUTTON_OTA_PRESSES) {
+        if (digitalRead(ECO_PIN_QON) == LOW) {
+            delay(30);                                    /* debounce */
+            if (digitalRead(ECO_PIN_QON) == LOW) {
+                presses++;
+                EcoTrace::ledOn(); delay(30); EcoTrace::ledOff();   /* press feedback */
+                while (digitalRead(ECO_PIN_QON) == LOW) delay(10);  /* wait for release */
+                window_end = millis() + BUTTON_MULTIPRESS_WINDOW_MS;
+            }
+        }
+        delay(5);
+    }
+
+    if (presses >= BUTTON_OTA_PRESSES) {
+        Serial.printf("button: %u presses - WiFi OTA mode\n", presses);
+        Ota::runWindow();   /* reboots on a successful push, else returns */
+    } else {
+        Serial.printf("button: %u press(es) - extra sample\n", presses);
+    }
+}
+
 void setup()
 {
     Serial.begin(115200);
-    delay(1500);
+    wdtBegin();
+
+    /* Boot classification: clean timer wake / crash reboot with RTC state intact /
+     * true cold boot (power-on, RTC RAM lost). */
+    bool timer_wake  = EcoTrace::wokeFromTimer();
+    bool button_wake = EcoTrace::wokeFromButton();
+    bool cold        = (s_rtc_magic != RTC_STATE_MAGIC);
+    bool crashed     = !cold && !timer_wake && !button_wake;
+    esp_reset_reason_t why = esp_reset_reason();
+
+    if (cold) delay(1500);   /* give USB CDC time to enumerate on the bench only */
+
     EcoTrace::beginBoard();
     EcoTrace::beginI2C();
+    EcoTrace::beginSPI();
 
-    bool first_boot = !EcoTrace::wokeFromTimer();
-    if (first_boot) {
-        s_count = 0;
-        s_samples_since_upload = 0;
-        s_uptime_s = 0;
-        s_vindpm_mv = MPPT_VINDPM_START_MV;
-        s_mppt_dir = +1;
-        s_mppt_last_pwr = -1;
+    handleButton();
+
+    if (cold) {
+        s_uptime_s         = 0;
+        s_last_sleep_s     = 0;
+        s_next_upload_in_s = 0;          /* upload (and clock-sync) on first boot */
+        s_retries_left     = UPLOAD_MAX_RETRIES;
+        s_boot_id          = (uint8_t)esp_random();
+        s_boot_count       = 0;
+        s_wake_count       = 0;
+        s_crash_count      = 0;
+        s_wdt_trips        = 0;
+        s_upload_fails     = 0;
+        s_vbat_min_mv      = 0xFFFF;
+        s_vbat_max_mv      = 0;
+        s_awake_ms         = 0;
+        Solar::reset();
+        s_rtc_magic = RTC_STATE_MAGIC;
+        Serial.printf("cold boot (id %u, reset reason %d)\n", s_boot_id, (int)why);
+    } else if (crashed) {
+        /* The previous wake died (watchdog, panic, brownout, manual reset). Keep
+         * all state, note it, and don't retry the likely culprit immediately. */
+        s_crash_count++;
+        if (why == ESP_RST_TASK_WDT || why == ESP_RST_INT_WDT ||
+            why == ESP_RST_WDT || why == ESP_RST_PANIC)
+            s_wdt_trips++;
+        if (s_next_upload_in_s <= 0) s_next_upload_in_s = UPLOAD_RETRY_S;
+        Serial.printf("recovered from abnormal reset (reason %d, %u in a row)\n",
+                      (int)why, s_crash_count);
     } else {
-        s_uptime_s += SAMPLE_INTERVAL_S;   /* approx: the sleep we just finished */
+        s_wake_count++;
+        if (timer_wake) {
+            /* A button wake cuts the sleep short by an unknown amount, so leave
+             * the uptime/upload bookkeeping to the timer wakes only. */
+            s_uptime_s         += s_last_sleep_s;
+            s_next_upload_in_s -= (int32_t)s_last_sleep_s;
+        }
     }
+    s_boot_count++;
 
-    /* Charger: bring up ADC, keep charging configured (watchdog disabled so our
-     * settings persist). Cheap to redo every wake. */
-    if (bq.begin()) {
+    /* After a crash the log cursors in RTC RAM may predate a half-finished
+     * append -- re-recover from the chip in that case (cheap). */
+    if (!flog.begin(cold || crashed))
+        Serial.println("WARNING: SPI flash not found -- samples will be lost!");
+
+    /* Charger up: ADC on, profile applied (VREG is set by the solar manager). */
+    Solar::Status sol = {};
+    bool bq_ok = bq.begin();
+    if (bq_ok) {
         bq.enableADC();
         bq.enableIbatSensing();
-        bq.configureCharging(CHARGE_CURRENT_MA, INPUT_LIMIT_MA, CHARGE_VOLTAGE_MV);
-        bq.enableACDRV1(true);   /* USB input sits behind ACFET1, which is off at POR */
-#if MPPT_ENABLE
-        bq.enableACDRV2(true);
-        bq.setVINDPM_mV(s_vindpm_mv);
-        if (bq.ac2Present()) mpptStep();   /* only track when solar is the source */
-#endif
+        bq.configureCharging(CHARGE_CURRENT_MA, 0 /* set per source below */, 0);
+        bq.enableACDRV1(true);   /* USB path gate is off at POR */
+        bq.enableACDRV2(true);   /* solar path gate */
+        sol = Solar::onWake(bq, SAMPLE_INTERVAL_S, localDayNum());
     } else {
         Serial.println("WARNING: BQ25792 not found -- battery data will be zero.");
     }
+    esp_task_wdt_reset();
 
-    /* Sample. */
-    if (s_count < BUFFER_SIZE) {
-        readSample(s_buf[s_count]);
-        LogRecord& r = s_buf[s_count];
-        Serial.printf("sample %u: VBAT=%u mV IBAT=%+d mA SOC=%d%% VBUS=%u mV %s light=%u\n",
-                      s_count, r.vbat_mv, r.ibat_ma, r.soc_pct, r.vbus_mv,
-                      bq.chargeStateName(), r.light_ch0);
-        s_count++;
-    } else {
-        Serial.println("buffer full -- forcing upload");
-        s_samples_since_upload = SAMPLES_PER_UPLOAD;
+    /* Sample -> flash. */
+    LogRecord r;
+    readSample(r, sol);
+    flog.append(r);
+    if (r.vbat_mv) {
+        if (r.vbat_mv < s_vbat_min_mv) s_vbat_min_mv = r.vbat_mv;
+        if (r.vbat_mv > s_vbat_max_mv) s_vbat_max_mv = r.vbat_mv;
+    }
+    Serial.printf("seq %lu: VBAT=%umV IBAT=%+dmA SOC=%u%% | in: %s VINDPM=%umV "
+                  "IBUS=%dmA | harvest %umAh (prev %u) weather=%s target=%umV | "
+                  "lux0=%u acc=[%d,%d,%d] | pending %lu\n",
+                  (unsigned long)r.seq, r.vbat_mv, r.ibat_ma, r.soc_pct,
+                  sol.usb_present ? "USB" : sol.solar_present ? "solar" : "none",
+                  r.vindpm_mv, r.ibus_ma,
+                  sol.harvest_today_mah, sol.harvest_prev_mah,
+                  sol.weather_good ? "good" : "bad", r.vreg_mv,
+                  r.light_ch0, r.acc_mg[0], r.acc_mg[1], r.acc_mg[2],
+                  (unsigned long)flog.pendingCount());
+    esp_task_wdt_reset();
+
+    /* Upload if due -- and only if the battery can afford the modem burst. */
+    if (s_next_upload_in_s <= 0) {
+        bool can_afford = r.vbat_mv >= UPLOAD_MIN_VBAT_MV ||
+                          sol.usb_present || sol.solar_present;
+        if (!can_afford) {
+            Serial.println("upload due but battery low -- deferring");
+            s_next_upload_in_s = UPLOAD_RETRY_S;
+        } else {
+            Uplink::StatusInfo si = {};
+            si.boot_id      = s_boot_id;
+            si.reset_reason = (uint8_t)why;
+            si.boot_count   = s_boot_count;
+            si.wake_count   = s_wake_count;
+            si.crash_count  = s_crash_count;
+            si.wdt_trips    = s_wdt_trips;
+            si.upload_fails = s_upload_fails;
+            si.vbat_min_mv  = (s_vbat_min_mv == 0xFFFF) ? 0 : s_vbat_min_mv;
+            si.vbat_max_mv  = s_vbat_max_mv;
+            si.awake_ms     = s_awake_ms + millis();
+            si.uptime_s     = s_uptime_s;
+
+            Uplink::Result u = Uplink::uploadAll(flog, SAMPLE_INTERVAL_S, si);
+            if (u.all_sent) {
+                s_next_upload_in_s = UPLOAD_PERIOD_S;
+                s_retries_left     = UPLOAD_MAX_RETRIES;
+                s_upload_fails     = 0;
+                s_vbat_min_mv = s_vbat_max_mv = r.vbat_mv ? r.vbat_mv : s_vbat_max_mv;
+                if (!r.vbat_mv) s_vbat_min_mv = 0xFFFF;
+                s_awake_ms = 0;
+            } else {
+                s_upload_fails++;
+                if (s_retries_left > 0) {
+                    s_retries_left--;
+                    s_next_upload_in_s = UPLOAD_RETRY_S;
+                } else {
+                    s_next_upload_in_s = UPLOAD_PERIOD_S;   /* give up until next slot */
+                    s_retries_left     = UPLOAD_MAX_RETRIES;
+                }
+            }
+        }
     }
 
-    /* Upload if due. */
-    if (++s_samples_since_upload >= SAMPLES_PER_UPLOAD) {
-        s_samples_since_upload = 0;
-        uploadBuffer();
-    }
+    /* Everything down, then sleep. Charging continues autonomously. */
+    if (bq_ok) bq.disableADC();
+    flog.sleep();
 
-    if (bq.isPresent()) bq.disableADC();   /* save the charger's ADC power in sleep */
+    uint32_t sleep_s = SAMPLE_INTERVAL_S;
+    if (r.vbat_mv && r.vbat_mv < CRITICAL_VBAT_MV && !sol.usb_present && !sol.solar_present)
+        sleep_s = SAMPLE_INTERVAL_S * CRITICAL_INTERVAL_MULT;
+    if (s_crash_count >= CRASH_SLOWDOWN_COUNT)
+        sleep_s = SAMPLE_INTERVAL_S * CRITICAL_INTERVAL_MULT;   /* containment */
 
-    Serial.printf("sleeping %d s (buffered %u/%u)\n",
-                  SAMPLE_INTERVAL_S, s_count, BUFFER_SIZE);
+    /* Reaching this point = the wake completed; the crash streak is over. */
+    s_crash_count  = 0;
+    s_awake_ms    += millis();
+    s_uptime_s    += millis() / 1000;   /* count awake time into uptime too */
+    s_last_sleep_s = sleep_s;
+
+    Serial.printf("sleeping %lus (next upload in %lds)\n",
+                  (unsigned long)sleep_s, (long)s_next_upload_in_s);
     Serial.flush();
-    EcoTrace::deepSleepSeconds(SAMPLE_INTERVAL_S);   /* never returns */
+    EcoTrace::deepSleepSeconds(sleep_s);   /* never returns */
 }
 
 void loop() {}
