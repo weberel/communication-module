@@ -11,7 +11,7 @@
  * battery/charger state), appends one record to the SPI-flash ring log, runs one
  * solar-management pass, and deep-sleeps. Below CRITICAL_VBAT_MV the interval is
  * stretched to save the last of the battery (logging continues, slower). */
-#define FW_VERSION              "dl-2.9"   /* printed at boot + sent with telemetry;
+#define FW_VERSION              "dl-2.12"  /* printed at boot + sent with telemetry;
                                             * bump before an OTA push to see it took */
 
 #define SAMPLE_INTERVAL_S       300     /* 5 min */
@@ -30,6 +30,8 @@
 #define UPLOAD_MAX_RETRIES      3
 #define UPLOAD_MIN_VBAT_MV      3500
 #define UPLOAD_BATCH_RECORDS    8       /* records per HTTP POST (~3.5 KB JSON) */
+#define UPLOAD_BATCH_GAP_MS     400     /* pause between POSTs -- ThingsBoard Cloud
+                                         * intermittently 500s back-to-back bursts */
 #define NTP_SERVER              "pool.ntp.org"
 #define TZ_OFFSET_MIN           120     /* local time for the harvest day-rollover (CEST) */
 

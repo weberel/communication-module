@@ -428,7 +428,12 @@ void setup()
     }
 
     /* Everything down, then sleep. Charging continues autonomously. */
-    if (bq_ok) bq.disableADC();
+    if (bq_ok) {
+        bq.disableADC();
+        bq.enableIbatSensing(false);   /* EN_IBAT costs charger quiescent; nothing
+                                        * reads IBAT while we sleep. Re-enabled
+                                        * next wake before sampling. */
+    }
     flog.sleep();
 
     uint32_t sleep_s = SAMPLE_INTERVAL_S;

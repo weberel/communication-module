@@ -56,9 +56,14 @@ void sensorRail(bool on)
 void deepSleepSeconds(uint32_t seconds)
 {
     /* Assert safe levels, then latch them so they survive deep sleep (single-IO
-     * hold persists through deep sleep on the C6). */
+     * hold persists through deep sleep on the C6).
+     *
+     * PWRKEY is held LOW (deasserted) in sleep, unlike the awake idle-HIGH: HIGH
+     * keeps the Q409 inverter's base conducting, ~0.3 mA of pure waste for the
+     * whole sleep. With the modem rail held off the PWRKEY level is irrelevant
+     * to the modem, and beginBoard() restores idle-HIGH on every wake. */
     digitalWrite(ECO_PIN_MODEM_PWR_EN, LOW);
-    digitalWrite(ECO_PIN_MODEM_PWRKEY, HIGH);
+    digitalWrite(ECO_PIN_MODEM_PWRKEY, LOW);
     digitalWrite(ECO_PIN_SENSOR_PWR, ECO_SENSOR_PWR_OFF);
     digitalWrite(ECO_PIN_LED, LOW);
 

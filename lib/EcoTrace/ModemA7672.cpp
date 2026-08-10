@@ -225,7 +225,9 @@ bool ModemA7672::httpPost(const char* url, const char* content_type, const char*
         if (p && sscanf(p, "+HTTPACTION: %d,%d,%d", &method, &status, &len) == 3)
             ok = (status >= 200 && status < 300);
     }
-    if (ok && body && body_len) {
+    /* Read the body whenever the server actually answered (status >= 100), not
+     * just on 2xx -- error bodies say WHY a request was rejected. */
+    if (status >= 100 && body && body_len) {
         if (sendAT("AT+HTTPREAD=0,512", "+HTTPREAD:", 5000)) {
             strncpy(body, _resp, body_len - 1);
             body[body_len - 1] = 0;

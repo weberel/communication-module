@@ -98,7 +98,15 @@ static ModemA7672 s_modem;
 static bool cellPost(const char* json)
 {
     int status = 0;
-    return s_modem.httpPost(POST_URL, "application/json", json, status);
+    char body[200] = "";
+    bool ok = s_modem.httpPost(POST_URL, "application/json", json, status,
+                               body, sizeof(body));
+    if (!ok)
+        /* status <100 = AT-flow failure before any HTTP happened; 7xx = SIMCom
+         * internal (703 DNS, 706 timeout, ...); else a real HTTP error code and
+         * the body is the server's explanation. */
+        Serial.printf("  cell POST failed (status %d) body: %.160s\n", status, body);
+    return ok;
 }
 
 static bool cellUp(int& rssi_dbm)
@@ -130,7 +138,9 @@ static bool wifiPost(const char* json)
     http.addHeader("Content-Type", "application/json");
     int code = http.POST((uint8_t*)json, strlen(json));
     http.end();
-    return code >= 200 && code < 300;
+    bool ok = code >= 200 && code < 300;
+    if (!ok) Serial.printf("  wifi POST failed (%d, RSSI %d dBm)\n", code, WiFi.RSSI());
+    return ok;
 }
 
 static int s_wifi_rssi;   /* captured on connect for the status record */
@@ -177,9 +187,22 @@ static uint32_t drain(FlashLog& log, uint32_t interval_s, bool (*post)(const cha
                          (uint32_t)(now_ms > 0 ? UPLOAD_BATCH_RECORDS : 1));
         uint32_t included = buildBatch(log, n, now_ms, interval_s);
         if (included == 0) { log.advance(n); continue; }   /* skip corrupt slots */
-        if (!post(s_json)) break;
+        if (!post(s_json)) {
+            /* One retry per batch: on a marginal link (WiFi at -88 dBm drops
+             * single POSTs) this rescues the drain instead of aborting it. */
+            esp_task_wdt_reset();
+            if (!post(s_json)) {
+                Serial.printf("  drain stopped at seq %lu (%lu still pending)\n",
+                              (unsigned long)(log.headSeq() - log.pendingCount()),
+                              (unsigned long)log.pendingCount());
+                break;
+            }
+        }
         log.advance(n);
         sent += included;
+        /* Pace the server: draining a large backlog back-to-back trips what
+         * looks like ThingsBoard Cloud rate limiting (intermittent 500s). */
+        if (log.pendingCount() > 0) delay(UPLOAD_BATCH_GAP_MS);
     }
     return sent;
 }
