@@ -116,11 +116,14 @@ Status onWake(BQ25792& bq, uint32_t interval_s, int32_t day_num)
     if (rolled) { s_prev_day_mas = s_day_mas; s_day_mas = 0; }
 
     /* Weather call + charge target. "Good" if yesterday delivered, or today
-     * already has -- so the cap engages the moment a sunny day proves itself. */
+     * already has -- so the cap engages the moment a sunny day proves itself.
+     * USB always charges to 100 %: plugging in a cable is a deliberate act
+     * ("fill it up"), and the longevity cap only makes sense on solar, where
+     * the energy keeps coming tomorrow. */
     uint16_t today_mah = (uint16_t)(s_day_mas / 3600);
     uint16_t prev_mah  = (uint16_t)(s_prev_day_mas / 3600);
     st.weather_good = (prev_mah >= WEATHER_GOOD_MAH) || (today_mah >= WEATHER_GOOD_MAH);
-    st.eco_target   = st.weather_good;
+    st.eco_target   = st.weather_good && !st.usb_present;
 
     uint16_t vreg = st.eco_target ? VREG_ECO_MV : VREG_FULL_MV;
     bq.setChargeVoltage_mV(vreg);

@@ -64,8 +64,16 @@ public:
                   int& status, char* body = nullptr, size_t body_len = 0);
 
     /* ---- Time --------------------------------------------------------------- */
-    /* AT+CCLK? parsed to Unix ms (requires NITZ/network time). 0 on failure. */
+    /* AT+CCLK? parsed to Unix ms (requires NITZ/network time). 0 on failure.
+     * CAUTION: without NITZ the modem reports its default 1970 epoch, which the
+     * 2-digit-year parse renders as 2070 -- sanity-check the result, and use
+     * ntpSync() first on carriers that do not send network time. */
     int64_t getUnixTimeMs();
+
+    /* Sync the modem clock via NTP over the data connection (AT+CNTP; needs
+     * connectGPRS first). After success getUnixTimeMs() returns real time even
+     * on carriers without NITZ. */
+    bool ntpSync(const char* server = "pool.ntp.org");
 
     /* ---- GPS (UNTESTED on Rev A hardware -- see docs/hardware-errata.md) ----- */
     /* Left as a stub on purpose. The A7672E-LASE has an internal GNSS engine

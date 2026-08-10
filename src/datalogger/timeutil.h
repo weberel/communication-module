@@ -11,10 +11,18 @@
 #include <sys/time.h>
 #include "config.h"
 
-/* Anything before 2026 means "never synced" (cold boot starts at epoch 0). */
+/* Anything outside [2026, 2036) means "never synced" or garbage. The upper
+ * bound matters: an A7672 without network time (NITZ) reports its default
+ * 1970 epoch, which the 2-digit-year CCLK parse turns into 2070 -- trusting
+ * that once stamped a whole day of records with 2070 timestamps. */
 static constexpr time_t CLOCK_MIN_VALID = 1767225600;   /* 2026-01-01 */
+static constexpr time_t CLOCK_MAX_VALID = 2082758400;   /* 2036-01-01 */
 
-static inline bool clockValid() { return time(nullptr) >= CLOCK_MIN_VALID; }
+static inline bool clockValid()
+{
+    time_t t = time(nullptr);
+    return t >= CLOCK_MIN_VALID && t < CLOCK_MAX_VALID;
+}
 
 static inline int64_t nowMs()
 {
@@ -26,7 +34,8 @@ static inline int64_t nowMs()
 
 static inline void setClockMs(int64_t unix_ms)
 {
-    if (unix_ms < (int64_t)CLOCK_MIN_VALID * 1000) return;
+    if (unix_ms <  (int64_t)CLOCK_MIN_VALID * 1000) return;
+    if (unix_ms >= (int64_t)CLOCK_MAX_VALID * 1000) return;   /* 2070 bug guard */
     struct timeval tv;
     tv.tv_sec  = (time_t)(unix_ms / 1000);
     tv.tv_usec = (suseconds_t)((unix_ms % 1000) * 1000);

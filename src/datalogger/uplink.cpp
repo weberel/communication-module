@@ -124,9 +124,15 @@ static bool cellUp(int& rssi_dbm)
     Serial.printf("  attached, %d dBm\n", rssi_dbm);
 
     /* Re-sync the clock on every upload -- the C6's sleep timer runs off an RC
-     * oscillator, so between uploads the wall clock drifts by minutes. */
+     * oscillator, so between uploads the wall clock drifts by minutes. This
+     * carrier sends no NITZ (modem reports its 1970 default, which the parser
+     * renders as 2070!), so fall back to NTP over the data connection. */
     int64_t t = s_modem.getUnixTimeMs();
-    if (t > 0) setClockMs(t);
+    if (t < (int64_t)CLOCK_MIN_VALID * 1000 || t >= (int64_t)CLOCK_MAX_VALID * 1000) {
+        Serial.println("  modem clock implausible (no NITZ) -- NTP over cellular");
+        if (s_modem.ntpSync(NTP_SERVER)) t = s_modem.getUnixTimeMs();
+    }
+    setClockMs(t);   /* rejects anything outside [2026, 2036) on its own */
     return true;
 }
 

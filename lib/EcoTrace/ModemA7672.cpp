@@ -238,6 +238,16 @@ bool ModemA7672::httpPost(const char* url, const char* content_type, const char*
 }
 
 /* ===================== time ===================== */
+bool ModemA7672::ntpSync(const char* server)
+{
+    char cmd[96];
+    snprintf(cmd, sizeof(cmd), "AT+CNTP=\"%s\",0", server);   /* 0 = UTC */
+    if (!sendAT(cmd, "OK", 2000)) return false;
+    if (!sendAT("AT+CNTP", "OK", 5000)) return false;
+    /* URC "+CNTP: 0" = success; any other code = failure. */
+    return waitFor("+CNTP:", 15000) && strstr(_resp, "+CNTP: 0") != nullptr;
+}
+
 int64_t ModemA7672::getUnixTimeMs()
 {
     if (!sendAT("AT+CCLK?", "+CCLK:", 3000)) return 0;
