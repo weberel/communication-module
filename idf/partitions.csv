@@ -1,0 +1,10 @@
+# 4 MB flash, dual OTA slots with rollback (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE).
+# Same layout as the Arduino build so a unit can be migrated over USB without
+# disturbing the external-flash data ring.
+# Name,   Type, SubType,  Offset,   Size,     Flags
+nvs,      data, nvs,      0x9000,   0x4000,
+otadata,  data, ota,      0xd000,   0x2000,
+phy_init, data, phy,      0xf000,   0x1000,
+app0,     app,  ota_0,    0x10000,  0x1F0000,
+app1,     app,  ota_1,    0x200000, 0x1F0000,
+coredump, data, coredump, 0x3F0000, 0x10000,

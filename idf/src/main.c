@@ -1,0 +1,270 @@
+/*
+ * ecoTrace datalogger -- ESP-IDF port.
+ *
+ * Milestone: LOGGING PARITY with the hardware-validated Arduino build
+ * (src/datalogger, frozen at dl-2.14). Each wake: full battery/charger state +
+ * all three I2C sensors -> one 64 B record into the flash ring -> deep sleep.
+ * Includes the field-robustness battery floors + park mode (2026-08-11 spec).
+ *
+ * NOT yet ported (next milestones, in order):
+ *   - uplink: esp_modem PPP + esp-mqtt + mbedTLS (fail-closed, no plaintext),
+ *     registration diagnostics, bounded escalation ladder
+ *   - error-event log (coredump partition), health telemetry
+ *   - OTA with rollback, NVS provisioning, ATECC identity, LP-core sampling
+ */
+#include <string.h>
+#include <time.h>
+
+#include "esp_attr.h"
+#include "esp_log.h"
+#include "esp_random.h"
+#include "esp_sleep.h"
+#include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "config.h"
+#include "board.h"
+#include "record.h"
+#include "flash_log.h"
+#include "ext_flash.h"
+#include "bq25792.h"
+#include "solar.h"
+#include "sensors.h"
+#include "uplink.h"
+
+static const char *TAG = "ecotrace";
+
+/* ---- state surviving deep sleep (and crash reboots) ---- */
+#define RTC_STATE_MAGIC 0x8BADF00Du
+static RTC_DATA_ATTR uint32_t s_rtc_magic;
+static RTC_DATA_ATTR uint32_t s_uptime_s;
+static RTC_DATA_ATTR uint32_t s_last_sleep_s;
+static RTC_DATA_ATTR uint8_t  s_boot_id;
+static RTC_DATA_ATTR uint16_t s_boot_count;
+static RTC_DATA_ATTR uint16_t s_wake_count;
+static RTC_DATA_ATTR uint16_t s_crash_count;
+static RTC_DATA_ATTR uint8_t  s_parked;      /* battery park mode latch */
+/* upload scheduling: bounded tempo (2026-08-11 spec) */
+static RTC_DATA_ATTR int32_t  s_next_upload_in_s;
+static RTC_DATA_ATTR uint8_t  s_retries_left;
+static RTC_DATA_ATTR uint32_t s_last_deep_uptime;   /* deep search once/day */
+static RTC_DATA_ATTR uint8_t  s_upload_inflight;
+static RTC_DATA_ATTR uint8_t  s_upload_crashed;
+
+#define UPLOAD_PERIOD_S (12 * 3600)
+#define UPLOAD_RETRY_S  (30 * 60)
+#define UPLOAD_RETRIES  2
+
+static uint8_t soc_from_voltage(uint16_t vbat_mv)
+{
+    if (vbat_mv >= 4200) return 100;
+    if (vbat_mv <= 3300) return 0;
+    return (uint8_t)((vbat_mv - 3300) * 100 / (4200 - 3300));
+}
+
+static void read_sample(LogRecord *r, const solar_status_t *sol)
+{
+    memset(r, 0xFF, sizeof(*r));   /* spare bytes stay 0xFF (NOR-friendly) */
+
+    time_t now = time(NULL);
+    r->ts_s     = (now >= 1767225600 && now < 2082758400) ? (uint32_t)now : 0;
+    r->uptime_s = s_uptime_s;
+    r->boot_id  = s_boot_id;
+
+    r->vbat_mv  = bq_vbat_mv();
+    r->ibat_ma  = bq_ibat_ma();
+    r->vbus_mv  = bq_vbus_mv();
+    r->ibus_ma  = bq_ibus_ma();
+    r->vac2_mv  = bq_vac2_mv();
+    r->vsys_mv  = bq_vsys_mv();
+    r->chg_stat = (uint8_t)bq_charge_state();
+    bq_faults(&r->fault0, &r->fault1);
+    r->soc_pct  = soc_from_voltage(r->vbat_mv);
+
+    r->vindpm_mv   = sol->vindpm_mv;
+    r->vreg_mv     = sol->vreg_mv;
+    r->harvest_mah = sol->harvest_today_mah;
+    r->flags = (sol->solar_present ? RECF_SOLAR   : 0) |
+               (sol->usb_present   ? RECF_USB     : 0) |
+               (sol->weather_good  ? RECF_WEATHER : 0) |
+               (sol->eco_target    ? RECF_ECO_CHG : 0);
+
+    uint16_t c0, c1;
+    if (ltr303_sample(&c0, &c1)) { r->light_ch0 = c0; r->light_ch1 = c1; }
+    else                         { r->light_ch0 = r->light_ch1 = 0; }
+
+    int16_t ax, ay, az;
+    if (sc7a20_sample(&ax, &ay, &az)) {
+        r->acc_mg[0] = ax; r->acc_mg[1] = ay; r->acc_mg[2] = az;
+    } else {
+        r->acc_mg[0] = r->acc_mg[1] = r->acc_mg[2] = 0;
+    }
+
+    float mbar, degc;
+    if (ms5837_sample(&mbar, &degc)) {
+        r->press_dmbar = (uint16_t)(mbar * 10.0f + 0.5f);
+        r->temp_cC     = (int16_t)(degc * 100.0f + (degc >= 0 ? 0.5f : -0.5f));
+    } else {
+        r->press_dmbar = 0;
+        r->temp_cC     = 0;
+    }
+}
+
+void app_main(void)
+{
+    esp_reset_reason_t why = esp_reset_reason();
+    bool timer_wake  = board_woke_from_timer();
+    bool button_wake = board_woke_from_button();
+    bool cold        = (s_rtc_magic != RTC_STATE_MAGIC);
+    bool crashed     = !cold && !timer_wake && !button_wake;
+
+    board_init();
+
+    if (cold) vTaskDelay(pdMS_TO_TICKS(1500));   /* let USB console enumerate */
+    ESP_LOGI(TAG, "ecoTrace datalogger %s (ESP-IDF port)", FW_VERSION);
+
+    if (cold) {
+        s_rtc_magic        = RTC_STATE_MAGIC;
+        s_uptime_s         = 0;
+        s_last_sleep_s     = 0;
+        s_boot_id          = (uint8_t)esp_random();
+        s_boot_count       = 0;
+        s_wake_count       = 0;
+        s_crash_count      = 0;
+        s_parked           = 0;
+        s_next_upload_in_s = 0;   /* first boot phones home immediately */
+        s_retries_left     = UPLOAD_RETRIES;
+        s_last_deep_uptime = 0;
+        s_upload_inflight  = 0;
+        s_upload_crashed   = 0;
+        solar_reset();
+        ESP_LOGI(TAG, "cold boot (id %u, reset reason %d)", s_boot_id, (int)why);
+    } else if (crashed) {
+        s_crash_count++;
+        if (s_upload_inflight) {           /* the upload killed us */
+            s_upload_crashed  = 1;
+            s_upload_inflight = 0;
+        }
+        if (s_next_upload_in_s <= 0) s_next_upload_in_s = UPLOAD_RETRY_S;
+        ESP_LOGW(TAG, "recovered from abnormal reset (reason %d, %u in a row)",
+                 (int)why, s_crash_count);
+    } else {
+        s_wake_count++;
+        if (timer_wake) {
+            s_uptime_s         += s_last_sleep_s;
+            s_next_upload_in_s -= (int32_t)s_last_sleep_s;
+        }
+        if (button_wake) ESP_LOGI(TAG, "button wake -- sample + upload now");
+    }
+    s_boot_count++;
+
+    /* Charger first: park-mode decision needs VBAT before we touch anything. */
+    bool bq_ok = bq_begin();
+    if (bq_ok) bq_adc_enable(true);
+    uint16_t vbat = bq_ok ? bq_vbat_mv() : 0;
+
+    /* Battery park mode: below PARK_VBAT_MV (and nothing plugged in) do the
+     * absolute minimum -- no flash writes, no sensors, long sleeps -- until the
+     * pack recovers past the hysteresis threshold. Brownout mid-flash-write is
+     * the failure this avoids. */
+    bool input_present = bq_ok && (bq_ac1_present() || bq_ac2_present());
+    if (bq_ok && !input_present) {
+        if (s_parked && vbat < PARK_RESUME_VBAT_MV) {
+            ESP_LOGW(TAG, "parked (VBAT %u mV) -- sleeping %d s", vbat, PARK_SLEEP_S);
+            bq_adc_disable();
+            s_last_sleep_s = PARK_SLEEP_S;
+            board_deep_sleep(PARK_SLEEP_S);
+        }
+        if (!s_parked && vbat > 0 && vbat < PARK_VBAT_MV) {
+            ESP_LOGW(TAG, "entering park mode (VBAT %u mV < %d)", vbat, PARK_VBAT_MV);
+            s_parked = 1;
+            bq_adc_disable();
+            s_last_sleep_s = PARK_SLEEP_S;
+            board_deep_sleep(PARK_SLEEP_S);
+        }
+        s_parked = 0;   /* recovered (or never parked) */
+    }
+
+    if (!flashlog_begin(cold || crashed))
+        ESP_LOGE(TAG, "SPI flash not found -- samples will be lost!");
+
+    solar_status_t sol = { 0 };
+    if (bq_ok) {
+        bq_ibat_sense(true);
+        bq_configure_charging(CHARGE_CURRENT_MA, 0, 0);
+        bq_enable_acdrv1(true);
+        bq_enable_acdrv2(true);
+        sol = solar_on_wake(SAMPLE_INTERVAL_S, -1 /* clock sync lands with uplink */);
+    } else {
+        ESP_LOGE(TAG, "BQ25792 not found -- battery data will be zero");
+    }
+
+    LogRecord r;
+    read_sample(&r, &sol);
+    flashlog_append(&r);
+    ESP_LOGI(TAG,
+        "seq %lu: VBAT=%umV IBAT=%+dmA SOC=%u%% | in:%s%s VINDPM=%umV IBUS=%dmA | "
+        "harvest %umAh (prev %u) weather=%s target=%umV | lux0=%u acc=[%d,%d,%d] "
+        "P=%.1fmbar T=%.2fC | pending %lu",
+        (unsigned long)r.seq, r.vbat_mv, r.ibat_ma, r.soc_pct,
+        sol.usb_present ? " USB" : "", sol.solar_present ? " solar" : "",
+        r.vindpm_mv, r.ibus_ma,
+        sol.harvest_today_mah, sol.harvest_prev_mah,
+        sol.weather_good ? "good" : "bad", r.vreg_mv,
+        r.light_ch0, r.acc_mg[0], r.acc_mg[1], r.acc_mg[2],
+        r.press_dmbar / 10.0f, r.temp_cC / 100.0f,
+        (unsigned long)flashlog_pending());
+
+    /* Upload if due (or the button asked). Tempo is bounded: 2 quick retries,
+     * then only the 12 h schedule -- an outage costs ~2 short attempts a day
+     * while everything banks in flash. */
+    if (button_wake) s_next_upload_in_s = 0;
+    if (s_next_upload_in_s <= 0) {
+        uplink_ctx_t ctx = {
+            .boot_id      = s_boot_id,
+            .reset_reason = (uint8_t)why,
+            .boot_count   = s_boot_count,
+            .wake_count   = s_wake_count,
+            .crash_count  = s_crash_count,
+            .vbat_mv      = r.vbat_mv,
+            .deep_search  = (s_uptime_s - s_last_deep_uptime) >= 86400,
+            .skip_cellular = s_upload_crashed != 0,
+        };
+        if (ctx.deep_search) s_last_deep_uptime = s_uptime_s;
+
+        s_upload_inflight = 1;
+        uplink_result_t u = uplink_upload_all(&ctx);
+        s_upload_inflight = 0;
+        s_upload_crashed  = 0;   /* one-shot: cellular is primary again */
+
+        if (u.all_sent) {
+            s_next_upload_in_s = UPLOAD_PERIOD_S;
+            s_retries_left     = UPLOAD_RETRIES;
+        } else if (s_retries_left > 0) {
+            s_retries_left--;
+            s_next_upload_in_s = UPLOAD_RETRY_S;
+        } else {
+            s_next_upload_in_s = UPLOAD_PERIOD_S;
+            s_retries_left     = UPLOAD_RETRIES;
+        }
+    }
+
+    if (bq_ok) {
+        bq_adc_disable();
+        bq_ibat_sense(false);   /* EN_IBAT off across sleep (quiescent) */
+    }
+    flashlog_sleep();
+
+    uint32_t sleep_s = SAMPLE_INTERVAL_S;
+    if (r.vbat_mv && r.vbat_mv < CRITICAL_VBAT_MV &&
+        !sol.usb_present && !sol.solar_present)
+        sleep_s = SAMPLE_INTERVAL_S * CRITICAL_INTERVAL_MULT;
+
+    s_crash_count  = 0;   /* wake completed cleanly */
+    s_last_sleep_s = sleep_s;
+
+    ESP_LOGI(TAG, "sleeping %lu s", (unsigned long)sleep_s);
+    vTaskDelay(pdMS_TO_TICKS(200));   /* drain console */
+    board_deep_sleep(sleep_s);
+}

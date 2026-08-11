@@ -1,0 +1,6 @@
+# Managed components for the transport milestone.
+# esp_modem: A7672 in PPP mode -> cellular becomes a normal netif, so the ESP
+# runs the whole IP/TLS/MQTT stack itself (mTLS-ready for the ATECC608B).
+# mqtt (esp-mqtt) ships with ESP-IDF; only esp_modem is external.
+dependencies:
+  espressif/esp_modem: "^1.1.0"

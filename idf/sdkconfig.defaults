@@ -1,0 +1,36 @@
+# ecoTrace datalogger (ESP-IDF port) -- build-time configuration baseline.
+# PlatformIO merges this into the generated sdkconfig on first build.
+
+# ---- Flash / partitions ----
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---- OTA with rollback (the reason this port owns field OTA) ----
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# ---- Console over the C6's native USB Serial/JTAG ----
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# ---- Task watchdog: long timeout, panic-reboot (proven policy from Arduino) ----
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_INIT=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=120
+CONFIG_ESP_TASK_WDT_PANIC=y
+
+# ---- Crash forensics into the coredump partition ----
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+
+# ---- LP core (continuous sensor sampling -- headline feature of the port) ----
+CONFIG_ULP_COPROC_ENABLED=y
+CONFIG_ULP_COPROC_TYPE_LP_CORE=y
+CONFIG_ULP_COPROC_RESERVE_MEM=8192
+
+# ---- mbedTLS: TLS 1.2 client, room for MQTTS ----
+CONFIG_MBEDTLS_TLS_CLIENT_ONLY=y
+
+# ---- PPP over the A7672 (esp_modem data mode) ----
+CONFIG_LWIP_PPP_SUPPORT=y
+CONFIG_LWIP_PPP_PAP_SUPPORT=y
+CONFIG_LWIP_PPP_NOTIFY_PHASE_SUPPORT=y
