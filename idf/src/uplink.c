@@ -3,7 +3,9 @@
 #include "record.h"
 
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <time.h>
 #include <sys/time.h>
 
@@ -14,6 +16,7 @@
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
 #include "esp_wifi.h"
+#include "esp_http_client.h"
 #include "esp_modem_api.h"
 #include "mqtt_client.h"
 #include "driver/gpio.h"
@@ -188,8 +191,14 @@ static uint32_t drain(uplink_result_t *res)
 
         if (included == 0) { flashlog_advance(n); continue; }
         if (!publish_acked(s_json)) {
+            /* Broker churn (TB Cloud drops the connection every ~18 s during
+             * drains): wait out the client's auto-reconnect, then retry --
+             * turns a stopped drain into a slightly slower one. */
             esp_task_wdt_reset();
-            if (!publish_acked(s_json)) {   /* one retry per batch */
+            xEventGroupWaitBits(s_ev, EV_MQTT_UP, pdTRUE, pdFALSE,
+                                pdMS_TO_TICKS(15000));
+            esp_task_wdt_reset();
+            if (!publish_acked(s_json)) {
                 ESP_LOGW(TAG, "drain stopped, %lu pending",
                          (unsigned long)flashlog_pending());
                 break;
@@ -225,13 +234,87 @@ static void send_status(const uplink_ctx_t *ctx, const uplink_result_t *res)
     publish_acked(s_json);
 }
 
+/* Parse an RFC 7231 Date header ("Tue, 11 Aug 2026 16:29:42 GMT") to epoch. */
+static time_t parse_http_date(const char *s)
+{
+    static const char *mon = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    int d, y, hh, mm, ss;
+    char mstr[4] = { 0 };
+    const char *comma = strchr(s, ',');
+    if (!comma) return 0;
+    if (sscanf(comma + 1, " %d %3s %d %d:%d:%d", &d, mstr, &y, &hh, &mm, &ss) != 6)
+        return 0;
+    const char *mp = strstr(mon, mstr);
+    if (!mp) return 0;
+    int m = (int)(mp - mon) / 3;   /* 0-based month */
+    /* days-from-civil (Howard Hinnant), valid for y >= 1970 */
+    int yy = y - (m < 2);
+    int era = yy / 400;
+    int yoe = yy - era * 400;
+    int doy = (153 * (m + (m > 1 ? -2 : 10)) + 2) / 5 + d - 1;
+    int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    long days = (long)era * 146097 + doe - 719468;
+    return (time_t)days * 86400 + hh * 3600 + mm * 60 + ss;
+}
+
+/* Fetch trusted time from the TB server's HTTPS Date header. The carrier can
+ * intercept UDP NTP; it cannot rewrite a header inside our TLS session. */
+static char s_date_hdr[64];
+
+static esp_err_t http_evt(esp_http_client_event_t *e)
+{
+    if (e->event_id == HTTP_EVENT_ON_HEADER &&
+        strcasecmp(e->header_key, "Date") == 0) {
+        strncpy(s_date_hdr, e->header_value, sizeof(s_date_hdr) - 1);
+    }
+    return ESP_OK;
+}
+
+static time_t https_trusted_time(void)
+{
+    s_date_hdr[0] = 0;
+    esp_http_client_config_t cfg = {
+        .url = "https://eu.thingsboard.cloud/api/v1/ping",
+        .cert_pem = isrg_root_pem,
+        .timeout_ms = 10000,
+        .event_handler = http_evt,
+    };
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    if (!c) return 0;
+    esp_http_client_perform(c);   /* any status is fine; we want the header */
+    esp_http_client_cleanup(c);
+    return s_date_hdr[0] ? parse_http_date(s_date_hdr) : 0;
+}
+
 static void sntp_sync(void)
 {
-    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
-    if (esp_netif_sntp_init(&cfg) != ESP_OK) return;
-    esp_netif_sntp_sync_wait(pdMS_TO_TICKS(10000));
-    esp_netif_sntp_deinit();
-    if (clock_valid()) ESP_LOGI(TAG, "clock synced via SNTP");
+    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(
+        2, ESP_SNTP_SERVER_LIST("time.google.com", "pool.ntp.org"));
+    if (esp_netif_sntp_init(&cfg) == ESP_OK) {
+        esp_netif_sntp_sync_wait(pdMS_TO_TICKS(10000));
+        esp_netif_sntp_deinit();
+    }
+    time_t sntp_t = clock_valid() ? time(NULL) : 0;
+
+    /* Cross-check against TLS-protected HTTP time; on disagreement > 2 min the
+     * HTTPS source wins (observed 2026-08-11: cellular-synced clock ran ~20-30
+     * min fast -- consistent with carrier NTP interception). */
+    time_t http_t = https_trusted_time();
+    ESP_LOGI(TAG, "clock: sntp=%lld http=%lld (delta %lld s)",
+             (long long)sntp_t, (long long)http_t,
+             (long long)(sntp_t && http_t ? sntp_t - http_t : 0));
+    if (http_t >= CLOCK_MIN && http_t < CLOCK_MAX) {
+        if (!sntp_t || llabs((long long)(sntp_t - http_t)) > 120) {
+            struct timeval tv = { .tv_sec = http_t };
+            settimeofday(&tv, NULL);
+            ESP_LOGW(TAG, "clock set from HTTPS Date (SNTP off by %lld s or absent)",
+                     sntp_t ? (long long)(sntp_t - http_t) : 0);
+        }
+    }
+    if (clock_valid()) {
+        time_t now = time(NULL);
+        ESP_LOGI(TAG, "clock now (UTC): %s", ctime(&now));
+    }
 }
 
 /* ===================== cellular: esp_modem PPP ===================== */
@@ -299,8 +382,10 @@ static bool cell_session(const uplink_ctx_t *ctx, uplink_result_t *res)
     modem_rail(true);
     vTaskDelay(pdMS_TO_TICKS(200));
     pwrkey_pulse(600);
-    vTaskDelay(pdMS_TO_TICKS(8000));   /* A7672 UART ready ~8 s after PWRKEY */
-    esp_task_wdt_reset();
+    for (int i = 0; i < 8; i++) {      /* A7672 UART ready ~8 s after PWRKEY */
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        esp_task_wdt_reset();          /* feed through the settle */
+    }
 
     esp_modem_dce_config_t dce_cfg = ESP_MODEM_DCE_DEFAULT_CONFIG(SIM_APN);
     esp_modem_dte_config_t dte_cfg = ESP_MODEM_DTE_DEFAULT_CONFIG();
@@ -343,7 +428,8 @@ static bool cell_session(const uplink_ctx_t *ctx, uplink_result_t *res)
     }
     ESP_LOGI(TAG, "PPP up");
 
-    if (!clock_valid()) sntp_sync();
+    sntp_sync();   /* every session: re-sync AND cross-check (clock can be
+                    * "valid" yet wrong -- that is exactly the observed bug) */
 
     if (mqtt_up()) {
         uint32_t sent = drain(res);
@@ -394,7 +480,7 @@ static bool wifi_session(const uplink_ctx_t *ctx, uplink_result_t *res)
     if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) res->wifi_rssi_dbm = ap.rssi;
     ESP_LOGI(TAG, "wifi up (%d dBm)", res->wifi_rssi_dbm);
 
-    if (!clock_valid()) sntp_sync();
+    sntp_sync();   /* every session, same reasoning as the cellular path */
 
     if (mqtt_up()) {
         res->used_wifi = true;

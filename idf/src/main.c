@@ -20,6 +20,7 @@
 #include "esp_random.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
+#include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -119,6 +120,17 @@ void app_main(void)
     bool cold        = (s_rtc_magic != RTC_STATE_MAGIC);
     bool crashed     = !cold && !timer_wake && !button_wake;
 
+    /* Runtime-enforce the long WDT: sdkconfig regeneration silently reverted
+     * TIMEOUT_S to 5 s once (idf-0.5/0.6 boot-looped on the modem's 8 s settle).
+     * Reconfigure defensively, then subscribe this task. */
+    esp_task_wdt_config_t wdt_cfg = {
+        .timeout_ms = 120000,
+        .idle_core_mask = 0,
+        .trigger_panic = true,
+    };
+    if (esp_task_wdt_reconfigure(&wdt_cfg) != ESP_OK)
+        esp_task_wdt_init(&wdt_cfg);
+    esp_task_wdt_add(NULL);
     board_init();
 
     if (cold) vTaskDelay(pdMS_TO_TICKS(1500));   /* let USB console enumerate */
