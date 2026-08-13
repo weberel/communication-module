@@ -22,6 +22,8 @@ typedef struct {
     uint16_t vreg_mv;
     uint16_t harvest_today_mah;
     uint16_t harvest_prev_mah;
+    uint8_t  sun_hours;          /* Voc-above-threshold hours so far today */
+    uint16_t voc_max_mv;         /* self-calibrating panel Voc reference (NVS) */
 } solar_status_t;
 
 void solar_reset(void);   /* cold boot */

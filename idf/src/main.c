@@ -32,6 +32,8 @@
 #include "bq25792.h"
 #include "solar.h"
 #include "sensors.h"
+#include "uss.h"
+#include "wf280a.h"
 #include "uplink.h"
 
 static const char *TAG = "ecotrace";
@@ -64,7 +66,7 @@ static uint8_t soc_from_voltage(uint16_t vbat_mv)
     return (uint8_t)((vbat_mv - 3300) * 100 / (4200 - 3300));
 }
 
-static void read_sample(LogRecord *r, const solar_status_t *sol)
+static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
 {
     memset(r, 0xFF, sizeof(*r));   /* spare bytes stay 0xFF (NOR-friendly) */
 
@@ -91,13 +93,18 @@ static void read_sample(LogRecord *r, const solar_status_t *sol)
                (sol->weather_good  ? RECF_WEATHER : 0) |
                (sol->eco_target    ? RECF_ECO_CHG : 0);
 
+    r->sensor_ok = bq_ok ? 0x01 : 0x00;
+
     uint16_t c0, c1;
-    if (ltr303_sample(&c0, &c1)) { r->light_ch0 = c0; r->light_ch1 = c1; }
-    else                         { r->light_ch0 = r->light_ch1 = 0; }
+    if (ltr303_sample(&c0, &c1)) {
+        r->light_ch0 = c0; r->light_ch1 = c1;
+        r->sensor_ok |= 0x02;
+    } else { r->light_ch0 = r->light_ch1 = 0; }
 
     int16_t ax, ay, az;
     if (sc7a20_sample(&ax, &ay, &az)) {
         r->acc_mg[0] = ax; r->acc_mg[1] = ay; r->acc_mg[2] = az;
+        r->sensor_ok |= 0x04;
     } else {
         r->acc_mg[0] = r->acc_mg[1] = r->acc_mg[2] = 0;
     }
@@ -106,9 +113,50 @@ static void read_sample(LogRecord *r, const solar_status_t *sol)
     if (ms5837_sample(&mbar, &degc)) {
         r->press_dmbar = (uint16_t)(mbar * 10.0f + 0.5f);
         r->temp_cC     = (int16_t)(degc * 100.0f + (degc >= 0 ? 0.5f : -0.5f));
+        r->sensor_ok |= 0x08;
     } else {
         r->press_dmbar = 0;
         r->temp_cC     = 0;
+    }
+
+    /* Charger thermal diagnostics: die temp, battery NTC, and the charger's
+     * own JEITA verdict -- so an afternoon charge lockout names itself. */
+    r->tdie_dC     = bq_tdie_dC();
+    r->ts_pct_x100 = bq_ts_pct_x100();
+    r->ts_stat     = bq_ts_stat();
+
+    /* Ultrasonic flow module (MSP430FR6043 I2C slave) + its WF280A pressure
+     * sensor, both on the shared bus. Absent on boards without the gas cell:
+     * each costs one NACK and the fields stay zero. */
+    uss_result_t u;
+    if (uss_sample(&u)) {
+        r->uss_flow_ulpm = u.flow_ulpm;
+        r->uss_dtof_ps   = u.dtof_ps;
+        r->uss_temp_cC   = u.temp_cC;
+        r->uss_amp_ups   = u.amp_ups;
+        r->uss_amp_dns   = u.amp_dns;
+        r->uss_code      = u.code;
+        r->uss_gain      = u.gain;
+        r->uss_snr_db2   = u.snr_db2;
+        r->uss_status    = u.status;
+        r->uss_vol_ml    = u.vol_ml;
+        r->sensor_ok |= 0x10;
+    } else {
+        r->uss_flow_ulpm = r->uss_dtof_ps = 0;
+        r->uss_temp_cC = 0;
+        r->uss_amp_ups = r->uss_amp_dns = 0;
+        r->uss_code = r->uss_gain = r->uss_snr_db2 = r->uss_status = 0;
+        r->uss_vol_ml = 0;
+    }
+
+    uint32_t praw, traw;
+    uint8_t  wst;
+    if (wf280a_sample(&praw, &traw, &wst)) {
+        r->wf_praw = praw;
+        r->wf_traw = traw;
+        r->sensor_ok |= 0x20;
+    } else {
+        r->wf_praw = r->wf_traw = 0;
     }
 }
 
@@ -207,13 +255,18 @@ void app_main(void)
         bq_configure_charging(CHARGE_CURRENT_MA, 0, 0);
         bq_enable_acdrv1(true);
         bq_enable_acdrv2(true);
-        sol = solar_on_wake(SAMPLE_INTERVAL_S, -1 /* clock sync lands with uplink */);
+        /* Local calendar day for harvest/sun rollover once the clock is valid;
+         * falls back to a 24 h counter before the first sync. */
+        time_t now = time(NULL);
+        int32_t day_num = (now >= 1767225600 && now < 2082758400)
+                        ? (int32_t)((now + TZ_OFFSET_MIN * 60) / 86400) : -1;
+        sol = solar_on_wake(SAMPLE_INTERVAL_S, day_num);
     } else {
         ESP_LOGE(TAG, "BQ25792 not found -- battery data will be zero");
     }
 
     LogRecord r;
-    read_sample(&r, &sol);
+    read_sample(&r, &sol, bq_ok);
     flashlog_append(&r);
     ESP_LOGI(TAG,
         "seq %lu: VBAT=%umV IBAT=%+dmA SOC=%u%% | in:%s%s VINDPM=%umV IBUS=%dmA | "
@@ -242,6 +295,8 @@ void app_main(void)
             .vbat_mv      = r.vbat_mv,
             .deep_search  = (s_uptime_s - s_last_deep_uptime) >= 86400,
             .skip_cellular = s_upload_crashed != 0,
+            .sun_hours    = sol.sun_hours,
+            .voc_max_mv   = sol.voc_max_mv,
         };
         if (ctx.deep_search) s_last_deep_uptime = s_uptime_s;
 

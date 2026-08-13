@@ -1,0 +1,1 @@
+ C:\Users\elweber\.platformio\penv\Scripts\python.exe tools\tb_export.py --user ew.thingsboard@pm.me --device "PCB-test-rig" --hours 30

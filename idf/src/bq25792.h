@@ -43,6 +43,11 @@ bool bq_ac1_present(void);           /* USB path */
 bool bq_ac2_present(void);           /* solar path */
 void bq_faults(uint8_t *fault0, uint8_t *fault1);
 
+/* ---- thermal diagnostics (the 2026-08-12 JEITA-lockout lesson) ---- */
+int16_t  bq_tdie_dC(void);           /* charger die temp, 0.1 C units */
+uint16_t bq_ts_pct_x100(void);       /* TS pin (battery NTC) as % of bias x100 */
+uint8_t  bq_ts_stat(void);           /* Charger_Status_4: TS_COLD/COOL/WARM/HOT bits */
+
 /* ---- limits / control ---- */
 void bq_set_vreg_mv(uint16_t mv);
 void bq_set_ichg_ma(uint16_t ma);

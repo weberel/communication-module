@@ -40,6 +40,8 @@ typedef struct {
     uint16_t vbat_mv;          /* gates: cellular >= MODEM_MIN, wifi >= WIFI_MIN */
     bool     deep_search;      /* once/day: use the long attach timeout */
     bool     skip_cellular;    /* previous attempt crashed the board */
+    uint8_t  sun_hours;        /* weather diagnostics for the status record */
+    uint16_t voc_max_mv;
 } uplink_ctx_t;
 
 uplink_result_t uplink_upload_all(const uplink_ctx_t *ctx);

@@ -5,7 +5,7 @@
  */
 #pragma once
 
-#define FW_VERSION              "idf-0.8"
+#define FW_VERSION              "idf-0.10"
 
 /* ---- Duty cycle ---- */
 #define SAMPLE_INTERVAL_S       300     /* 5 min */
@@ -40,5 +40,24 @@
 #define MPPT_VINDPM_MIN_MV      5000
 #define MPPT_VINDPM_MAX_MV      22000
 
-/* ---- Weather detection ---- */
+/* ---- Weather detection ----
+ * Two independent signals, either one declares the day "good":
+ *  - harvest (charge actually drawn): catches sunny days while the battery
+ *    still wants charge;
+ *  - Voc sun-hours: hourly open-circuit panel voltage >= SUN_FRACTION_PCT of
+ *    the self-calibrating max (NVS-persisted) -- catches sunny days when a
+ *    full battery makes harvest blind (the 2026-08-12 finding). Voc is a
+ *    daylight detector, not an intensity meter (logarithmic in light,
+ *    -0.3 %/C in temperature), hence the loose fraction. */
 #define WEATHER_GOOD_MAH        1000
+#define SUN_FRACTION_PCT        80
+#define SUN_HOURS_GOOD          4
+#define TZ_OFFSET_MIN           120     /* local day rollover (CEST) */
+
+/* ---- Ultrasonic flow module (MSP430FR6043 I2C slave, uss_link.h) ----
+ * A USS measurement is a capture + algorithm run on the MSP430; the reference
+ * firmware turns one around well inside 500 ms. Budget 3 s before declaring
+ * the module stuck -- a lost measurement costs one sample, a false timeout
+ * every 5 min would cost the link. */
+#define USS_MEAS_TIMEOUT_MS     3000
+#define USS_POLL_MS             25

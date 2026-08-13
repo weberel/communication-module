@@ -1,4 +1,4 @@
-#include "uplink.h"
+﻿#include "uplink.h"
 #include "config.h"
 #include "record.h"
 
@@ -127,7 +127,7 @@ static bool publish_acked(const char *json)
 static int record_values(const LogRecord *r, char *out, size_t cap)
 {
     int32_t bat_mw = (int32_t)r->vbat_mv * r->ibat_ma / 1000;
-    return snprintf(out, cap,
+    int n = snprintf(out, cap,
         "\"vbat_mv\":%u,\"ibat_ma\":%d,\"bat_mw\":%ld,\"soc_pct\":%u,"
         "\"vbus_mv\":%u,\"ibus_ma\":%d,\"vac2_mv\":%u,\"vsys_mv\":%u,"
         "\"vindpm_mv\":%u,\"vreg_mv\":%u,\"chg_stat\":%u,"
@@ -135,7 +135,8 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
         "\"solar\":%u,\"usb\":%u,\"weather_good\":%u,\"eco_chg\":%u,"
         "\"light_ch0\":%u,\"light_ch1\":%u,"
         "\"acc_x_mg\":%d,\"acc_y_mg\":%d,\"acc_z_mg\":%d,"
-        "\"press_mbar\":%.1f,\"temp_c\":%.2f",
+        "\"press_mbar\":%.1f,\"temp_c\":%.2f,"
+        "\"tdie_c\":%.1f,\"ts_pct\":%.2f,\"ts_stat\":%u,\"sensor_ok\":%u",
         r->vbat_mv, r->ibat_ma, (long)bat_mw, r->soc_pct,
         r->vbus_mv, r->ibus_ma, r->vac2_mv, r->vsys_mv,
         r->vindpm_mv, r->vreg_mv, r->chg_stat,
@@ -144,10 +145,30 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
         (r->flags & RECF_WEATHER) ? 1 : 0, (r->flags & RECF_ECO_CHG) ? 1 : 0,
         r->light_ch0, r->light_ch1,
         r->acc_mg[0], r->acc_mg[1], r->acc_mg[2],
-        r->press_dmbar / 10.0f, r->temp_cC / 100.0f);
+        r->press_dmbar / 10.0f, r->temp_cC / 100.0f,
+        r->tdie_dC / 10.0f, r->ts_pct_x100 / 100.0f, r->ts_stat, r->sensor_ok);
+
+    /* Ultrasonic flow + WF280A keys only when the hardware answered this
+     * sample -- boards without the gas cell don't burn datapoint quota. */
+    if ((r->sensor_ok & 0x10) && n > 0 && (size_t)n < cap)
+        n += snprintf(out + n, cap - n,
+            ",\"flow_lpm\":%.4f,\"uss_dtof_ns\":%.3f,\"uss_temp_c\":%.2f,"
+            "\"uss_code\":%u,\"uss_amp_ups\":%u,\"uss_amp_dns\":%u,"
+            "\"uss_snr_db\":%.1f,\"uss_gain\":%u,\"uss_vol_ml\":%lu,"
+            "\"uss_status\":%u",
+            r->uss_flow_ulpm / 1e6f, r->uss_dtof_ps / 1000.0f,
+            r->uss_temp_cC / 100.0f,
+            r->uss_code, r->uss_amp_ups, r->uss_amp_dns,
+            r->uss_snr_db2 / 2.0f, r->uss_gain,
+            (unsigned long)r->uss_vol_ml, r->uss_status);
+    if ((r->sensor_ok & 0x20) && n > 0 && (size_t)n < cap)
+        n += snprintf(out + n, cap - n,
+            ",\"wf_praw\":%lu,\"wf_traw\":%lu",
+            (unsigned long)r->wf_praw, (unsigned long)r->wf_traw);
+    return n;
 }
 
-static char s_json[4608];
+static char s_json[7168];
 
 static int64_t record_ts_ms(const LogRecord *r, int64_t now_ms, uint32_t head)
 {
@@ -170,7 +191,7 @@ static uint32_t drain(uplink_result_t *res)
         for (uint32_t i = 0; i < n; i++) {
             LogRecord r;
             if (!flashlog_peek(i, &r)) continue;
-            char vals[560];
+            char vals[800];
             record_values(&r, vals, sizeof(vals));
             int w;
             if (now_ms > 0)
@@ -211,27 +232,41 @@ static uint32_t drain(uplink_result_t *res)
     return sent;
 }
 
+/* QoS-1 publish that survives broker churn: on failure wait out the client's
+ * auto-reconnect, then retry once (2026-08-13 audit: the status record was
+ * being eaten by the end-of-session disconnect nearly every time). */
+static bool publish_resilient(const char *json)
+{
+    if (publish_acked(json)) return true;
+    esp_task_wdt_reset();
+    xEventGroupWaitBits(s_ev, EV_MQTT_UP, pdTRUE, pdFALSE, pdMS_TO_TICKS(15000));
+    esp_task_wdt_reset();
+    return publish_acked(json);
+}
+
 static void send_status(const uplink_ctx_t *ctx, const uplink_result_t *res)
 {
     const char *transport = (res->sent && res->used_wifi) ? "wifi" :
                             res->sent ? "cell" : "none";
     int64_t now_ms = clock_valid() ? (int64_t)time(NULL) * 1000 : 0;
-    char vals[512];
+    char vals[800];
     snprintf(vals, sizeof(vals),
              "\"rssi_dbm\":%d,\"wifi_rssi_dbm\":%d,\"transport\":\"%s\","
              "\"cereg_stat\":%u,\"backlog\":%lu,\"boot_id\":%u,"
              "\"reset_reason\":%u,\"boot_count\":%u,\"wake_count\":%u,"
-             "\"crash_count\":%u,\"vbat_mv\":%u,\"fw\":\"" FW_VERSION "\"",
+             "\"crash_count\":%u,\"vbat_mv\":%u,"
+             "\"sun_h\":%u,\"voc_max_mv\":%u,\"fw\":\"" FW_VERSION "\"",
              res->cell_rssi_dbm, res->wifi_rssi_dbm, transport,
              res->cell_reg_stat, (unsigned long)flashlog_pending(), ctx->boot_id,
              ctx->reset_reason, ctx->boot_count, ctx->wake_count,
-             ctx->crash_count, ctx->vbat_mv);
+             ctx->crash_count, ctx->vbat_mv,
+             ctx->sun_hours, ctx->voc_max_mv);
     if (now_ms > 0)
         snprintf(s_json, sizeof(s_json), "{\"ts\":%lld,\"values\":{%s}}",
                  (long long)now_ms, vals);
     else
         snprintf(s_json, sizeof(s_json), "{%s}", vals);
-    publish_acked(s_json);
+    publish_resilient(s_json);
 }
 
 /* Parse an RFC 7231 Date header ("Tue, 11 Aug 2026 16:29:42 GMT") to epoch. */
@@ -435,7 +470,7 @@ static bool cell_session(const uplink_ctx_t *ctx, uplink_result_t *res)
         uint32_t sent = drain(res);
         res->sent += sent;
         res->sent ? (res->any_success = true) : 0;
-        if (flashlog_pending() == 0) send_status(ctx, res);
+        send_status(ctx, res);   /* always: health must not depend on the drain */
         ok = sent > 0 || flashlog_pending() == 0;
     }
     mqtt_down();
@@ -487,7 +522,7 @@ static bool wifi_session(const uplink_ctx_t *ctx, uplink_result_t *res)
         uint32_t sent = drain(res);
         res->sent += sent;
         if (sent) res->any_success = true;
-        if (flashlog_pending() == 0) send_status(ctx, res);
+        send_status(ctx, res);   /* always: health must not depend on the drain */
         ok = sent > 0 || flashlog_pending() == 0;
     }
     mqtt_down();

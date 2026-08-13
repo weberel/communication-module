@@ -16,8 +16,11 @@
 #define REG_CHG_CTRL5 0x14   /* SFET_PRESENT[7] EN_IBAT[5] EN_EXTILIM[1] */
 #define REG_STATUS0   0x1B
 #define REG_STATUS1   0x1C
+#define REG_STATUS4   0x1F   /* TS_COLD[3] TS_COOL[2] TS_WARM[1] TS_HOT[0] */
 #define REG_FAULT0    0x20
 #define REG_ADC_CTRL  0x2E
+#define REG_TS_ADC    0x3F   /* u16, 0.0976563 %/LSB of TS bias */
+#define REG_TDIE_ADC  0x41   /* s16, 0.5 C/LSB */
 #define REG_IBUS_ADC  0x31
 #define REG_IBAT_ADC  0x33
 #define REG_VBUS_ADC  0x35
@@ -107,6 +110,19 @@ bq_chg_stat_t bq_charge_state(void) { return (bq_chg_stat_t)((rd8(REG_STATUS1) >
 bool bq_vbus_present(void) { return (rd8(REG_STATUS0) & 0x01) != 0; }
 bool bq_ac1_present(void)  { return (rd8(REG_STATUS0) & 0x02) != 0; }
 bool bq_ac2_present(void)  { return (rd8(REG_STATUS0) & 0x04) != 0; }
+
+int16_t bq_tdie_dC(void)
+{
+    return (int16_t)((int16_t)rd16(REG_TDIE_ADC) * 5);   /* 0.5 C -> 0.1 C units */
+}
+
+uint16_t bq_ts_pct_x100(void)
+{
+    /* raw * 0.0976563 % -> x100 fixed point */
+    return (uint16_t)(((uint32_t)rd16(REG_TS_ADC) * 97656u) / 10000u);
+}
+
+uint8_t bq_ts_stat(void) { return rd8(REG_STATUS4); }
 
 void bq_faults(uint8_t *fault0, uint8_t *fault1)
 {
