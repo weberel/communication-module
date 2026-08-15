@@ -30,6 +30,10 @@ i2c_master_dev_handle_t eco_i2c_add_tracked(i2c_master_dev_handle_t *slot, uint8
  * (its ESD clamps back-feed from an idle-high bus otherwise). release() restores
  * the pins and rebuilds the bus; drivers re-attach on their next call.
  * The bus is shared -- keep the window short. */
+/* Probe 0x08..0x77 and log what answers, with names. Cheap; run it each wake
+ * so a missing chip names itself instead of showing up as a zero reading. */
+void eco_i2c_scan(void);
+
 void eco_i2c_hold_low(void);
 void eco_i2c_release(void);
 

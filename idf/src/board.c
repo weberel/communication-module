@@ -35,7 +35,18 @@ void board_deep_sleep(uint32_t seconds)
 {
     gpio_set_level(ECO_PIN_MODEM_PWR_EN, 0);
     gpio_set_level(ECO_PIN_MODEM_PWRKEY, 0);   /* deasserted: no inverter current */
-    gpio_set_level(ECO_PIN_SENSOR_PWR, 0);
+    /* SENSOR rail stays ON through deep sleep, deliberately.
+     *
+     * Dropping it does not save power, it costs power: with the rail down, our
+     * always-on 4k7 bus pull-ups feed the sleeping board through its ESD clamps
+     * (~1.4 mA continuous, for the entire 5-minute sleep) and clamp SDA/SCL at
+     * the same time. Leaving it up removes that path, and the ultrasonic board
+     * gates its own AFE rails between measurements anyway, so its idle draw is
+     * the MSP430 in LPM3 plus an LDO -- microamps.
+     *
+     * The rail is only ever dropped by board_sensor_power_cycle(), i.e. when
+     * the module needs a reboot. */
+    gpio_set_level(ECO_PIN_SENSOR_PWR, 1);
     gpio_set_level(ECO_PIN_LED, 0);
 
     gpio_hold_en(ECO_PIN_MODEM_PWR_EN);

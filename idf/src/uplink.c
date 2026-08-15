@@ -171,11 +171,19 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
         n += snprintf(out + n, cap - n,
             ",\"uss_tof_ups_q40\":%lu,\"uss_tof_dns_q40\":%lu",
             (unsigned long)r->uss_tof_ups_q40, (unsigned long)r->uss_tof_dns_q40);
-    /* Absolute pressure PLACEHOLDER -- a compile-time constant, not a reading.
-     * The key name and the companion flag both say so; see config.h. */
-    if (n > 0 && (size_t)n < cap)
-        n += snprintf(out + n, cap - n,
-            ",\"p_abs_const_hpa\":%.2f,\"p_abs_is_const\":1", P_ABS_CONST_HPA);
+    /* Absolute (atmospheric) pressure. Prefer the MS5837 on this board -- it is
+     * a real measurement, and it agreed with the Zurich constant to 0.4 hPa on
+     * 2026-08-15 (965.4 measured vs 965.0 assumed). The constant is only a
+     * fallback for boards where that barometer is not fitted, and p_abs_is_const
+     * says which you are looking at so no analysis has to guess. */
+    if (n > 0 && (size_t)n < cap) {
+        if (r->sensor_ok & 0x08)
+            n += snprintf(out + n, cap - n,
+                ",\"p_abs_hpa\":%.2f,\"p_abs_is_const\":0", r->press_dmbar / 10.0f);
+        else
+            n += snprintf(out + n, cap - n,
+                ",\"p_abs_hpa\":%.2f,\"p_abs_is_const\":1", P_ABS_CONST_HPA);
+    }
     if ((r->sensor_ok & 0x20) && n > 0 && (size_t)n < cap)
         n += snprintf(out + n, cap - n,
             ",\"wf_praw\":%lu,\"wf_traw\":%lu",

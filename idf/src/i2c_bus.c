@@ -1,6 +1,7 @@
 #include "i2c_bus.h"
 
 #include "driver/gpio.h"
+#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -101,4 +102,34 @@ void eco_i2c_release(void)
     }
     vTaskDelay(pdMS_TO_TICKS(2));
     (void) eco_i2c_bus();                   /* rebuild; devices re-attach lazily */
+}
+
+/* Probe the whole 7-bit range and log what answers.
+ *
+ * Worth doing every wake: it costs a few tens of ms (absent devices NACK
+ * immediately, they do not time out) and it turns "the reading is zero" into
+ * "that chip is not on the bus", which are completely different faults. */
+void eco_i2c_scan(void)
+{
+    i2c_master_bus_handle_t bus = eco_i2c_bus();
+    if (!bus) { ESP_LOGE("i2cscan", "no bus"); return; }
+
+    char line[160];
+    int n = 0, len = 0;
+    for (uint8_t a = 0x08; a <= 0x77; a++) {
+        if (i2c_master_probe(bus, a, 10) != ESP_OK) continue;
+        const char *who =
+            (a == 0x18 || a == 0x19) ? "SC7A20"   :
+            (a == 0x29)              ? "LTR303"   :
+            (a == 0x2C)              ? "USS"      :
+            (a == 0x35 || a == 0x60) ? "ATECC608" :
+            (a == 0x38 || a == 0x78) ? "WF280A"   :
+            (a == 0x6B)              ? "BQ25792"  :
+            (a == 0x76 || a == 0x77) ? "MS5837"   : "?";
+        if (len < (int)sizeof(line) - 24)
+            len += snprintf(line + len, sizeof(line) - len, "0x%02X:%s ", a, who);
+        n++;
+    }
+    if (!n) ESP_LOGW("i2cscan", "NOTHING on the bus");
+    else    ESP_LOGI("i2cscan", "%d device(s): %s", n, line);
 }

@@ -33,6 +33,7 @@
 #include "solar.h"
 #include "sensors.h"
 #include "uss.h"
+#include "i2c_bus.h"
 #include "esp_timer.h"
 #include "wf280a.h"
 #include "uplink.h"
@@ -97,6 +98,11 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
                (sol->usb_present   ? RECF_USB     : 0) |
                (sol->weather_good  ? RECF_WEATHER : 0) |
                (sol->eco_target    ? RECF_ECO_CHG : 0);
+
+    /* Log what is actually on the bus. Cheap (absent devices NACK immediately)
+     * and it turns "the reading is zero" into "that chip is not there", which
+     * are entirely different faults. */
+    eco_i2c_scan();
 
     r->sensor_ok = bq_ok ? 0x01 : 0x00;
 
@@ -354,6 +360,14 @@ void app_main(void)
         r.light_ch0, r.acc_mg[0], r.acc_mg[1], r.acc_mg[2],
         r.press_dmbar / 10.0f, r.temp_cC / 100.0f,
         (unsigned long)flashlog_pending());
+
+    /* Decode sensor_ok by name. A zero reading and an absent chip look
+     * identical in the summary above; this line separates them. */
+    ESP_LOGI(TAG, "sensor_ok=0x%02X  BQ:%c LTR303:%c SC7A20:%c MS5837:%c USS:%c WF280A:%c",
+             r.sensor_ok,
+             (r.sensor_ok & 0x01) ? 'y' : 'N', (r.sensor_ok & 0x02) ? 'y' : 'N',
+             (r.sensor_ok & 0x04) ? 'y' : 'N', (r.sensor_ok & 0x08) ? 'y' : 'N',
+             (r.sensor_ok & 0x10) ? 'y' : 'N', (r.sensor_ok & 0x20) ? 'y' : 'N');
 
     /* Upload if due (or the button asked). Tempo is bounded: 2 quick retries,
      * then only the 12 h schedule -- an outage costs ~2 short attempts a day
