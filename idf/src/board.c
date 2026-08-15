@@ -59,6 +59,11 @@ bool board_woke_from_button(void)
 }
 
 
+void board_sensor_power(bool on)
+{
+    gpio_set_level(ECO_PIN_SENSOR_PWR, on ? 1 : 0);
+}
+
 void board_sensor_power_cycle(uint32_t off_ms)
 {
     /* Order matters. Holding the bus low FIRST is what makes the rail actually

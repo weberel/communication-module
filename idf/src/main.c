@@ -33,10 +33,15 @@
 #include "solar.h"
 #include "sensors.h"
 #include "uss.h"
+#include "esp_timer.h"
 #include "wf280a.h"
 #include "uplink.h"
 
 static const char *TAG = "ecotrace";
+
+/* When the switched SENSOR rail came up this wake; the ultrasonic module needs
+ * BOARD_SENSOR_BOOT_MS from that point before its I2C slave answers. */
+static int64_t s_sensor_up_us;
 
 /* ---- state surviving deep sleep (and crash reboots) ---- */
 #define RTC_STATE_MAGIC 0x8BADF00Du
@@ -95,6 +100,7 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
 
     r->sensor_ok = bq_ok ? 0x01 : 0x00;
 
+
     uint16_t c0, c1;
     if (ltr303_sample(&c0, &c1)) {
         r->light_ch0 = c0; r->light_ch1 = c1;
@@ -128,6 +134,16 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
     /* Ultrasonic flow module (MSP430FR6043 I2C slave) + its WF280A pressure
      * sensor, both on the shared bus. Absent on boards without the gas cell:
      * each costs one NACK and the fields stay zero. */
+    /* Wait out the module's boot before the first transaction. The on-board
+     * sensor reads above have already burned some of it, so only the remainder
+     * costs anything. Without this we NACK a module that is merely still
+     * booting, then waste a power cycle on it. */
+    {
+        int64_t elapsed_ms = (esp_timer_get_time() - s_sensor_up_us) / 1000;
+        if (elapsed_ms < BOARD_SENSOR_BOOT_MS)
+            vTaskDelay(pdMS_TO_TICKS(BOARD_SENSOR_BOOT_MS - elapsed_ms));
+    }
+
     uss_result_t u;
     /* One recovery attempt: if the module does not answer, power-cycle the
      * SENSOR rail and try once more. This is the whole point of the gated rail
@@ -138,7 +154,13 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
     bool uss_ok = uss_sample(&u);
     if (!uss_ok) {
         ESP_LOGW(TAG, "USS silent, power-cycling the sensor rail");
-        board_sensor_power_cycle(300);
+        /* 800 ms, not 300: the SENSOR rail is a high-side switch with no
+         * bleed resistor, so when it opens the node is left floating and the
+         * decoupling caps discharge only through the slave's own quiescent
+         * draw. Confirmed on the bench 2026-08-15 with an LED across the
+         * header -- it fades rather than switching off. Too short a window
+         * means no power-on reset at all, which defeats the purpose. */
+        board_sensor_power_cycle(800);
         uss_ok = uss_sample(&u);
         ESP_LOGW(TAG, "USS after power cycle: %s", uss_ok ? "recovered" : "still silent");
     }
@@ -156,6 +178,12 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
         r->uss_tof_ups_q40 = u.tof_ups_q40;
         r->uss_tof_dns_q40 = u.tof_dns_q40;
         r->sensor_ok |= 0x10;
+        ESP_LOGI(TAG, "USS ok: code=%u seq=%u dtof=%ld ps tof_ups=%lu tof_dns=%lu q40 "
+                      "(%.1f/%.1f us) amp=%u/%u snr=%.1f dB gain=%u",
+                 u.code, u.seq, (long) u.dtof_ps,
+                 (unsigned long) u.tof_ups_q40, (unsigned long) u.tof_dns_q40,
+                 u.tof_ups_q40 / 1099511.627776, u.tof_dns_q40 / 1099511.627776,
+                 u.amp_ups, u.amp_dns, u.snr_db2 / 2.0f, u.gain);
     } else {
         r->uss_flow_ulpm = r->uss_dtof_ps = 0;
         r->uss_temp_cC = 0;
@@ -196,6 +224,36 @@ void app_main(void)
         esp_task_wdt_init(&wdt_cfg);
     esp_task_wdt_add(NULL);
     board_init();
+
+    /* Raise the switched SENSOR rail (J404) BEFORE the first I2C transaction.
+     *
+     * This is not just about powering the ultrasonic module: an UNPOWERED board
+     * on the shared bus drags SDA and SCL down through its ESD clamps and kills
+     * the bus for everyone. Measured 2026-08-15 with the rail left off -- the
+     * BQ25792 on our own always-on rail was not found either, every I2C call
+     * returned "clear bus failed", and the whole record came back zeros.
+     *
+     * So the rail must be up whenever the bus is used, and it is only dropped
+     * in deep sleep (where nothing is talking anyway). That still leaves the
+     * remote-recovery path intact via board_sensor_power_cycle(). */
+    board_sensor_power(true);
+    s_sensor_up_us = esp_timer_get_time();
+
+#ifdef ECOTRACE_RAIL_BLINK
+    /* Bench helper: does GPIO14 actually switch the SENSOR rail? Put an LED
+     * across the J404 header's VCC/GND and watch. Never returns, so the board
+     * stays awake and enumerated. */
+    ESP_LOGW(TAG, "RAIL BLINK MODE: toggling GPIO14 (SENSOR rail) 1 s on / 1 s off");
+    for (;;) {
+        board_sensor_power(true);
+        ESP_LOGI(TAG, "SENSOR rail ON  (GPIO14 high)");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        board_sensor_power(false);
+        ESP_LOGI(TAG, "SENSOR rail OFF (GPIO14 low)");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        esp_task_wdt_reset();
+    }
+#endif
 
     if (cold) vTaskDelay(pdMS_TO_TICKS(1500));   /* let USB console enumerate */
     ESP_LOGI(TAG, "ecoTrace datalogger %s (ESP-IDF port)", FW_VERSION);
