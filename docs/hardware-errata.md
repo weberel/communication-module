@@ -95,3 +95,66 @@ an ACDRV bit that is actually `WKUP_DLY`). It happened to work because the BQ's 
 defaults were already usable. The `BQ25792` driver in this repo uses the **correct**
 registers per the TI datasheet (SLUSDG1D). If you port old snippets, cross-check the
 register map in `lib/EcoTrace/BQ25792.h`.
+
+---
+
+## 🟠 9. Switched SENSOR rail has no bleed resistor
+
+GPIO14's high-side switch leaves its output **floating** when it opens, so the
+rail discharges only through whatever load is attached. Confirmed on the bench
+2026-08-15 with an LED across the header: it **fades** rather than switching off.
+
+Consequence: a short "power cycle" does not produce a power-on reset.
+`board_sensor_power_cycle()` uses 800 ms for this reason.
+
+**Respin:** ~100 kΩ from the switched rail to GND.
+
+## 🔴 10. An unpowered device on the shared I2C bus takes the WHOLE bus down
+
+Not specific to this board, but it bit hard and the symptom is misleading.
+
+Any device on SDA/SCL that is unpowered while the bus is live will clamp it:
+its ESD diodes hold the lines at ~0.6 V, and any pull-ups it has to *its* rail
+become pull-downs to ground. I2C has no isolation, so **one clamped line makes
+every device on those wires unreachable**.
+
+Observed 2026-08-15 with the ultrasonic board unpowered: BQ25792 "not found",
+light sensor and accelerometer silent, entire record zeros. All of them healthy.
+
+Two error signatures separate this from a device fault, and they are worth
+memorising:
+
+* ESP-IDF **`clear bus failed`** = a line is held low -> hardware/power
+* ESP-IDF **`unexpected nack`** = bus healthy, that device did not answer
+
+**Respin:** if anything on a switched rail shares the bus, add an I2C isolator
+(TCA9517/TCA4311A class) or two BSS138 FETs on SDA/SCL gated by the rail enable.
+Otherwise "power-cycle the sensor" and "keep the charger readable" are mutually
+exclusive -- and a node that cannot read its charger cannot manage its battery.
+
+## 🟠 11. Cutting a device's VCC does not power it down while the bus idles high
+
+The same coupling in reverse. Current flows: our 3V3 -> bus pull-up -> SDA ->
+the device's ESD clamp -> its VCC. It sits about a diode drop below the bus:
+**too low to run, too high to trigger a power-on reset**.
+
+This is why `board_sensor_power_cycle()` holds SDA and SCL **low** for the whole
+off window (`eco_i2c_hold_low()`), and why leaving a switched rail off during
+deep sleep *costs* ~1.4 mA rather than saving anything.
+
+## 🟡 12. Telemetry datapoint budget is a real constraint
+
+ThingsBoard Cloud closed the MQTT connection (`transport_read(): EOF`,
+`mqtt_message_receive() returned -2`) once records carried ~40 datapoints at
+8 records per publish (~320 per message). Trimmed to 22 keys per record.
+
+Related, and worse because it is silent: the record payload buffer was 800 bytes
+and the JSON grew past it. `snprintf` truncated mid-field, the JSON became
+malformed, and the server rejected **the whole batch** with no error anywhere.
+The symptom was every sensor key frozen at one timestamp while the separate,
+shorter status payload kept updating. `record_values()` now returns -1 on
+truncation so it cannot fail quietly again.
+
+Also: keep large payload buffers **static**. A 1536-byte automatic on the 4 kB
+main task stack triggered `Guru Meditation Error: Core 0 panic'ed (Stack
+protection fault)` mid-upload, rebooting the device every cycle.

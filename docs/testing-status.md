@@ -136,3 +136,44 @@ the datalogger code itself remains unrun.
   upload endpoint with a sane timestamp.
 - See [`hardware-errata.md`](hardware-errata.md) for the physical gotchas (swapped VIN
   silk, NTC resistor rework, keep a battery connected when flashing).
+
+---
+
+## Ultrasonic link brought up, 2026-08-14/15
+
+**The gas node works end to end.** The comm module reads the MSP430FR6043 over
+I2C, logs a record and uploads it. Measured, not inferred:
+
+| Capability | Proven | Evidence |
+|---|:---:|---|
+| I2C slave link, PROTO 2 | ✅ | `who_am_i 0x5A`, `proto 2`; 20/20 then 15/15 valid, CRC clean |
+| Measurement over I2C, no UART | ✅ | `code=122`, 1301 ms mean / 1675 ms max vs a 3000 ms budget |
+| Absolute ToF | ✅ | 131.3 us -> **335 m/s** on the 44 mm cell (air ~346) |
+| Autonomous 1 Hz + totalizer | ✅ | `st=0x09 AUTO`, `vol_ml` accumulating |
+| Slave watchdog (~3.2 s) | ✅ | 16 consecutive measurements, uptime monotonic, no spurious resets |
+| All six I2C devices | ✅ | `sensor_ok=0x3F`; scan shows 7 incl. ATECC608 |
+| Cellular upload with this payload | ✅ | "26 records sent, 0 pending" |
+
+### Not proven / not calibrated
+
+| Item | State |
+|---|---|
+| **Flow calibration (VFR constants)** | **Wrong for this cell.** `flow_lpm` reads several L/min at zero flow and `vol_ml` integrates it faithfully, so absolute volume is meaningless. Needs the lab DOE; no firmware change after. |
+| Gas pressure | MS5837 is **not plumbed into the line yet** -- it reads ambient, so `dp_hpa` is not meaningful |
+| Atmospheric pressure | a per-site **constant** (`P_ATM_CONST_HPA`), no sensor. Set before deployment: Nairobi at the Zurich value is ~18 % off |
+| WF280A | **does not work.** Status byte 0x19 on every access = ADC powered off + test mode; a datasheet-correct trigger returns 6. Compensation polynomial is unpublished. Bosch part on the respin |
+| GPS | still a stub |
+
+### Bench gotchas for whoever picks this up
+
+* **The ultrasonic board needs a power cycle after flashing.** SBW flashing
+  succeeds while the CPU never starts. On the node its rail comes from this
+  board, so it only bites on the bench.
+* **Its `/SDA` trace is broken between J2 and R22** and is currently **bodged
+  J2.4 -> R22.1**. Do not remove that wire. The layout routes `/SDA` through
+  U8's pad, so one unwetted LGA land cuts the whole bus.
+* **Feed its `/VCC` from VSYS, not 3V3** -- its onboard XC6206 needs headroom;
+  3.3 V in leaves it in dropout.
+* The USB CDC takes several seconds to enumerate after a wake, so a console
+  attached mid-cycle misses the sampling logs entirely. A `USS recap` line is
+  emitted just before deep sleep for exactly this reason.

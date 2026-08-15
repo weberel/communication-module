@@ -358,7 +358,63 @@ Two constraints that belong here as well as there:
 - The flow module's own I²C master (its bit-banged WF280A driver) must be
   dormant in the deployed build. Two masters on one bus is a bus fight.
 
-**Status: written, builds green, not yet run against hardware.**
+**Status (2026-08-15): WORKING on hardware, end to end.**
+
+Verified: `sensor_ok=0x3F` (all six devices), `uss_code=122`, absolute ToF
+131.3 us -> 335 m/s, autonomous mode `st=0x09`, volume accumulating, records
+uploading over LTE with the backlog draining to zero.
+
+### How it is driven
+
+The module runs **autonomously at 1 Hz** and integrates flow into `VOL_ML`; this
+board wakes every 5 min and reads the latest latched block plus the totalizer.
+Sample rate is decoupled from bus traffic, which is also the prerequisite for
+LP-core sampling later. Rules the master must follow are in
+`Ultrasonic/Firmware/docs/PROTOCOL.md` section 8.3 -- in particular: only send
+`AUTO_START` when `STATUS.AUTO` is clear (it zeroes the totalizer), wait for
+`AUTO` and then for `READY` before sampling, and never send `MEASURE` while AUTO
+is set.
+
+### Power, and why it matters more than it looks
+
+The ultrasonic board is on the **switched SENSOR rail (J404, GPIO14)**, and the
+rail is **always on** except during a deliberate power cycle. Three findings
+force that:
+
+1. **An unpowered board on the shared bus clamps it.** Its ESD diodes hold
+   SDA/SCL near 0.6 V and its own 4k7 pull-ups become pull-downs to a dead rail.
+   The symptom is every device unreachable -- the BQ25792 on our own always-on
+   rail included -- and a record of all zeros.
+2. **Leaving the rail off in sleep costs power, not saves it**: our pull-ups
+   then feed the sleeping board through those clamps, ~1.4 mA continuously.
+3. **Cutting VCC does not power it down while the bus idles high.** To
+   power-cycle it you must hold SDA/SCL LOW for the whole off window --
+   `board_sensor_power_cycle()` does this, and `eco_i2c_hold_low()` tears the
+   bus down to make it possible. **CAUTION: that blocks the charger and every
+   other sensor for the duration, so keep the window short.**
+
+`BOARD_SENSOR_BOOT_MS` is **3000**: that board's init primes the USSXT crystal
+with up to 5 x 300 ms retries, and talking to it sooner gets a clean NACK from a
+module that is merely still booting.
+
+### Telemetry keys
+
+22 per record (trimmed from ~40 on 2026-08-15; the 128-byte flash record still
+carries every field, only the uplink is trimmed):
+
+`vbat_mv ibat_ma soc_pct vbus_mv ibus_ma chg_stat harvest_mah solar usb`
+`light_ch0 acc_x_mg acc_y_mg acc_z_mg temp_c sensor_ok`
+`p_gas_hpa dp_hpa`
+`uss_tof_us uss_dtof_us uss_code uss_snr_db uss_vol_ml`
+
+* `uss_tof_us` is the **mean** of both directions: the mean is the
+  speed-of-sound (composition) signal, the difference is flow and `uss_dtof_us`
+  carries that at far better resolution.
+* `uss_vol_ml` is a counter to be **differenced**; it wraps at 4294 L.
+* `flow_lpm` is deliberately **not** published: the VFR constants are wrong for
+  this cell, so it is misleading rather than merely useless.
+* Datapoint budget matters -- at ~40 keys x 8 records ThingsBoard Cloud closed
+  the MQTT connection.
 
 ## 8. Roadmap
 
