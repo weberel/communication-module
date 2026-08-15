@@ -48,6 +48,49 @@ static uint32_t le32(const uint8_t *p)
            (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }
 
+/* Put the module into autonomous mode: it then measures on its own schedule and
+ * integrates flow into USS_REG_VOL_ML, so our sample rate stops dictating its
+ * measurement rate. Idempotent -- safe to call every wake, which is what makes
+ * it self-healing after the slave reboots (STATUS.AUTO clears on its reset). */
+bool uss_start_auto(uint16_t period_s)
+{
+    uint8_t lo = (uint8_t)(period_s & 0xFF), hi = (uint8_t)(period_s >> 8);
+    uint8_t st = 0;
+    if (!s_dev) {
+        eco_i2c_add_tracked(&s_dev, USS_LINK_ADDR7);
+        if (!s_dev) return false;
+    }
+    /* Only start it if it is NOT already running. USS_CMD_AUTO_START zeroes the
+     * totalizer, so re-issuing it every wake would throw away the volume
+     * accumulated since the last read -- the one thing this mode exists to
+     * provide. Re-asserting only when STATUS.AUTO is clear still recovers
+     * automatically after the module reboots. */
+    if (!rd(USS_REG_STATUS, &st, 1)) return false;
+    if (st & USS_ST_AUTO) return true;
+
+    if (!wr(USS_REG_AUTO_PERIOD, lo))     return false;
+    if (!wr(USS_REG_AUTO_PERIOD + 1, hi)) return false;
+    if (!wr(USS_REG_CMD, USS_CMD_AUTO_START)) return false;
+
+    /* WAIT for STATUS.AUTO before returning.
+     *
+     * The command is only queued by the write; the module then brings its AFE
+     * rails up, settles them and runs one discard capture before it sets the
+     * bit -- about 700 ms. Returning immediately let uss_sample() read STATUS
+     * inside that window, see AUTO clear, and issue a MEASURE, which is exactly
+     * the interleaving that stalls the module's own cadence. */
+    for (int waited = 0; waited < USS_AUTO_START_TIMEOUT_MS; waited += USS_POLL_MS) {
+        vTaskDelay(pdMS_TO_TICKS(USS_POLL_MS));
+        if (!rd(USS_REG_STATUS, &st, 1)) return false;
+        if (st & USS_ST_AUTO) {
+            ESP_LOGI(TAG, "autonomous mode started, period %u s", period_s);
+            return true;
+        }
+    }
+    ESP_LOGW(TAG, "autonomous start not confirmed (status 0x%02x)", st);
+    return false;
+}
+
 bool uss_sample(uss_result_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -65,22 +108,34 @@ bool uss_sample(uss_result_t *out)
         return false;
     }
 
-    if (!wr(USS_REG_CMD, USS_CMD_MEASURE)) return false;
-
-    /* Poll STATUS until READY. First wait is longer: the slave is doing the
-     * whole capture + algorithm run, no point hammering the bus. */
-    vTaskDelay(pdMS_TO_TICKS(100));
     uint8_t st = 0;
-    int waited = 100;
-    for (;;) {
-        if (!rd(USS_REG_STATUS, &st, 1)) return false;
-        if ((st & USS_ST_READY) && !(st & USS_ST_BUSY)) break;
-        if (waited >= USS_MEAS_TIMEOUT_MS) {
-            ESP_LOGW(TAG, "measurement timeout (status 0x%02x)", st);
+    if (!rd(USS_REG_STATUS, &st, 1)) return false;
+
+    /* If the module is running autonomously, do NOT command a measurement --
+     * just take whatever it last latched. Interleaving our own MEASURE with its
+     * schedule would stall its cadence and corrupt the integration interval. */
+    if (st & USS_ST_AUTO) {
+        if (!(st & USS_ST_READY)) {
+            ESP_LOGW(TAG, "auto mode but no result yet (status 0x%02x)", st);
             return false;
         }
-        vTaskDelay(pdMS_TO_TICKS(USS_POLL_MS));
-        waited += USS_POLL_MS;
+    } else {
+        if (!wr(USS_REG_CMD, USS_CMD_MEASURE)) return false;
+
+        /* Poll STATUS until READY. First wait is longer: the slave is doing the
+         * whole capture + algorithm run, no point hammering the bus. */
+        vTaskDelay(pdMS_TO_TICKS(100));
+        int waited = 100;
+        for (;;) {
+            if (!rd(USS_REG_STATUS, &st, 1)) return false;
+            if ((st & USS_ST_READY) && !(st & USS_ST_BUSY)) break;
+            if (waited >= USS_MEAS_TIMEOUT_MS) {
+                ESP_LOGW(TAG, "measurement timeout (status 0x%02x)", st);
+                return false;
+            }
+            vTaskDelay(pdMS_TO_TICKS(USS_POLL_MS));
+            waited += USS_POLL_MS;
+        }
     }
 
     uint8_t blk[USS_LINK_RESULT_LEN];

@@ -157,20 +157,27 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
              * ToF for a known gas, which this product does not need), so the
              * field is structurally always 0.00. Publishing it would burn a
              * ThingsBoard datapoint per sample on a constant. */
-            ",\"flow_lpm\":%.4f,\"uss_dtof_ns\":%.3f,"
+            ",\"flow_lpm\":%.4f,\"uss_dtof_us\":%.6f,"
             "\"uss_code\":%u,\"uss_amp_ups\":%u,\"uss_amp_dns\":%u,"
             "\"uss_snr_db\":%.1f,\"uss_gain\":%u,\"uss_vol_ml\":%lu,"
             "\"uss_status\":%u",
-            r->uss_flow_ulpm / 1e6f, r->uss_dtof_ps / 1000.0f,
+            r->uss_flow_ulpm / 1e6f, r->uss_dtof_ps / 1e6f,   /* ps -> us */
             r->uss_code, r->uss_amp_ups, r->uss_amp_dns,
             r->uss_snr_db2 / 2.0f, r->uss_gain,
             (unsigned long)r->uss_vol_ml, r->uss_status);
     /* Raw absolute ToF, Q40 seconds, unscaled on purpose (see record.h).
      * Sent as integers so no float rounding touches the composition signal. */
+    /* Absolute ToF: raw Q40 seconds AND microseconds. The raw value stays the
+     * source of truth (no scaling assumption baked into two firmwares); the us
+     * fields exist because a dashboard cannot plot a Q40 integer.
+     *   us = raw * 1e6 / 2^40 = raw / 1099511.627776 */
     if ((r->sensor_ok & 0x10) && n > 0 && (size_t)n < cap)
         n += snprintf(out + n, cap - n,
-            ",\"uss_tof_ups_q40\":%lu,\"uss_tof_dns_q40\":%lu",
-            (unsigned long)r->uss_tof_ups_q40, (unsigned long)r->uss_tof_dns_q40);
+            ",\"uss_tof_ups_q40\":%lu,\"uss_tof_dns_q40\":%lu"
+            ",\"uss_tof_ups_us\":%.4f,\"uss_tof_dns_us\":%.4f",
+            (unsigned long)r->uss_tof_ups_q40, (unsigned long)r->uss_tof_dns_q40,
+            r->uss_tof_ups_q40 / 1099511.627776,
+            r->uss_tof_dns_q40 / 1099511.627776);
     /* Pressure. The MS5837 sits in the GAS LINE, so it reports gas pressure --
      * not ambient. Atmospheric has no sensor on this node yet, so it comes from
      * a per-site constant, flagged as such. dp is the difference, which is the

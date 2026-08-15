@@ -157,6 +157,10 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
      * half-powered slave is a real state (its ESD clamps back-feed from an
      * idle-high bus, so the rail must be dropped with SDA/SCL held low).
      * Costs ~1 s and only on the failing path; a healthy node never sees it. */
+    /* Keep the module in autonomous 1 Hz mode. Idempotent, and re-asserting it
+     * every wake is what makes it recover by itself if the module rebooted. */
+    (void) uss_start_auto(USS_AUTO_PERIOD_S);
+
     bool uss_ok = uss_sample(&u);
     if (!uss_ok) {
         ESP_LOGW(TAG, "USS silent, power-cycling the sensor rail");
@@ -167,6 +171,10 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
          * header -- it fades rather than switching off. Too short a window
          * means no power-on reset at all, which defeats the purpose. */
         board_sensor_power_cycle(800);
+        /* The module has just rebooted, so STATUS.AUTO is clear -- restart
+         * autonomous mode before sampling, or it would stay in one-shot until
+         * the next wake and the totalizer would never accumulate. */
+        (void) uss_start_auto(USS_AUTO_PERIOD_S);
         uss_ok = uss_sample(&u);
         ESP_LOGW(TAG, "USS after power cycle: %s", uss_ok ? "recovered" : "still silent");
     }
@@ -185,11 +193,12 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
         r->uss_tof_dns_q40 = u.tof_dns_q40;
         r->sensor_ok |= 0x10;
         ESP_LOGI(TAG, "USS ok: code=%u seq=%u dtof=%ld ps tof_ups=%lu tof_dns=%lu q40 "
-                      "(%.1f/%.1f us) amp=%u/%u snr=%.1f dB gain=%u",
+                      "(%.1f/%.1f us) amp=%u/%u snr=%.1f dB gain=%u vol=%lu mL st=0x%02X",
                  u.code, u.seq, (long) u.dtof_ps,
                  (unsigned long) u.tof_ups_q40, (unsigned long) u.tof_dns_q40,
                  u.tof_ups_q40 / 1099511.627776, u.tof_dns_q40 / 1099511.627776,
-                 u.amp_ups, u.amp_dns, u.snr_db2 / 2.0f, u.gain);
+                 u.amp_ups, u.amp_dns, u.snr_db2 / 2.0f, u.gain,
+                 (unsigned long) u.vol_ml, u.status);
     } else {
         r->uss_flow_ulpm = r->uss_dtof_ps = 0;
         r->uss_temp_cC = 0;
@@ -418,6 +427,17 @@ void app_main(void)
 
     s_crash_count  = 0;   /* wake completed cleanly */
     s_last_sleep_s = sleep_s;
+
+    /* Repeat the USS state right before sleeping. The USB CDC takes several
+     * seconds to enumerate after a wake, so the sampling log at the top of the
+     * cycle is unobservable on a console that attaches mid-wake -- this recap
+     * always lands. */
+    ESP_LOGI(TAG, "USS recap: st=0x%02X%s code=%u vol=%lu mL tof=%.2f/%.2f us dtof=%.4f us",
+             r.uss_status, (r.uss_status & 0x08) ? " AUTO" : "", r.uss_code,
+             (unsigned long)r.uss_vol_ml,
+             r.uss_tof_ups_q40 / 1099511.627776,
+             r.uss_tof_dns_q40 / 1099511.627776,
+             r.uss_dtof_ps / 1e6f);
 
     ESP_LOGI(TAG, "sleeping %lu s", (unsigned long)sleep_s);
     vTaskDelay(pdMS_TO_TICKS(200));   /* drain console */

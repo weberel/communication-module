@@ -83,5 +83,16 @@
  * firmware turns one around well inside 500 ms. Budget 3 s before declaring
  * the module stuck -- a lost measurement costs one sample, a false timeout
  * every 5 min would cost the link. */
+/* Autonomous measurement period on the module, seconds. It measures and
+ * integrates at this rate continuously; we just read the accumulated volume
+ * whenever we wake, so this is decoupled from SAMPLE_INTERVAL_S. 1 Hz is
+ * comfortable now that the AFE rails stay up for the whole autonomous run. */
+#define USS_AUTO_PERIOD_S       1
+
+/* How long to wait for STATUS.AUTO after commanding AUTO_START. The module
+ * raises its AFE rails, settles them and runs one discard capture first, so
+ * ~700 ms is normal; 3 s is the give-up point. */
+#define USS_AUTO_START_TIMEOUT_MS  3000
+
 #define USS_MEAS_TIMEOUT_MS     3000
 #define USS_POLL_MS             25

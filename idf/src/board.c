@@ -24,7 +24,12 @@ void board_init(void)
 
     out(ECO_PIN_MODEM_PWR_EN, 0);   /* modem rail OFF first, always */
     out(ECO_PIN_MODEM_PWRKEY, 1);   /* idle-high while awake */
-    out(ECO_PIN_SENSOR_PWR, 0);
+    /* HIGH, not low. The sensor rail is always-on policy now (only
+     * board_sensor_power_cycle() drops it), and driving it low here glitched
+     * the ultrasonic module on every comm-module reboot -- costing it a 3 s
+     * reboot and clearing its autonomous mode. Coming out of deep sleep the
+     * pin was already held high, so this keeps it glitch-free too. */
+    out(ECO_PIN_SENSOR_PWR, 1);
     out(ECO_PIN_LED, 0);
 
     gpio_reset_pin(ECO_PIN_QON);

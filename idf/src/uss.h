@@ -43,6 +43,12 @@ typedef struct {
  * metrics (amp/snr/gain) are still valid diagnostics. */
 bool uss_sample(uss_result_t *out);
 
+/* Start autonomous measurement + totalizing on the module (period in seconds).
+ * Idempotent and cheap; call it each wake so the mode is restored automatically
+ * after the module reboots. With this running, uss_sample() stops commanding
+ * measurements and simply reads the latest latched block plus vol_ml. */
+bool uss_start_auto(uint16_t period_s);
+
 #ifdef __cplusplus
 }
 #endif
