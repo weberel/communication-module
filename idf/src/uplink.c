@@ -42,11 +42,11 @@ extern const char isrg_root_pem[];
 #define NO_SIGNAL_FAILFAST_S 25      /* CSQ still 99 after this -> abort attempt */
 #define MQTT_CONNECT_TO_MS   30000
 #define PUBLISH_TO_MS        20000
-/* 4, not 8. Each record now carries the USS block and the pressure trio, so a
- * batch of 8 was ~320 datapoints in one publish and ThingsBoard Cloud closed
- * the connection (transport_read EOF). Smaller batches drain just as fast with
- * the existing inter-batch pacing. */
-#define BATCH_RECORDS        4
+/* Back to 8 after the telemetry trim: 22 datapoints per record x 8 = ~176 per
+ * publish, comfortably under what made ThingsBoard Cloud drop the connection
+ * (that was ~320, at 40 datapoints x 8). Larger batches drain a backlog in
+ * fewer round trips, which matters over a slow cellular link. */
+#define BATCH_RECORDS        8
 #define BATCH_GAP_MS         400     /* ThingsBoard Cloud dislikes bursts */
 
 #define CLOCK_MIN 1767225600L        /* 2026-01-01 */
@@ -133,81 +133,73 @@ static bool publish_acked(const char *json)
  * whole batch down with it. */
 static int record_values(const LogRecord *r, char *out, size_t cap)
 {
-    int32_t bat_mw = (int32_t)r->vbat_mv * r->ibat_ma / 1000;
-    int n = snprintf(out, cap,
-        "\"vbat_mv\":%u,\"ibat_ma\":%d,\"bat_mw\":%ld,\"soc_pct\":%u,"
-        "\"vbus_mv\":%u,\"ibus_ma\":%d,\"vac2_mv\":%u,\"vsys_mv\":%u,"
-        "\"vindpm_mv\":%u,\"vreg_mv\":%u,\"chg_stat\":%u,"
-        "\"fault0\":%u,\"fault1\":%u,\"harvest_mah\":%u,"
-        "\"solar\":%u,\"usb\":%u,\"weather_good\":%u,\"eco_chg\":%u,"
-        "\"light_ch0\":%u,\"light_ch1\":%u,"
-        "\"acc_x_mg\":%d,\"acc_y_mg\":%d,\"acc_z_mg\":%d,"
-        "\"press_mbar\":%.1f,\"temp_c\":%.2f,"
-        "\"tdie_c\":%.1f,\"ts_pct\":%.2f,\"ts_stat\":%u,\"sensor_ok\":%u",
-        r->vbat_mv, r->ibat_ma, (long)bat_mw, r->soc_pct,
-        r->vbus_mv, r->ibus_ma, r->vac2_mv, r->vsys_mv,
-        r->vindpm_mv, r->vreg_mv, r->chg_stat,
-        r->fault0, r->fault1, r->harvest_mah,
-        (r->flags & RECF_SOLAR) ? 1 : 0, (r->flags & RECF_USB) ? 1 : 0,
-        (r->flags & RECF_WEATHER) ? 1 : 0, (r->flags & RECF_ECO_CHG) ? 1 : 0,
-        r->light_ch0, r->light_ch1,
-        r->acc_mg[0], r->acc_mg[1], r->acc_mg[2],
-        r->press_dmbar / 10.0f, r->temp_cC / 100.0f,
-        r->tdie_dC / 10.0f, r->ts_pct_x100 / 100.0f, r->ts_stat, r->sensor_ok);
-
-    /* Ultrasonic flow + WF280A keys only when the hardware answered this
-     * sample -- boards without the gas cell don't burn datapoint quota. */
-    if ((r->sensor_ok & 0x10) && n > 0 && (size_t)n < cap)
-        n += snprintf(out + n, cap - n,
-            /* uss_temp_c is NOT published: USS_ALG_ENABLE_ESTIMATE_TEMPERATURE
-             * is false in the gas config (that option derives temperature from
-             * ToF for a known gas, which this product does not need), so the
-             * field is structurally always 0.00. Publishing it would burn a
-             * ThingsBoard datapoint per sample on a constant. */
-            ",\"flow_lpm\":%.4f,\"uss_dtof_us\":%.6f,"
-            "\"uss_code\":%u,\"uss_amp_ups\":%u,\"uss_amp_dns\":%u,"
-            "\"uss_snr_db\":%.1f,\"uss_gain\":%u,\"uss_vol_ml\":%lu,"
-            "\"uss_status\":%u",
-            r->uss_flow_ulpm / 1e6f, r->uss_dtof_ps / 1e6f,   /* ps -> us */
-            r->uss_code, r->uss_amp_ups, r->uss_amp_dns,
-            r->uss_snr_db2 / 2.0f, r->uss_gain,
-            (unsigned long)r->uss_vol_ml, r->uss_status);
-    /* Raw absolute ToF, Q40 seconds, unscaled on purpose (see record.h).
-     * Sent as integers so no float rounding touches the composition signal. */
-    /* Absolute ToF in microseconds only.
+    /* TRIMMED SET (2026-08-15): ~40 datapoints -> 22.
      *
-     * The raw Q40 value is still what crosses the I2C link and what is stored
-     * in the flash record -- that stays the source of truth. It is NOT
-     * published: sending both doubled the ToF datapoints for no analytical
-     * gain, and ThingsBoard started dropping the MQTT connection once each
-     * record carried ~40 datapoints.
-     *   us = raw * 1e6 / 2^40 = raw / 1099511.627776 */
-    if ((r->sensor_ok & 0x10) && n > 0 && (size_t)n < cap)
+     * Rule applied: publish what you would act on or analyse. Drop what is
+     * derivable from other fields, what is only wanted for a post-mortem, and
+     * what is structurally constant. Nothing is actually lost -- the 128-byte
+     * flash record still carries every field, so a unit can be interrogated
+     * after the fact; this only trims what crosses the air.
+     *
+     * Dropped and why:
+     *   bat_mw                 = vbat * ibat, derivable
+     *   vac2_mv, vsys_mv,
+     *   vreg_mv, vindpm_mv     charger internals; post-mortem, not decisions
+     *   fault0, fault1         almost always 0; the record keeps them
+     *   weather_good, eco_chg  derived heuristics, recomputable from harvest
+     *   light_ch1              IR channel; ch0 is the one that means anything
+     *   press_mbar             DUPLICATE of p_gas_hpa (same MS5837 reading)
+     *   tdie_c, ts_pct,
+     *   ts_stat                charger thermal diagnostics
+     *   flow_lpm               VFR constants are wrong for this cell; it is a
+     *                          misleading number until the lab calibration
+     *   uss_amp_ups/dns, gain  summarised by uss_snr_db (a degrading signal
+     *                          shows up there); the record keeps the detail
+     *   uss_status             AUTO/BOOT bits; vol_ml resetting says the same
+     *   p_atm_hpa, is_const    a compile-time constant, same every sample
+     *   wf_praw, wf_traw       the WF280A does not produce usable data
+     *
+     * uss_tof_us is the MEAN of the two directions, not both. That is the
+     * principled split: the mean is the speed-of-sound (composition) signal,
+     * and the difference is the flow signal, which uss_dtof_us already carries
+     * at far better resolution. Publishing both directions separately sent the
+     * same information twice. */
+    int n = snprintf(out, cap,
+        "\"vbat_mv\":%u,\"ibat_ma\":%d,\"soc_pct\":%u,"
+        "\"vbus_mv\":%u,\"ibus_ma\":%d,\"chg_stat\":%u,"
+        "\"harvest_mah\":%u,\"solar\":%u,\"usb\":%u,"
+        "\"light_ch0\":%u,"
+        "\"acc_x_mg\":%d,\"acc_y_mg\":%d,\"acc_z_mg\":%d,"
+        "\"temp_c\":%.2f,\"sensor_ok\":%u",
+        r->vbat_mv, r->ibat_ma, r->soc_pct,
+        r->vbus_mv, r->ibus_ma, r->chg_stat,
+        r->harvest_mah,
+        (r->flags & RECF_SOLAR) ? 1 : 0, (r->flags & RECF_USB) ? 1 : 0,
+        r->light_ch0,
+        r->acc_mg[0], r->acc_mg[1], r->acc_mg[2],
+        r->temp_cC / 100.0f, r->sensor_ok);
+
+    /* Ultrasonic: four core values plus SNR as the health indicator. Only when
+     * the module answered, so boards without a gas cell burn no quota. */
+    if ((r->sensor_ok & 0x10) && n > 0 && (size_t)n < cap) {
+        double tof_us = (r->uss_tof_ups_q40 / 1099511.627776 +
+                         r->uss_tof_dns_q40 / 1099511.627776) / 2.0;
         n += snprintf(out + n, cap - n,
-            ",\"uss_tof_ups_us\":%.4f,\"uss_tof_dns_us\":%.4f",
-            r->uss_tof_ups_q40 / 1099511.627776,
-            r->uss_tof_dns_q40 / 1099511.627776);
-    /* Pressure. The MS5837 sits in the GAS LINE, so it reports gas pressure --
-     * not ambient. Atmospheric has no sensor on this node yet, so it comes from
-     * a per-site constant, flagged as such. dp is the difference, which is the
-     * quantity the gas work actually wants; it is published for convenience but
-     * both inputs are sent raw so it can be recomputed off-device. */
-    if (n > 0 && (size_t)n < cap) {
-        if (r->sensor_ok & 0x08) {
-            float p_gas = r->press_dmbar / 10.0f;
-            n += snprintf(out + n, cap - n,
-                ",\"p_gas_hpa\":%.2f,\"p_atm_hpa\":%.2f,\"p_atm_is_const\":1"
-                ",\"dp_hpa\":%.2f",
-                p_gas, P_ATM_CONST_HPA, p_gas - P_ATM_CONST_HPA);
-        } else {
-            n += snprintf(out + n, cap - n,
-                ",\"p_atm_hpa\":%.2f,\"p_atm_is_const\":1", P_ATM_CONST_HPA);
-        }
+            ",\"uss_tof_us\":%.4f,\"uss_dtof_us\":%.6f,"
+            "\"uss_code\":%u,\"uss_snr_db\":%.1f,\"uss_vol_ml\":%lu",
+            tof_us, r->uss_dtof_ps / 1e6f,
+            r->uss_code, r->uss_snr_db2 / 2.0f,
+            (unsigned long)r->uss_vol_ml);
     }
-    if ((r->sensor_ok & 0x20) && n > 0 && (size_t)n < cap)
+
+    /* Gas pressure from the MS5837 (it sits in the LINE, not ambient), and the
+     * differential against the per-site atmospheric constant in config.h. */
+    if ((r->sensor_ok & 0x08) && n > 0 && (size_t)n < cap) {
+        float p_gas = r->press_dmbar / 10.0f;
         n += snprintf(out + n, cap - n,
-            ",\"wf_praw\":%lu,\"wf_traw\":%lu",
-            (unsigned long)r->wf_praw, (unsigned long)r->wf_traw);
+            ",\"p_gas_hpa\":%.2f,\"dp_hpa\":%.2f",
+            p_gas, p_gas - P_ATM_CONST_HPA);
+    }
 
     /* snprintf returns what it WOULD have written, so n > cap means we lost
      * bytes somewhere above. Say so rather than emitting broken JSON. */
@@ -215,10 +207,6 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
     return n;
 }
 
-/* 10 kB: BATCH_RECORDS (8) x ~1140 chars per record now that each carries the
- * USS block, both raw Q40 ToFs and their us forms, and the pressure trio. At
- * 7168 the batch quietly truncated to ~6 records -- safe, but it made every
- * upload smaller than intended for no reason. */
 static char s_json[10240];
 
 static int64_t record_ts_ms(const LogRecord *r, int64_t now_ms, uint32_t head)

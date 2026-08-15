@@ -115,9 +115,20 @@ bool uss_sample(uss_result_t *out)
      * just take whatever it last latched. Interleaving our own MEASURE with its
      * schedule would stall its cadence and corrupt the integration interval. */
     if (st & USS_ST_AUTO) {
-        if (!(st & USS_ST_READY)) {
-            ESP_LOGW(TAG, "auto mode but no result yet (status 0x%02x)", st);
-            return false;
+        /* AUTO is set the moment the module accepts the command, but READY only
+         * appears when its first autonomous measurement publishes -- up to one
+         * period later. Sampling inside that window used to return "module not
+         * answering" for a module that was working perfectly. Wait for it. */
+        int waited = 0;
+        while (!(st & USS_ST_READY)) {
+            if (waited >= USS_MEAS_TIMEOUT_MS) {
+                ESP_LOGW(TAG, "auto mode but no result within %d ms (status 0x%02x)",
+                         USS_MEAS_TIMEOUT_MS, st);
+                return false;
+            }
+            vTaskDelay(pdMS_TO_TICKS(USS_POLL_MS));
+            waited += USS_POLL_MS;
+            if (!rd(USS_REG_STATUS, &st, 1)) return false;
         }
     } else {
         if (!wr(USS_REG_CMD, USS_CMD_MEASURE)) return false;
