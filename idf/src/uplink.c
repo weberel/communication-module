@@ -171,18 +171,22 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
         n += snprintf(out + n, cap - n,
             ",\"uss_tof_ups_q40\":%lu,\"uss_tof_dns_q40\":%lu",
             (unsigned long)r->uss_tof_ups_q40, (unsigned long)r->uss_tof_dns_q40);
-    /* Absolute (atmospheric) pressure. Prefer the MS5837 on this board -- it is
-     * a real measurement, and it agreed with the Zurich constant to 0.4 hPa on
-     * 2026-08-15 (965.4 measured vs 965.0 assumed). The constant is only a
-     * fallback for boards where that barometer is not fitted, and p_abs_is_const
-     * says which you are looking at so no analysis has to guess. */
+    /* Pressure. The MS5837 sits in the GAS LINE, so it reports gas pressure --
+     * not ambient. Atmospheric has no sensor on this node yet, so it comes from
+     * a per-site constant, flagged as such. dp is the difference, which is the
+     * quantity the gas work actually wants; it is published for convenience but
+     * both inputs are sent raw so it can be recomputed off-device. */
     if (n > 0 && (size_t)n < cap) {
-        if (r->sensor_ok & 0x08)
+        if (r->sensor_ok & 0x08) {
+            float p_gas = r->press_dmbar / 10.0f;
             n += snprintf(out + n, cap - n,
-                ",\"p_abs_hpa\":%.2f,\"p_abs_is_const\":0", r->press_dmbar / 10.0f);
-        else
+                ",\"p_gas_hpa\":%.2f,\"p_atm_hpa\":%.2f,\"p_atm_is_const\":1"
+                ",\"dp_hpa\":%.2f",
+                p_gas, P_ATM_CONST_HPA, p_gas - P_ATM_CONST_HPA);
+        } else {
             n += snprintf(out + n, cap - n,
-                ",\"p_abs_hpa\":%.2f,\"p_abs_is_const\":1", P_ABS_CONST_HPA);
+                ",\"p_atm_hpa\":%.2f,\"p_atm_is_const\":1", P_ATM_CONST_HPA);
+        }
     }
     if ((r->sensor_ok & 0x20) && n > 0 && (size_t)n < cap)
         n += snprintf(out + n, cap - n,

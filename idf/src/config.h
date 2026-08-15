@@ -55,28 +55,28 @@
 #define TZ_OFFSET_MIN           120     /* local day rollover (CEST) */
 
 /* =========================================================================
- * ABSOLUTE (atmospheric) PRESSURE
+ * PRESSURE: WHICH SENSOR MEASURES WHAT
  * =========================================================================
- * Primary source is the MS5837 barometer on this board (sensor_ok bit 3). The
- * uplink publishes p_abs_hpa from it and sets p_abs_is_const=0. Measured
- * 965.4 hPa in Zurich on 2026-08-15.
+ * GAS pressure  -- the MS5837 on the I2C hat header (sensor_ok bit 3). It sits
+ *                  in the GAS LINE, so press_dmbar is gas pressure, NOT ambient.
+ *                  Published as p_gas_hpa.
+ * ATMOSPHERIC   -- no sensor on this node. Comes from the constant below and is
+ *                  published as p_atm_hpa with p_atm_is_const=1 so no analysis
+ *                  mistakes it for a reading. SET IT PER SITE: it feeds gas
+ *                  density directly.
+ *                     sea level (ISA) 1013    Zurich ~400 m 965
+ *                     Mzuzu ~1250 m    875    Nairobi ~1795 m 820
+ * dp_hpa        -- gas minus atmospheric, published for convenience; both
+ *                  inputs are sent so it can be recomputed off-device.
  *
- * The constant below is used ONLY when that barometer is absent, and the
- * uplink then sets p_abs_is_const=1 so downstream can tell them apart.
- * Set it per site if you ship a board without a barometer -- station pressure
- * feeds gas density directly:
- *     sea level (ISA) 1013    Zurich ~400 m 965
- *     Mzuzu ~1250 m    875    Nairobi ~1795 m 820
- *
- * NOTE: this is NOT the gas-line pressure. The WF280A (U8) on the ultrasonic
- * board was to supply that and does not work: measured 2026-08-15, its status
- * byte reads 0x19 on every access (ADC powered off, test mode set, two
- * reserved-must-be-zero bits set) and a datasheet-correct trigger returns 6.
- * Its compensation polynomial is also unpublished. sensor_ok bit 5 reflects
- * only that it ACKs, not that its data is usable. A Bosch part replaces it on
- * the respin.
+ * The WF280A (U8) on the ultrasonic board was meant to supply gas pressure and
+ * does not work: measured 2026-08-15, its status byte reads 0x19 on every
+ * access (ADC powered off, test mode set, two reserved-must-be-zero bits set)
+ * and a datasheet-correct trigger returns 6. Its compensation polynomial is
+ * also unpublished. sensor_ok bit 5 means only that it ACKs, not that its data
+ * is usable. A Bosch part replaces it on the respin.
  * ========================================================================= */
-#define P_ABS_CONST_HPA         965.0f   /* ZURICH, ~408 m. */
+#define P_ATM_CONST_HPA         965.0f   /* ATMOSPHERIC, Zurich ~408 m. Per site. */
 
 /* ---- Ultrasonic flow module (MSP430FR6043 I2C slave, uss_link.h) ----
  * A USS measurement is a capture + algorithm run on the MSP430; the reference
