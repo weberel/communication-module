@@ -42,7 +42,11 @@ extern const char isrg_root_pem[];
 #define NO_SIGNAL_FAILFAST_S 25      /* CSQ still 99 after this -> abort attempt */
 #define MQTT_CONNECT_TO_MS   30000
 #define PUBLISH_TO_MS        20000
-#define BATCH_RECORDS        8
+/* 4, not 8. Each record now carries the USS block and the pressure trio, so a
+ * batch of 8 was ~320 datapoints in one publish and ThingsBoard Cloud closed
+ * the connection (transport_read EOF). Smaller batches drain just as fast with
+ * the existing inter-batch pacing. */
+#define BATCH_RECORDS        4
 #define BATCH_GAP_MS         400     /* ThingsBoard Cloud dislikes bursts */
 
 #define CLOCK_MIN 1767225600L        /* 2026-01-01 */
@@ -124,6 +128,9 @@ static bool publish_acked(const char *json)
 
 /* ---- ThingsBoard JSON, same schema the dashboards already use ---- */
 
+/* Returns the length written, or -1 if the payload did not fit. A truncated
+ * record is worse than no record: it produces malformed JSON that takes the
+ * whole batch down with it. */
 static int record_values(const LogRecord *r, char *out, size_t cap)
 {
     int32_t bat_mw = (int32_t)r->vbat_mv * r->ibat_ma / 1000;
@@ -167,15 +174,17 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
             (unsigned long)r->uss_vol_ml, r->uss_status);
     /* Raw absolute ToF, Q40 seconds, unscaled on purpose (see record.h).
      * Sent as integers so no float rounding touches the composition signal. */
-    /* Absolute ToF: raw Q40 seconds AND microseconds. The raw value stays the
-     * source of truth (no scaling assumption baked into two firmwares); the us
-     * fields exist because a dashboard cannot plot a Q40 integer.
+    /* Absolute ToF in microseconds only.
+     *
+     * The raw Q40 value is still what crosses the I2C link and what is stored
+     * in the flash record -- that stays the source of truth. It is NOT
+     * published: sending both doubled the ToF datapoints for no analytical
+     * gain, and ThingsBoard started dropping the MQTT connection once each
+     * record carried ~40 datapoints.
      *   us = raw * 1e6 / 2^40 = raw / 1099511.627776 */
     if ((r->sensor_ok & 0x10) && n > 0 && (size_t)n < cap)
         n += snprintf(out + n, cap - n,
-            ",\"uss_tof_ups_q40\":%lu,\"uss_tof_dns_q40\":%lu"
             ",\"uss_tof_ups_us\":%.4f,\"uss_tof_dns_us\":%.4f",
-            (unsigned long)r->uss_tof_ups_q40, (unsigned long)r->uss_tof_dns_q40,
             r->uss_tof_ups_q40 / 1099511.627776,
             r->uss_tof_dns_q40 / 1099511.627776);
     /* Pressure. The MS5837 sits in the GAS LINE, so it reports gas pressure --
@@ -199,10 +208,18 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
         n += snprintf(out + n, cap - n,
             ",\"wf_praw\":%lu,\"wf_traw\":%lu",
             (unsigned long)r->wf_praw, (unsigned long)r->wf_traw);
+
+    /* snprintf returns what it WOULD have written, so n > cap means we lost
+     * bytes somewhere above. Say so rather than emitting broken JSON. */
+    if (n < 0 || (size_t)n >= cap) return -1;
     return n;
 }
 
-static char s_json[7168];
+/* 10 kB: BATCH_RECORDS (8) x ~1140 chars per record now that each carries the
+ * USS block, both raw Q40 ToFs and their us forms, and the pressure trio. At
+ * 7168 the batch quietly truncated to ~6 records -- safe, but it made every
+ * upload smaller than intended for no reason. */
+static char s_json[10240];
 
 static int64_t record_ts_ms(const LogRecord *r, int64_t now_ms, uint32_t head)
 {
@@ -225,8 +242,22 @@ static uint32_t drain(uplink_result_t *res)
         for (uint32_t i = 0; i < n; i++) {
             LogRecord r;
             if (!flashlog_peek(i, &r)) continue;
-            char vals[800];
-            record_values(&r, vals, sizeof(vals));
+            /* 1536, not 800: the record payload is ~1070 chars now (28 base
+             * fields + 9 USS + 4 ToF, two of them 9-digit Q40 integers + 4
+             * pressure + 2 WF280A). At 800 it truncated mid-field, the JSON
+             * came out malformed, and ThingsBoard silently rejected the whole
+             * batch -- the symptom was every sensor key frozen while the
+             * separate (short) status payload kept updating. */
+            /* STATIC, not on the stack. The main task stack is 4 KB and a
+             * 1536-byte automatic here overflowed it -- ESP-IDF caught it as a
+             * stack protection fault mid-upload, so the device rebooted every
+             * cycle and never sent anything. Static is safe: this loop is
+             * single-threaded and the buffer is consumed before the next pass. */
+            static char vals[1536];
+            if (record_values(&r, vals, sizeof(vals)) < 0) {
+                ESP_LOGE(TAG, "record payload truncated -- telemetry dropped");
+                continue;
+            }
             int w;
             if (now_ms > 0)
                 w = snprintf(s_json + len, sizeof(s_json) - len - 2,
@@ -283,7 +314,7 @@ static void send_status(const uplink_ctx_t *ctx, const uplink_result_t *res)
     const char *transport = (res->sent && res->used_wifi) ? "wifi" :
                             res->sent ? "cell" : "none";
     int64_t now_ms = clock_valid() ? (int64_t)time(NULL) * 1000 : 0;
-    char vals[800];
+    static char vals[800];          /* keep it off the 4 KB main stack too */
     snprintf(vals, sizeof(vals),
              "\"rssi_dbm\":%d,\"wifi_rssi_dbm\":%d,\"transport\":\"%s\","
              "\"cereg_stat\":%u,\"backlog\":%lu,\"boot_id\":%u,"
