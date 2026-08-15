@@ -84,7 +84,7 @@
  * >>> Leaving the sea-level default on a Nairobi node overstates absolute
  * >>> pressure by ~24 %, and gas density with it.
  * ========================================================================= */
-#define P_ABS_CONST_HPA         1013.25f
+#define P_ABS_CONST_HPA         965.0f   /* ZURICH, ~408 m. Change per site. */
 
 /* ---- Ultrasonic flow module (MSP430FR6043 I2C slave, uss_link.h) ----
  * A USS measurement is a capture + algorithm run on the MSP430; the reference

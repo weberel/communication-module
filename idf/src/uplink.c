@@ -152,12 +152,16 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
      * sample -- boards without the gas cell don't burn datapoint quota. */
     if ((r->sensor_ok & 0x10) && n > 0 && (size_t)n < cap)
         n += snprintf(out + n, cap - n,
-            ",\"flow_lpm\":%.4f,\"uss_dtof_ns\":%.3f,\"uss_temp_c\":%.2f,"
+            /* uss_temp_c is NOT published: USS_ALG_ENABLE_ESTIMATE_TEMPERATURE
+             * is false in the gas config (that option derives temperature from
+             * ToF for a known gas, which this product does not need), so the
+             * field is structurally always 0.00. Publishing it would burn a
+             * ThingsBoard datapoint per sample on a constant. */
+            ",\"flow_lpm\":%.4f,\"uss_dtof_ns\":%.3f,"
             "\"uss_code\":%u,\"uss_amp_ups\":%u,\"uss_amp_dns\":%u,"
             "\"uss_snr_db\":%.1f,\"uss_gain\":%u,\"uss_vol_ml\":%lu,"
             "\"uss_status\":%u",
             r->uss_flow_ulpm / 1e6f, r->uss_dtof_ps / 1000.0f,
-            r->uss_temp_cC / 100.0f,
             r->uss_code, r->uss_amp_ups, r->uss_amp_dns,
             r->uss_snr_db2 / 2.0f, r->uss_gain,
             (unsigned long)r->uss_vol_ml, r->uss_status);
