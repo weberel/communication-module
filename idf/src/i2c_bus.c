@@ -1,6 +1,21 @@
 #include "i2c_bus.h"
 
+#include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 static i2c_master_bus_handle_t s_bus;
+
+/* Where each driver keeps its cached device handle.
+ *
+ * The bus has to be torn down to power-cycle the ultrasonic board (see
+ * eco_i2c_hold_low), and every handle registered on it dies with it. Rather
+ * than have each driver poll for that, they hand us the address of their
+ * cached handle and we null it on teardown -- their existing lazy
+ * `if (!h) h = eco_i2c_add(...)` then re-attaches on the next call. */
+#define ECO_I2C_MAX_TRACKED 8
+static i2c_master_dev_handle_t *s_slots[ECO_I2C_MAX_TRACKED];
+static int s_nslots;
 
 i2c_master_bus_handle_t eco_i2c_bus(void)
 {
@@ -32,4 +47,58 @@ i2c_master_dev_handle_t eco_i2c_add(uint8_t addr7)
     i2c_master_dev_handle_t h = NULL;
     if (i2c_master_bus_add_device(bus, &dev, &h) != ESP_OK) return NULL;
     return h;
+}
+
+i2c_master_dev_handle_t eco_i2c_add_tracked(i2c_master_dev_handle_t *slot, uint8_t addr7)
+{
+    i2c_master_dev_handle_t h = eco_i2c_add(addr7);
+    if (!h || !slot) return h;
+
+    for (int i = 0; i < s_nslots; i++)
+        if (s_slots[i] == slot) { *slot = h; return h; }
+
+    if (s_nslots < ECO_I2C_MAX_TRACKED) s_slots[s_nslots++] = slot;
+    *slot = h;
+    return h;
+}
+
+/* Tear the bus down and hold SDA+SCL LOW as plain GPIOs.
+ *
+ * WHY THIS IS NEEDED (measured 2026-08-15): cutting the ultrasonic board's VCC
+ * does NOT power it down while the bus idles high. Current flows our 3V3 ->
+ * pull-up -> SDA -> that board's ESD clamp -> its VCC, parking it a diode drop
+ * below the bus: too low to run, too high to trigger a power-on reset. Without
+ * this the sensor rail switch cannot actually reset the slave, and a node that
+ * cannot reset its sensor cannot recover remotely.
+ *
+ * CAUTION: this bus is shared with the charger, the light sensor, the
+ * accelerometer and the barometer. Holding it low blocks all of them, so keep
+ * the window short and never overlap it with a charger poll. */
+void eco_i2c_hold_low(void)
+{
+    for (int i = 0; i < s_nslots; i++) {
+        if (s_slots[i] && *s_slots[i]) {
+            i2c_master_bus_rm_device(*s_slots[i]);
+            *s_slots[i] = NULL;
+        }
+    }
+    if (s_bus) { i2c_del_master_bus(s_bus); s_bus = NULL; }
+
+    const gpio_num_t pins[2] = { ECO_I2C_SDA, ECO_I2C_SCL };
+    for (int i = 0; i < 2; i++) {
+        gpio_reset_pin(pins[i]);
+        gpio_set_direction(pins[i], GPIO_MODE_OUTPUT);
+        gpio_set_level(pins[i], 0);
+    }
+}
+
+void eco_i2c_release(void)
+{
+    const gpio_num_t pins[2] = { ECO_I2C_SDA, ECO_I2C_SCL };
+    for (int i = 0; i < 2; i++) {
+        gpio_set_level(pins[i], 1);
+        gpio_reset_pin(pins[i]);            /* back to high-Z for the driver */
+    }
+    vTaskDelay(pdMS_TO_TICKS(2));
+    (void) eco_i2c_bus();                   /* rebuild; devices re-attach lazily */
 }

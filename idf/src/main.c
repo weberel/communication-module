@@ -129,7 +129,20 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
      * sensor, both on the shared bus. Absent on boards without the gas cell:
      * each costs one NACK and the fields stay zero. */
     uss_result_t u;
-    if (uss_sample(&u)) {
+    /* One recovery attempt: if the module does not answer, power-cycle the
+     * SENSOR rail and try once more. This is the whole point of the gated rail
+     * -- a wedged or half-powered slave is otherwise a site visit, and a
+     * half-powered slave is a real state (its ESD clamps back-feed from an
+     * idle-high bus, so the rail must be dropped with SDA/SCL held low).
+     * Costs ~1 s and only on the failing path; a healthy node never sees it. */
+    bool uss_ok = uss_sample(&u);
+    if (!uss_ok) {
+        ESP_LOGW(TAG, "USS silent, power-cycling the sensor rail");
+        board_sensor_power_cycle(300);
+        uss_ok = uss_sample(&u);
+        ESP_LOGW(TAG, "USS after power cycle: %s", uss_ok ? "recovered" : "still silent");
+    }
+    if (uss_ok) {
         r->uss_flow_ulpm = u.flow_ulpm;
         r->uss_dtof_ps   = u.dtof_ps;
         r->uss_temp_cC   = u.temp_cC;

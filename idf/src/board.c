@@ -1,7 +1,11 @@
 #include "board.h"
+#include "i2c_bus.h"
 
 #include "driver/gpio.h"
 #include "esp_sleep.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h" 
 
 static void out(gpio_num_t pin, int level)
 {
@@ -52,4 +56,20 @@ bool board_woke_from_timer(void)
 bool board_woke_from_button(void)
 {
     return esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1;
+}
+
+
+void board_sensor_power_cycle(uint32_t off_ms)
+{
+    /* Order matters. Holding the bus low FIRST is what makes the rail actually
+     * fall: an idle-high bus back-feeds the ultrasonic board through its ESD
+     * clamps and parks it too low to run but too high to reset. Measured
+     * 2026-08-15; see docs/I2C_LINK.md 2.0. */
+    ESP_LOGI("board", "sensor power cycle (%lu ms)", (unsigned long) off_ms);
+    eco_i2c_hold_low();
+    gpio_set_level(ECO_PIN_SENSOR_PWR, 0);
+    vTaskDelay(pdMS_TO_TICKS(off_ms));
+    gpio_set_level(ECO_PIN_SENSOR_PWR, 1);
+    vTaskDelay(pdMS_TO_TICKS(BOARD_SENSOR_BOOT_MS));
+    eco_i2c_release();
 }

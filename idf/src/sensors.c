@@ -29,7 +29,7 @@ static i2c_master_dev_handle_t s_ltr;
 bool ltr303_sample(uint16_t *ch0, uint16_t *ch1)
 {
     *ch0 = *ch1 = 0;
-    if (!s_ltr) s_ltr = eco_i2c_add(0x29);
+    if (!s_ltr) eco_i2c_add_tracked(&s_ltr, 0x29);
 
     uint8_t pid = 0;
     if (!dev_rd(s_ltr, 0x86, &pid, 1) || (pid & 0xF0) != 0xA0) return false;
@@ -62,7 +62,7 @@ bool sc7a20_sample(int16_t *x_mg, int16_t *y_mg, int16_t *z_mg)
         uint8_t addr = (i2c_master_probe(bus, 0x18, XFER_MS) == ESP_OK) ? 0x18 :
                        (i2c_master_probe(bus, 0x19, XFER_MS) == ESP_OK) ? 0x19 : 0;
         if (!addr) return false;
-        s_acc = eco_i2c_add(addr);
+        eco_i2c_add_tracked(&s_acc, addr);
     }
 
     uint8_t who = 0;
@@ -128,7 +128,7 @@ static bool ms_convert(uint8_t cmd, uint32_t *value)
 bool ms5837_sample(float *mbar, float *degc)
 {
     *mbar = *degc = 0;
-    if (!s_baro) s_baro = eco_i2c_add(0x76);
+    if (!s_baro) eco_i2c_add_tracked(&s_baro, 0x76);
 
     if (!ms_cmd(0x1E)) return false;          /* reset */
     vTaskDelay(pdMS_TO_TICKS(20));

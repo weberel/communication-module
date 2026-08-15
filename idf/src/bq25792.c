@@ -78,7 +78,7 @@ static bool set_bits(uint8_t reg, uint8_t set, uint8_t clr)
 
 bool bq_begin(void)
 {
-    if (!s_dev) s_dev = eco_i2c_add(BQ25792_ADDR);
+    if (!s_dev) eco_i2c_add_tracked(&s_dev, BQ25792_ADDR);
     if (!s_dev) return false;
     uint8_t v = 0;
     if (!rd(REG_PART_INFO, &v, 1)) return false;

@@ -53,7 +53,7 @@ bool uss_sample(uss_result_t *out)
     memset(out, 0, sizeof(*out));
 
     if (!s_dev) {
-        s_dev = eco_i2c_add(USS_LINK_ADDR7);
+        eco_i2c_add_tracked(&s_dev, USS_LINK_ADDR7);
         if (!s_dev) return false;
     }
 

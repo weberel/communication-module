@@ -31,7 +31,7 @@ static bool resolve(void)
     if      (i2c_master_probe(bus, WF_ADDR_ALT,     XFER_TO_MS) == ESP_OK) addr = WF_ADDR_ALT;
     else if (i2c_master_probe(bus, WF_ADDR_DEFAULT, XFER_TO_MS) == ESP_OK) addr = WF_ADDR_DEFAULT;
     else return false;
-    s_dev = eco_i2c_add(addr);
+    eco_i2c_add_tracked(&s_dev, addr);
     if (s_dev) ESP_LOGI(TAG, "found at 0x%02x", addr);
     return s_dev != NULL;
 }
