@@ -16,7 +16,12 @@
 #include <stdbool.h>
 #include <assert.h>   /* static_assert in C11+ */
 
-#define REC_MAGIC 0x45434C34u   /* "ECL4" -- bumped when the layout changed
+#define REC_MAGIC 0x45434C35u   /* "ECL5" -- bumped when the layout changed
+                                 * (v5: +raw absolute ToF, taken from rsvd[],
+                                 * 2026-08-15. The size is unchanged, but old
+                                 * records carry 0xFF there, so the magic is
+                                 * bumped to REJECT them rather than let
+                                 * 0xFFFFFFFF be read back as a ToF.)
                                  * (v4: 64 -> 128 B, +ultrasonic flow module
                                  * and WF280A raw pressure, 2026-08-13; v3
                                  * added the charger thermal diagnostics).
@@ -76,7 +81,13 @@ typedef struct __attribute__((packed)) {
     uint32_t uss_vol_ml;     /* totalized volume, mL (0 until autonomous mode) */
     uint32_t wf_praw;        /* WF280A raw 24-bit pressure counts */
     uint32_t wf_traw;        /* WF280A raw 24-bit temperature counts */
-    uint8_t  rsvd[36];     /* spare for future fields (0xFF) */
+    /* --- v5: RAW absolute time-of-flight, Q40 seconds, unscaled ---
+     * us = raw * 1e6 / 2^40. Converted off-device on purpose: this is the
+     * speed-of-sound / composition signal and must not inherit an on-device
+     * scaling assumption. */
+    uint32_t uss_tof_ups_q40;
+    uint32_t uss_tof_dns_q40;
+    uint8_t  rsvd[28];     /* spare for future fields (0xFF) */
     uint16_t crc;          /* CRC16-CCITT over bytes [0 .. offsetof(crc)-1] */
 } LogRecord;
 

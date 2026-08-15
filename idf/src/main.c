@@ -140,6 +140,8 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
         r->uss_snr_db2   = u.snr_db2;
         r->uss_status    = u.status;
         r->uss_vol_ml    = u.vol_ml;
+        r->uss_tof_ups_q40 = u.tof_ups_q40;
+        r->uss_tof_dns_q40 = u.tof_dns_q40;
         r->sensor_ok |= 0x10;
     } else {
         r->uss_flow_ulpm = r->uss_dtof_ps = 0;
@@ -147,6 +149,7 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
         r->uss_amp_ups = r->uss_amp_dns = 0;
         r->uss_code = r->uss_gain = r->uss_snr_db2 = r->uss_status = 0;
         r->uss_vol_ml = 0;
+        r->uss_tof_ups_q40 = r->uss_tof_dns_q40 = 0;
     }
 
     uint32_t praw, traw;

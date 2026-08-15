@@ -46,7 +46,11 @@
                                      * 0x29 LTR303, 0x38/0x78 WF280A,
                                      * 0x60 ATECC608B, 0x6B BQ25792, 0x76 MS5837 */
 #define USS_LINK_WHOAMI     0x5A
-#define USS_LINK_PROTO      1
+/* PROTO 2 (2026-08-14): result block grew 28 -> 44 bytes to carry ABSOLUTE
+ * time-of-flight. The CRC moved 0x1F -> 0x2F, so a v1 master reading a v2 slave
+ * would checksum the wrong offset and fail every sample -- which is the point of
+ * the version byte. Reflash BOTH sides together. */
+#define USS_LINK_PROTO      2
 
 /* ---- register map ---- */
 #define USS_REG_WHO_AM_I    0x00    /* u8  = USS_LINK_WHOAMI                  */
@@ -66,16 +70,42 @@
 #define USS_REG_GAIN        0x17    /* u8  PGA gain index actually used       */
 #define USS_REG_VOL_ML      0x18    /* u32 totalized volume, mL (autonomous
                                      *     mode, future -- 0 until implemented) */
-/* 0x1C..0x1E reserved (0x00) */
-#define USS_REG_CRC8        0x1F    /* u8  CRC8 over regs 0x04..0x1E          */
+#define USS_REG_VARIANT     0x1C    /* u8  USS_VARIANT_*: which medium the slave
+                                     *     image was built for. Gas and water
+                                     *     are separate builds (different USS
+                                     *     optimized library, tone config and
+                                     *     AFE routing), so the master cannot
+                                     *     infer it. ADDED 2026-08-14 into space
+                                     *     that was reserved-zero INSIDE the CRC
+                                     *     block, so it is purely additive: a
+                                     *     master that ignores it still reads a
+                                     *     CRC-valid block. */
+/* 0x1D..0x1F reserved (0x00) */
+/* -- absolute time-of-flight, ADDED in PROTO 2 --
+ * Sent as the library's RAW Q40 seconds, deliberately NOT converted to ps.
+ * Absolute ToF is the speed-of-sound observable (gas composition), so the wire
+ * carries exactly what the USS library produced and the scaling is applied
+ * off-device. It also keeps a wrong exponent from being baked into two
+ * firmwares: getting this wrong is a documented trap (assuming 2^20 instead of
+ * 2^40 inflates ToF by ~4.9% and looks like a capture-window bug).
+ *   microseconds = raw * 1e6 / 2^40   (= raw / 1099511.627776)             */
+#define USS_REG_TOF_UPS_Q40 0x20    /* u32 absolute ToF upstream,   Q40 s     */
+#define USS_REG_TOF_DNS_Q40 0x24    /* u32 absolute ToF downstream, Q40 s     */
+/* 0x28..0x2E reserved (0x00) */
+#define USS_REG_CRC8        0x2F    /* u8  CRC8 over regs 0x04..0x2E          */
 /* -- control -- */
 #define USS_REG_CMD         0x40    /* u8  write-only, USS_CMD_*              */
 #define USS_REG_AUTO_PERIOD 0x42    /* u16 autonomous measurement period, s
                                      *     (future; 0 = off)                  */
 
 #define USS_LINK_RESULT_OFF 0x04
-#define USS_LINK_RESULT_LEN 28      /* 0x04..0x1F inclusive, CRC included     */
-#define USS_LINK_REGFILE_SIZE 0x20  /* readable window 0x00..0x1F             */
+#define USS_LINK_RESULT_LEN 44      /* 0x04..0x2F inclusive, CRC included     */
+#define USS_LINK_REGFILE_SIZE 0x40  /* readable window 0x00..0x3F; MUST stay a
+                                     * power of two (the slave masks the
+                                     * auto-increment pointer with SIZE-1 so an
+                                     * over-long read can never walk RAM).
+                                     * USS_REG_CMD (0x40) sits just outside it,
+                                     * which is fine: it is write-only.        */
 
 /* STATUS bits */
 #define USS_ST_READY        0x01    /* result block valid & CRC'd             */
@@ -86,6 +116,11 @@
 #define USS_ST_BOOT         0x80    /* set from reset until the first command:
                                      * lets the master detect a slave reboot
                                      * (and a lost totalizer)                 */
+
+/* USS_REG_VARIANT values */
+#define USS_VARIANT_UNKNOWN 0x00
+#define USS_VARIANT_GAS     0x01    /* multi-tone 170/240 kHz, external AFE    */
+#define USS_VARIANT_LIQUID  0x02    /* single-tone 1 MHz, direct drive         */
 
 /* CMD values */
 #define USS_CMD_MEASURE     0x01

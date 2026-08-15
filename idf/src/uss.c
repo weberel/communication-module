@@ -98,6 +98,8 @@ bool uss_sample(uss_result_t *out)
     out->snr_db2   = blk[USS_REG_SNR_DB2 - USS_LINK_RESULT_OFF];
     out->gain      = blk[USS_REG_GAIN    - USS_LINK_RESULT_OFF];
     out->vol_ml    = le32(&blk[USS_REG_VOL_ML - USS_LINK_RESULT_OFF]);
+    out->tof_ups_q40 = le32(&blk[USS_REG_TOF_UPS_Q40 - USS_LINK_RESULT_OFF]);
+    out->tof_dns_q40 = le32(&blk[USS_REG_TOF_DNS_Q40 - USS_LINK_RESULT_OFF]);
 
     if (out->status & USS_ST_BOOT)
         ESP_LOGW(TAG, "slave rebooted since last contact");

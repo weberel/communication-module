@@ -26,6 +26,14 @@ typedef struct {
     uint8_t  snr_db2;     /* SNR, dB x2 */
     uint8_t  gain;        /* PGA gain index used */
     uint32_t vol_ml;      /* totalized volume, mL (0 until autonomous mode) */
+    /* Absolute time-of-flight, RAW Q40 seconds exactly as the USS library
+     * produced it -- deliberately not scaled here. This is the speed-of-sound
+     * observable (gas composition), so the conversion is applied off-device:
+     *   microseconds = raw * 1e6 / 2^40   (= raw / 1099511.627776)
+     * Keeping it raw also stops a wrong exponent being baked into two
+     * firmwares, which is a documented trap on this project. */
+    uint32_t tof_ups_q40;
+    uint32_t tof_dns_q40;
 } uss_result_t;
 
 /* Trigger one measurement and read the result block (CRC-verified).

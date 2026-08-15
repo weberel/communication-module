@@ -161,6 +161,17 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
             r->uss_code, r->uss_amp_ups, r->uss_amp_dns,
             r->uss_snr_db2 / 2.0f, r->uss_gain,
             (unsigned long)r->uss_vol_ml, r->uss_status);
+    /* Raw absolute ToF, Q40 seconds, unscaled on purpose (see record.h).
+     * Sent as integers so no float rounding touches the composition signal. */
+    if ((r->sensor_ok & 0x10) && n > 0 && (size_t)n < cap)
+        n += snprintf(out + n, cap - n,
+            ",\"uss_tof_ups_q40\":%lu,\"uss_tof_dns_q40\":%lu",
+            (unsigned long)r->uss_tof_ups_q40, (unsigned long)r->uss_tof_dns_q40);
+    /* Absolute pressure PLACEHOLDER -- a compile-time constant, not a reading.
+     * The key name and the companion flag both say so; see config.h. */
+    if (n > 0 && (size_t)n < cap)
+        n += snprintf(out + n, cap - n,
+            ",\"p_abs_const_hpa\":%.2f,\"p_abs_is_const\":1", P_ABS_CONST_HPA);
     if ((r->sensor_ok & 0x20) && n > 0 && (size_t)n < cap)
         n += snprintf(out + n, cap - n,
             ",\"wf_praw\":%lu,\"wf_traw\":%lu",

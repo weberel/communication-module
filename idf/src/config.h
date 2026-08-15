@@ -54,6 +54,38 @@
 #define SUN_HOURS_GOOD          4
 #define TZ_OFFSET_MIN           120     /* local day rollover (CEST) */
 
+/* =========================================================================
+ * ABSOLUTE PRESSURE: HARD-CODED CONSTANT. THIS IS NOT A MEASUREMENT.
+ * =========================================================================
+ * The WF280A (U8) on the ultrasonic board does not deliver usable pressure:
+ * measured 2026-08-15, its status byte reads 0x19 on every access, which
+ * decodes as ADC POWERED OFF (bit6=0) and TEST MODE SET (bit3=1), with two
+ * reserved-must-be-zero bits also set. A datasheet-correct trigger (A0 00 00)
+ * followed by a 24-bit read returns 6. Its NVM address word reads 0x0000,
+ * which per the datasheet means it should answer at 0x78, yet it answers at
+ * 0x38 and nothing answers at 0x78.
+ *
+ * Separately, even a healthy part could not be converted on-device: the
+ * WF280A compensation polynomial is NOT published (datasheet 3.10.2 refers you
+ * to WF Technologies' driver C code), and it needs 11 per-device NVM
+ * coefficients.
+ *
+ * So until a working pressure sensor is fitted, this constant stands in.
+ * It is published under the key "p_abs_const_hpa" and accompanied by
+ * "p_abs_is_const":1 so no downstream analysis can mistake it for data.
+ * sensor_ok bit5 stays 0.
+ *
+ * >>> SET THIS PER DEPLOYMENT SITE. Station pressure varies strongly with
+ * >>> altitude and it feeds gas-density calculations directly:
+ * >>>    sea level (ISA)   1013 hPa
+ * >>>    Zurich   ~400 m   ~965 hPa
+ * >>>    Mzuzu   ~1250 m   ~875 hPa
+ * >>>    Nairobi ~1795 m   ~820 hPa
+ * >>> Leaving the sea-level default on a Nairobi node overstates absolute
+ * >>> pressure by ~24 %, and gas density with it.
+ * ========================================================================= */
+#define P_ABS_CONST_HPA         1013.25f
+
 /* ---- Ultrasonic flow module (MSP430FR6043 I2C slave, uss_link.h) ----
  * A USS measurement is a capture + algorithm run on the MSP430; the reference
  * firmware turns one around well inside 500 ms. Budget 3 s before declaring
