@@ -209,9 +209,33 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
 
 static char s_json[10240];
 
+/* Reference for back-dating: the uptime and boot epoch of the newest record
+ * (set from the ctx at the start of every session). */
+static uint32_t s_ref_uptime_s;
+static uint8_t  s_ref_boot_id;
+
+/* Timestamp for one record.
+ *
+ * A record logged before the first clock sync carries ts_s = 0 and has to be
+ * placed in time at upload. Doing that from its ring position assumes every
+ * wake was exactly SAMPLE_INTERVAL_S apart -- which is false in precisely the
+ * situations a clockless device is in: critical-battery mode (x6), park mode
+ * (3600 s), button wakes and crash reboots. uptime_s is monotonic elapsed time
+ * and carries no such assumption, so it goes first.
+ *
+ * It is only meaningful within one boot epoch (a cold boot restarts uptime at
+ * 0 and rolls boot_id), so records from an older epoch keep the position
+ * estimate as a last resort -- coarse, but better than a timestamp built on an
+ * uptime that has since restarted.
+ *
+ * Both branches anchor at now_ms, so everything is late by however long this
+ * session has been running (minutes at worst); the alternative is baking the
+ * session duration into the reference, which buys little and can go negative. */
 static int64_t record_ts_ms(const LogRecord *r, int64_t now_ms, uint32_t head)
 {
     if (r->ts_s) return (int64_t)r->ts_s * 1000;
+    if (r->boot_id == s_ref_boot_id && r->uptime_s <= s_ref_uptime_s)
+        return now_ms - (int64_t)(s_ref_uptime_s - r->uptime_s) * 1000;
     return now_ms - (int64_t)(head - 1 - r->seq) * SAMPLE_INTERVAL_S * 1000;
 }
 
@@ -592,6 +616,9 @@ out:
 uplink_result_t uplink_upload_all(const uplink_ctx_t *ctx)
 {
     uplink_result_t res = { 0 };
+
+    s_ref_uptime_s = ctx->uptime_s;
+    s_ref_boot_id  = ctx->boot_id;
 
     if (!s_ev) {
         s_ev = xEventGroupCreate();

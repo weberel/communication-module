@@ -173,8 +173,17 @@ wrong clock silently corrupts a year of data. Carrier NITZ is **never** used
 header** from the ThingsBoard server. The carrier can intercept UDP NTP; it
 cannot rewrite a header inside our TLS session, so a disagreement > 120 s
 vetoes the SNTP result. Sanity bounds: [2026-01-01, 2036-01-01). Re-synced
-every uplink session. A record sampled before the first sync stores `ts_s = 0`
-and is timestamped at upload from its position in the ring.
+every uplink session.
+
+A record sampled before the first sync stores `ts_s = 0` and is placed in time
+at upload, from the **monotonic uptime counter** it carries: the elapsed time
+between that record and the newest one is real elapsed time, whatever the sleep
+interval happened to be. That matters because a clockless device is exactly the
+device whose intervals are irregular — critical-battery mode (×6), park mode
+(3600 s), button wakes, crash reboots. Uptime is only comparable within one
+boot epoch (a cold boot restarts it and rolls `boot_id`), so records from an
+older epoch fall back to a position-in-the-ring estimate at the nominal
+interval — coarse, but the only thing left.
 
 ### 3.6 Watchdog
 

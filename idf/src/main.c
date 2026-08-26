@@ -394,6 +394,7 @@ void app_main(void)
             .skip_cellular = s_upload_crashed != 0,
             .sun_hours    = sol.sun_hours,
             .voc_max_mv   = sol.voc_max_mv,
+            .uptime_s     = s_uptime_s,
         };
         if (ctx.deep_search) s_last_deep_uptime = s_uptime_s;
 
