@@ -34,6 +34,16 @@
 #define RECF_USB      0x02   /* USB input present (VAC1) */
 #define RECF_WEATHER  0x04   /* weather classified good this day */
 #define RECF_ECO_CHG  0x08   /* charge target limited to ~80 % SoC */
+#define RECF_MOTION   0x10   /* this wake was triggered by the accelerometer's
+                              * motion interrupt, not the timer or the button */
+
+/* sensor_ok bits */
+#define SOK_BQ        0x01
+#define SOK_LTR303    0x02
+#define SOK_SC7A20    0x04
+#define SOK_MS5837    0x08
+#define SOK_USS       0x10
+#define SOK_WF280A    0x20
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;        /* REC_MAGIC */
@@ -66,7 +76,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  sensor_ok;    /* bit0 BQ, bit1 LTR303, bit2 SC7A20, bit3 MS5837,
                             * bit4 USS flow module, bit5 WF280A -- set only when
                             * the source answered correctly, so a zero reading
-                            * is distinguishable from a dead sensor */
+                            * is distinguishable from a dead sensor. */
     /* --- v4: ultrasonic flow module (MSP430FR6043 I2C slave, uss_link.h)
      *         + WF280A raw pressure. All zero when absent (see sensor_ok). --- */
     int32_t  uss_flow_ulpm;  /* calibrated flow, uL/min */

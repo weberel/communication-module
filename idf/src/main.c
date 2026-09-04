@@ -40,6 +40,9 @@
 
 static const char *TAG = "ecotrace";
 
+/* Set for the duration of a wake that the accelerometer triggered. */
+static bool s_motion_flag;
+
 /* When the switched SENSOR rail came up this wake; the ultrasonic module needs
  * BOARD_SENSOR_BOOT_MS from that point before its I2C slave answers. */
 static int64_t s_sensor_up_us;
@@ -60,6 +63,12 @@ static RTC_DATA_ATTR uint8_t  s_retries_left;
 static RTC_DATA_ATTR uint32_t s_last_deep_uptime;   /* deep search once/day */
 static RTC_DATA_ATTR uint8_t  s_upload_inflight;
 static RTC_DATA_ATTR uint8_t  s_upload_crashed;
+/* Consecutive wakes on which the ultrasonic module did not answer. Used to back
+ * the recovery off: retrying a rail power-cycle every 5 minutes forever is the
+ * worst case for power on a node whose module is absent or dead. */
+static RTC_DATA_ATTR uint16_t s_uss_fail_streak;
+/* Consecutive out-of-turn motion wakes, reset by any ordinary timer wake. */
+static RTC_DATA_ATTR uint8_t  s_motion_streak;
 
 #define UPLOAD_PERIOD_S (12 * 3600)
 #define UPLOAD_RETRY_S  (30 * 60)
@@ -97,26 +106,31 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
     r->flags = (sol->solar_present ? RECF_SOLAR   : 0) |
                (sol->usb_present   ? RECF_USB     : 0) |
                (sol->weather_good  ? RECF_WEATHER : 0) |
-               (sol->eco_target    ? RECF_ECO_CHG : 0);
+               (sol->eco_target    ? RECF_ECO_CHG : 0) |
+               (s_motion_flag      ? RECF_MOTION  : 0);
 
     /* Log what is actually on the bus. Cheap (absent devices NACK immediately)
      * and it turns "the reading is zero" into "that chip is not there", which
      * are entirely different faults. */
     eco_i2c_scan();
 
-    r->sensor_ok = bq_ok ? 0x01 : 0x00;
+    r->sensor_ok = bq_ok ? SOK_BQ : 0x00;
 
 
+    /* Sampled every wake. Duty-cycling it was considered and rejected: the
+     * 150 ms integration wait is only ~0.5 mAh/day (0.4 % of the budget), and
+     * leaving the sensor in continuous mode instead would cost ~2.4 mAh/day of
+     * its own active current -- five times more than it saves. */
     uint16_t c0, c1;
     if (ltr303_sample(&c0, &c1)) {
         r->light_ch0 = c0; r->light_ch1 = c1;
-        r->sensor_ok |= 0x02;
+        r->sensor_ok |= SOK_LTR303;
     } else { r->light_ch0 = r->light_ch1 = 0; }
 
     int16_t ax, ay, az;
     if (sc7a20_sample(&ax, &ay, &az)) {
         r->acc_mg[0] = ax; r->acc_mg[1] = ay; r->acc_mg[2] = az;
-        r->sensor_ok |= 0x04;
+        r->sensor_ok |= SOK_SC7A20;
     } else {
         r->acc_mg[0] = r->acc_mg[1] = r->acc_mg[2] = 0;
     }
@@ -125,7 +139,7 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
     if (ms5837_sample(&mbar, &degc)) {
         r->press_dmbar = (uint16_t)(mbar * 10.0f + 0.5f);
         r->temp_cC     = (int16_t)(degc * 100.0f + (degc >= 0 ? 0.5f : -0.5f));
-        r->sensor_ok |= 0x08;
+        r->sensor_ok |= SOK_MS5837;
     } else {
         r->press_dmbar = 0;
         r->temp_cC     = 0;
@@ -159,10 +173,27 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
      * Costs ~1 s and only on the failing path; a healthy node never sees it. */
     /* Keep the module in autonomous 1 Hz mode. Idempotent, and re-asserting it
      * every wake is what makes it recover by itself if the module rebooted. */
-    (void) uss_start_auto(USS_AUTO_PERIOD_S);
+    if (s_uss_fail_streak < USS_RETRY_STREAK ||
+        (s_wake_count % USS_RETRY_EVERY_N_WAKES) == 0)
+        (void) uss_start_auto(USS_AUTO_PERIOD_S);
 
     bool uss_ok = uss_sample(&u);
-    if (!uss_ok) {
+    /* Back off the recovery. The power-cycle costs ~2 s of awake time (800 ms
+     * rail-down plus the module's boot and a second sample), which is the
+     * single most expensive thing a wake can do. Worth it when a working module
+     * has wedged; pure waste every 5 minutes on a node whose module is absent,
+     * unpowered, or dead -- which is exactly the state a bench board or a
+     * fleet unit without a gas cell sits in. After USS_RETRY_STREAK failures,
+     * attempt it only once an hour; a module that comes back is picked up
+     * within that hour and costs nothing in between. */
+    bool try_recovery = uss_ok ? false
+                      : (s_uss_fail_streak < USS_RETRY_STREAK) ||
+                        ((s_wake_count % USS_RETRY_EVERY_N_WAKES) == 0);
+    if (!uss_ok && !try_recovery) {
+        ESP_LOGW(TAG, "USS silent (%u wakes) -- recovery backed off",
+                 s_uss_fail_streak);
+    }
+    if (!uss_ok && try_recovery) {
         ESP_LOGW(TAG, "USS silent, power-cycling the sensor rail");
         /* 800 ms, not 300: the SENSOR rail is a high-side switch with no
          * bleed resistor, so when it opens the node is left floating and the
@@ -178,6 +209,8 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
         uss_ok = uss_sample(&u);
         ESP_LOGW(TAG, "USS after power cycle: %s", uss_ok ? "recovered" : "still silent");
     }
+    s_uss_fail_streak = uss_ok ? 0
+                      : (s_uss_fail_streak < 0xFFFF ? s_uss_fail_streak + 1 : 0xFFFF);
     if (uss_ok) {
         r->uss_flow_ulpm = u.flow_ulpm;
         r->uss_dtof_ps   = u.dtof_ps;
@@ -191,7 +224,7 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
         r->uss_vol_ml    = u.vol_ml;
         r->uss_tof_ups_q40 = u.tof_ups_q40;
         r->uss_tof_dns_q40 = u.tof_dns_q40;
-        r->sensor_ok |= 0x10;
+        r->sensor_ok |= SOK_USS;
         ESP_LOGI(TAG, "USS ok: code=%u seq=%u dtof=%ld ps tof_ups=%lu tof_dns=%lu q40 "
                       "(%.1f/%.1f us) amp=%u/%u snr=%.1f dB gain=%u vol=%lu mL st=0x%02X",
                  u.code, u.seq, (long) u.dtof_ps,
@@ -213,7 +246,7 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
     if (wf280a_sample(&praw, &traw, &wst)) {
         r->wf_praw = praw;
         r->wf_traw = traw;
-        r->sensor_ok |= 0x20;
+        r->sensor_ok |= SOK_WF280A;
     } else {
         r->wf_praw = r->wf_traw = 0;
     }
@@ -224,8 +257,9 @@ void app_main(void)
     esp_reset_reason_t why = esp_reset_reason();
     bool timer_wake  = board_woke_from_timer();
     bool button_wake = board_woke_from_button();
+    bool motion_wake = board_woke_from_motion();
     bool cold        = (s_rtc_magic != RTC_STATE_MAGIC);
-    bool crashed     = !cold && !timer_wake && !button_wake;
+    bool crashed     = !cold && !timer_wake && !button_wake && !motion_wake;
 
     /* Runtime-enforce the long WDT: sdkconfig regeneration silently reverted
      * TIMEOUT_S to 5 s once (idf-0.5/0.6 boot-looped on the modem's 8 s settle).
@@ -252,7 +286,17 @@ void app_main(void)
      * in deep sleep (where nothing is talking anyway). That still leaves the
      * remote-recovery path intact via board_sensor_power_cycle(). */
     board_sensor_power(true);
-    s_sensor_up_us = esp_timer_get_time();
+    /* Only stamp a fresh bring-up time when the rail was ACTUALLY off, i.e. on
+     * a cold boot. board_deep_sleep() deliberately holds this rail high through
+     * sleep, so on an ordinary timer wake the ultrasonic module never rebooted
+     * and there is nothing to wait for -- yet the wait below was being paid on
+     * every wake: 3 s of awake time, 288 times a day, ~9.6 mAh/day, about 8 %
+     * of the whole node budget, spent waiting for a boot that did not happen.
+     * (The genuine reboot path, board_sensor_power_cycle(), already does its
+     * own BOARD_SENSOR_BOOT_MS wait internally.) */
+    s_sensor_up_us = (cold || crashed)
+                   ? esp_timer_get_time()          /* rail really was off/glitched */
+                   : esp_timer_get_time() - (int64_t)BOARD_SENSOR_BOOT_MS * 1000;
 
 #ifdef ECOTRACE_RAIL_BLINK
     /* Bench helper: does GPIO14 actually switch the SENSOR rail? Put an LED
@@ -306,6 +350,14 @@ void app_main(void)
         }
         if (button_wake) ESP_LOGI(TAG, "button wake -- sample + upload now");
     }
+    s_motion_flag = motion_wake;
+    if (motion_wake) {
+        if (s_motion_streak < 0xFF) s_motion_streak++;
+        ESP_LOGI(TAG, "motion wake (%u in a row)", s_motion_streak);
+    } else if (timer_wake || button_wake) {
+        s_motion_streak = 0;
+    }
+
     s_boot_count++;
 
     /* Charger first: park-mode decision needs VBAT before we touch anything. */
@@ -349,7 +401,9 @@ void app_main(void)
         time_t now = time(NULL);
         int32_t day_num = (now >= 1767225600 && now < 2082758400)
                         ? (int32_t)((now + TZ_OFFSET_MIN * 60) / 86400) : -1;
-        sol = solar_on_wake(SAMPLE_INTERVAL_S, day_num);
+        /* Cheap bookkeeping every wake; the expensive hill climb every Nth. */
+        bool do_mppt = (s_wake_count % MPPT_EVERY_N_WAKES) == 0;
+        sol = solar_on_wake(SAMPLE_INTERVAL_S, day_num, do_mppt);
     } else {
         ESP_LOGE(TAG, "BQ25792 not found -- battery data will be zero");
     }
@@ -374,7 +428,8 @@ void app_main(void)
      * identical in the summary above; this line separates them. */
     ESP_LOGI(TAG, "sensor_ok=0x%02X  BQ:%c LTR303:%c SC7A20:%c MS5837:%c USS:%c WF280A:%c",
              r.sensor_ok,
-             (r.sensor_ok & 0x01) ? 'y' : 'N', (r.sensor_ok & 0x02) ? 'y' : 'N',
+             (r.sensor_ok & SOK_BQ) ? 'y' : 'N',
+             (r.sensor_ok & SOK_LTR303) ? 'y' : 'N',
              (r.sensor_ok & 0x04) ? 'y' : 'N', (r.sensor_ok & 0x08) ? 'y' : 'N',
              (r.sensor_ok & 0x10) ? 'y' : 'N', (r.sensor_ok & 0x20) ? 'y' : 'N');
 
@@ -426,6 +481,15 @@ void app_main(void)
         !sol.usb_present && !sol.solar_present)
         sleep_s = SAMPLE_INTERVAL_S * CRITICAL_INTERVAL_MULT;
 
+    /* Clear the latch (or the INT line stays asserted and the next sleep returns
+     * immediately) and re-arm -- unless we are in a motion burst, in which case
+     * leave it disarmed until the next ordinary timer wake. */
+    (void) sc7a20_motion_fired();
+    bool arm_motion = (s_motion_streak < MOTION_WAKE_BURST_MAX);
+    if (arm_motion) arm_motion = sc7a20_arm_motion(MOTION_THRESHOLD_MG);
+    else ESP_LOGW(TAG, "motion wakes suppressed (%u in a row)", s_motion_streak);
+    board_set_motion_wake(arm_motion);
+
     s_crash_count  = 0;   /* wake completed cleanly */
     s_last_sleep_s = sleep_s;
 
@@ -441,6 +505,9 @@ void app_main(void)
              r.uss_dtof_ps / 1e6f);
 
     ESP_LOGI(TAG, "sleeping %lu s", (unsigned long)sleep_s);
-    vTaskDelay(pdMS_TO_TICKS(200));   /* drain console */
+    /* Draining the console costs 200 ms of awake time on EVERY wake -- ~0.6
+     * mAh/day at a 5 min interval, for output nobody can see unless USB is
+     * attached. Pay it only when someone is actually watching. */
+    if (sol.usb_present) vTaskDelay(pdMS_TO_TICKS(200));
     board_deep_sleep(sleep_s);
 }

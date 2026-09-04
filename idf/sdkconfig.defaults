@@ -34,3 +34,35 @@ CONFIG_MBEDTLS_TLS_CLIENT_ONLY=y
 CONFIG_LWIP_PPP_SUPPORT=y
 CONFIG_LWIP_PPP_PAP_SUPPORT=y
 CONFIG_LWIP_PPP_NOTIFY_PHASE_SUPPORT=y
+
+# Multi-server SNTP. uplink.c asks for two servers (time.google.com and
+# pool.ntp.org); lwip defaults to ONE, so esp_netif_sntp_init() failed outright
+# with "Tried to configure more servers than enabled in lwip" -- observed on
+# hardware 2026-09-04. The clock was being carried entirely by the HTTPS-Date
+# cross-check, i.e. the redundancy we thought we had did not exist.
+CONFIG_LWIP_SNTP_MAX_SERVERS=2
+
+# CPU at 80 MHz instead of 160. A sampling wake is dominated by waiting -- I2C
+# sensor conversions (LTR-303 150 ms, MS5837 60 ms), flash writes, rail settle
+# -- not by computing, so halving the clock roughly halves active current for
+# nearly the same elapsed time. The TLS handshake is the one compute-bound step
+# and does get slower, but by seconds inside a session already dominated by the
+# modem's attach time.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=n
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_80=y
+
+# Skip re-validating the app image on a DEEP-SLEEP wake. The bootloader
+# otherwise SHA-256s the whole 1.2 MB application 288 times a day, and the only
+# cost that matters on this node is ESP32 awake-milliseconds. Power-on boots and
+# post-OTA boots still validate, which is where validation actually earns its
+# keep -- this only skips the case where the image was already verified moments
+# earlier and the chip never lost power.
+# CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP -- NOT enabled: it makes the
+# bootloader retain the image digest in RTC reserved memory, which overflows
+# lp_reserved_seg by 16 bytes on this build. Worth ~1 mAh/day; not worth
+# reshuffling the RTC memory layout for.
+
+# Bootloader chatter costs formatting time on every wake; warnings and errors
+# are still printed.
+CONFIG_BOOTLOADER_LOG_LEVEL_INFO=n
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y

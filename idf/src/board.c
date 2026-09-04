@@ -14,6 +14,9 @@ static void out(gpio_num_t pin, int level)
     gpio_set_level(pin, level);
 }
 
+/* Whether the shared sensor INT participates in the next deep sleep. */
+static bool s_motion_wake;
+
 void board_init(void)
 {
     /* Release holds from a previous deep sleep before reconfiguring. */
@@ -34,6 +37,8 @@ void board_init(void)
 
     gpio_reset_pin(ECO_PIN_QON);
     gpio_set_direction(ECO_PIN_QON, GPIO_MODE_INPUT);   /* external pull-up */
+    gpio_reset_pin(ECO_PIN_INT_SHARED);
+    gpio_set_direction(ECO_PIN_INT_SHARED, GPIO_MODE_INPUT);   /* external pull-up */
 }
 
 void board_deep_sleep(uint32_t seconds)
@@ -60,7 +65,11 @@ void board_deep_sleep(uint32_t seconds)
     gpio_hold_en(ECO_PIN_LED);
 
     esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
-    esp_sleep_enable_ext1_wakeup(1ULL << ECO_PIN_QON, ESP_EXT1_WAKEUP_ANY_LOW);
+    /* Both sources are active LOW (button pulls QON down; the SC7A20's INT is
+     * configured H_LACTIVE), so they share one ANY_LOW mask. */
+    uint64_t mask = 1ULL << ECO_PIN_QON;
+    if (s_motion_wake) mask |= 1ULL << ECO_PIN_INT_SHARED;
+    esp_sleep_enable_ext1_wakeup(mask, ESP_EXT1_WAKEUP_ANY_LOW);
     esp_deep_sleep_start();
 }
 
@@ -69,10 +78,20 @@ bool board_woke_from_timer(void)
     return esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER;
 }
 
+/* EXT1 carries two pins, so the cause alone is not enough -- ask which one. */
 bool board_woke_from_button(void)
 {
-    return esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1;
+    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT1) return false;
+    return (esp_sleep_get_ext1_wakeup_status() & (1ULL << ECO_PIN_QON)) != 0;
 }
+
+bool board_woke_from_motion(void)
+{
+    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT1) return false;
+    return (esp_sleep_get_ext1_wakeup_status() & (1ULL << ECO_PIN_INT_SHARED)) != 0;
+}
+
+void board_set_motion_wake(bool enable) { s_motion_wake = enable; }
 
 
 void board_sensor_power(bool on)

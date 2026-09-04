@@ -30,7 +30,12 @@ void solar_reset(void);   /* cold boot */
 
 /* One management pass per wake; bq must be up with its ADC running.
  * day_num = local day number, or -1 while the clock is unsynced. */
-solar_status_t solar_on_wake(uint32_t interval_s, int32_t day_num);
+/* Called every wake. `interval_s` is the time since the previous wake (used for
+ * harvest integration and the Voc schedule). `do_mppt` runs the expensive
+ * perturb-and-observe hill climb -- pass false on wakes where only the cheap
+ * bookkeeping is wanted; harvest accounting, day rollover and charge-target
+ * selection always run. */
+solar_status_t solar_on_wake(uint32_t interval_s, int32_t day_num, bool do_mppt);
 
 #ifdef __cplusplus
 }

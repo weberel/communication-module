@@ -26,6 +26,7 @@
 #include "freertos/event_groups.h"
 
 #include "board.h"
+#include "bq25792.h"
 #include "secrets.h"
 
 static const char *TAG = "uplink";
@@ -143,14 +144,23 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
      *
      * Dropped and why:
      *   bat_mw                 = vbat * ibat, derivable
-     *   vac2_mv, vsys_mv,
-     *   vreg_mv, vindpm_mv     charger internals; post-mortem, not decisions
+     *   vsys_mv, vreg_mv,
+     *   vindpm_mv              charger internals; post-mortem, not decisions
+     * RESTORED 2026-09-04 (the trim went one key too far):
+     *   vac2_mv                without it there is no way to tell "no panel
+     *                          voltage" from "panel fine, charger refusing" --
+     *                          the exact question that could not be answered
+     *                          remotely during the 2026-09 discharge test
+     *   tdie_c, ts_stat        the two JEITA channels: they distinguish
+     *                          "charging stopped because the CELL was hot"
+     *                          (ts_stat) from "because the CHARGER was hot"
+     *                          (tdie_c). Without them both look identical from
+     *                          a dashboard: current fell, nobody knows why.
      *   fault0, fault1         almost always 0; the record keeps them
      *   weather_good, eco_chg  derived heuristics, recomputable from harvest
      *   light_ch1              IR channel; ch0 is the one that means anything
      *   press_mbar             DUPLICATE of p_gas_hpa (same MS5837 reading)
-     *   tdie_c, ts_pct,
-     *   ts_stat                charger thermal diagnostics
+     *   ts_pct                 raw NTC ratio; ts_stat carries the verdict
      *   flow_lpm               VFR constants are wrong for this cell; it is a
      *                          misleading number until the lab calibration
      *   uss_amp_ups/dns, gain  summarised by uss_snr_db (a degrading signal
@@ -167,17 +177,20 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
     int n = snprintf(out, cap,
         "\"vbat_mv\":%u,\"ibat_ma\":%d,\"soc_pct\":%u,"
         "\"vbus_mv\":%u,\"ibus_ma\":%d,\"chg_stat\":%u,"
-        "\"harvest_mah\":%u,\"solar\":%u,\"usb\":%u,"
+        "\"harvest_mah\":%u,\"solar\":%u,\"usb\":%u,\"motion\":%u,"
         "\"light_ch0\":%u,"
         "\"acc_x_mg\":%d,\"acc_y_mg\":%d,\"acc_z_mg\":%d,"
-        "\"temp_c\":%.2f,\"sensor_ok\":%u",
+        "\"temp_c\":%.2f,\"sensor_ok\":%u,"
+        "\"vac2_mv\":%u,\"tdie_c\":%.1f,\"ts_stat\":%u",
         r->vbat_mv, r->ibat_ma, r->soc_pct,
         r->vbus_mv, r->ibus_ma, r->chg_stat,
         r->harvest_mah,
         (r->flags & RECF_SOLAR) ? 1 : 0, (r->flags & RECF_USB) ? 1 : 0,
+        (r->flags & RECF_MOTION) ? 1 : 0,
         r->light_ch0,
         r->acc_mg[0], r->acc_mg[1], r->acc_mg[2],
-        r->temp_cC / 100.0f, r->sensor_ok);
+        r->temp_cC / 100.0f, r->sensor_ok,
+        r->vac2_mv, r->tdie_dC / 10.0f, r->ts_stat);
 
     /* Ultrasonic: four core values plus SNR as the health indicator. Only when
      * the module answered, so boards without a gas cell burn no quota. */
@@ -237,6 +250,17 @@ static int64_t record_ts_ms(const LogRecord *r, int64_t now_ms, uint32_t head)
     if (r->boot_id == s_ref_boot_id && r->uptime_s <= s_ref_uptime_s)
         return now_ms - (int64_t)(s_ref_uptime_s - r->uptime_s) * 1000;
     return now_ms - (int64_t)(head - 1 - r->seq) * SAMPLE_INTERVAL_S * 1000;
+}
+
+/* Sample VBAT under load and keep the minimum. Called straight after a publish,
+ * i.e. while the radio is still hot -- the A7672's 2 A bursts are what actually
+ * threaten the modem's brown-out limit, and no other sample in the system ever
+ * sees them (every logged VBAT is taken with the modem powered down). */
+static void note_vbat_under_load(uplink_result_t *res)
+{
+    uint16_t v = bq_vbat_mv();
+    if (v == 0) return;                       /* BQ absent or ADC off */
+    if (res->vbat_load_mv == 0 || v < res->vbat_load_mv) res->vbat_load_mv = v;
 }
 
 static uint32_t drain(uplink_result_t *res)
@@ -303,6 +327,7 @@ static uint32_t drain(uplink_result_t *res)
             }
         }
         flashlog_advance(n);
+        note_vbat_under_load(res);
         sent += included;
         if (flashlog_pending() > 0) vTaskDelay(pdMS_TO_TICKS(BATCH_GAP_MS));
     }
@@ -331,12 +356,12 @@ static void send_status(const uplink_ctx_t *ctx, const uplink_result_t *res)
              "\"rssi_dbm\":%d,\"wifi_rssi_dbm\":%d,\"transport\":\"%s\","
              "\"cereg_stat\":%u,\"backlog\":%lu,\"boot_id\":%u,"
              "\"reset_reason\":%u,\"boot_count\":%u,\"wake_count\":%u,"
-             "\"crash_count\":%u,\"vbat_mv\":%u,"
+             "\"crash_count\":%u,\"vbat_mv\":%u,\"vbat_load_mv\":%u,"
              "\"sun_h\":%u,\"voc_max_mv\":%u,\"fw\":\"" FW_VERSION "\"",
              res->cell_rssi_dbm, res->wifi_rssi_dbm, transport,
              res->cell_reg_stat, (unsigned long)flashlog_pending(), ctx->boot_id,
              ctx->reset_reason, ctx->boot_count, ctx->wake_count,
-             ctx->crash_count, ctx->vbat_mv,
+             ctx->crash_count, ctx->vbat_mv, res->vbat_load_mv,
              ctx->sun_hours, ctx->voc_max_mv);
     if (now_ms > 0)
         snprintf(s_json, sizeof(s_json), "{\"ts\":%lld,\"values\":{%s}}",
@@ -527,6 +552,7 @@ static bool cell_session(const uplink_ctx_t *ctx, uplink_result_t *res)
     }
     ESP_LOGI(TAG, "registered (stat %u, %d dBm)",
              res->cell_reg_stat, res->cell_rssi_dbm);
+    note_vbat_under_load(res);   /* attach bursts are the heaviest load of all */
 
     xEventGroupClearBits(s_ev, EV_IP_UP);
     if (esp_modem_set_mode(dce, ESP_MODEM_MODE_DATA) != ESP_OK) {

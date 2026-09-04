@@ -13,6 +13,9 @@ extern "C" {
 
 #define ECO_PIN_LED          1
 #define ECO_PIN_QON          2    /* button / BQ QON, external pull-up, EXT1 wake */
+#define ECO_PIN_INT_SHARED   3    /* shared sensor INT (SC7A20 + LTR-303), external
+                                   * pull-up, ACTIVE LOW, EXT1 wake. GPIO0-7 are the
+                                   * LP-capable pins on the C6, so 3 can wake deep sleep. */
 #define ECO_PIN_SENSOR_PWR   14   /* external sensor rail, active HIGH */
 #define ECO_PIN_MODEM_PWRKEY 22   /* via inverter: HIGH = asserted */
 #define ECO_PIN_MODEM_PWR_EN 23   /* HIGH = modem rail on */
@@ -46,6 +49,13 @@ void board_sensor_power(bool on);
  * load. Measured with an LED across the header, it fades rather than switching
  * off. A respin should add ~100k to GND on that node. */
 void board_sensor_power_cycle(uint32_t off_ms);
+
+/* Arm (or disarm) the shared sensor INT as a deep-sleep wake source. Off by
+ * default: a board with nothing driving that line must not be woken by it. */
+void board_set_motion_wake(bool enable);
+
+/* Was this wake caused by the shared sensor INT rather than the button/timer? */
+bool board_woke_from_motion(void);
 
 /* Deep sleep with rails held safe. PWRKEY is held LOW (deasserted) through
  * sleep -- holding it asserted burns ~0.3 mA in the Q409 inverter (dl-2.10

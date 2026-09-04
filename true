@@ -1,0 +1,158 @@
+0x00005B18 1 3  JSON R: {"response":0}
+0x00005B18 1 4  POLL I: TimeToSleep() found shorter sleep time of 5000 ms from class `anonymous namespace'::CommandSink
+0x00005B18 1 3  JSON C: {"command":"blinkLEDs","data":["C:/ti/fr6043_recovery.ccxml",0]}
+0x00005B18 2 3  COM_DBG_IF C: class dsDebugger::OnTaskStart()
+0x00005B18 2 3  COM_DBG_IF R: class dsDebugger::OnTaskStart()
+0x00005B18 4 5  COM_DBG_IF I: Final Release for class CoProgressTask (this = 0000020FED3AD0E8)
+0x00005B18 4 5  COM_DBG_IF I: Final Release for class XPCOMFramework::Event<class XPCOMFramework::EventTemplateArgs<class dsIStringEvent,char const * __ptr64,class dsIStringEventCallback> > (this = 0000020FED3A5F98)
+0x00005B18 4 5  COM_DBG_IF I: Final Release for class XPCOMFramework::Event<class XPCOMFramework::EventTemplateArgs<class dsIObjectEvent,class nsISupports * __ptr64,class dsIObjectEventCallback> > (this = 0000020FED3A5D58)
+0x00005B18 4 3  JSON R: {"data":{"id":0,"isCancellable":false,"isComplete":false,"isFirstUpdate":true,"name":"Reading configuration...","percent":null,"subActivity":"","task":""},"event":"progress.update"}
+0x00005B18 345 3  JSON R: {"data":{"id":0,"isCancellable":false,"isComplete":false,"isFirstUpdate":false,"name":"Reading configuration...","percent":null,"subActivity":"Initializing Register Database...","task":""},"event":"progress.update"}
+0x00005B18 345 3  SETUP C: OpenDatabase( C:\Users\elweber\AppData\Local\TEXASI~1\CCS\TICLOU~1\0\0\targetdb.dat, C:\ti\uniflash_9.4.1\deskdb\content\TICloudAgent\win\ccs_base\common\targetdb\timestamp )
+0x00005B18 353 3  SETUP I: SELECT sql FROM sqlite_master ORDER BY tbl_name, name
+0x00005B18 353 3  SETUP R: OpenDatabase( C:\Users\elweber\AppData\Local\TEXASI~1\CCS\TICLOU~1\0\0\targetdb.dat, C:\ti\uniflash_9.4.1\deskdb\content\TICloudAgent\win\ccs_base\common\targetdb\timestamp ) = 0000020FED3A8B90
+0x00005B18 353 3  SETUP I: Loading repository "C:\ti\uniflash_9.4.1\deskdb\content\TICloudAgent\win\ccs_base\common\targetdb\"
+0x00005B18 353 3  SETUP I: SELECT * FROM TargetDB_Repositories
+0x00005B18 353 3  SETUP I: SELECT * FROM TargetDB_Repositories WHERE dbid=1
+0x00005B18 353 3  SETUP I: PRAGMA journal_mode = MEMORY
+0x00005B18 353 3  SETUP I: PRAGMA synchronous = OFF
+0x00005B18 353 3  SETUP I: BEGIN IMMEDIATE TRANSACTION
+0x00005B18 355 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="CS_DAP_0_regids.xml"
+0x00005B18 355 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=1
+0x00005B18 355 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="CS_DAP_PC_0_regids.xml"
+0x00005B18 355 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=2
+0x00005B18 355 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="ICEPick_C_regids.xml"
+0x00005B18 355 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=3
+0x00005B18 355 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="ICEPick_D_regids.xml"
+0x00005B18 356 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=4
+0x00005B18 356 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="ICEPick_M_regids.xml"
+0x00005B18 356 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=5
+0x00005B18 356 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="MSP430_regids.xml"
+0x00005B18 356 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=6
+0x00005B18 356 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS192C2000_regids.xml"
+0x00005B18 356 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=7
+0x00005B18 357 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS192C2001_regids.xml"
+0x00005B18 357 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=8
+0x00005B18 357 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS192C2002_regids.xml"
+0x00005B18 357 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=9
+0x00005B18 357 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS192C2003_regids.xml"
+0x00005B18 357 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=10
+0x00005B18 358 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS192C2004_regids.xml"
+0x00005B18 358 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=11
+0x00005B18 358 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS192C2005_regids.xml"
+0x00005B18 358 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=12
+0x00005B18 358 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS192C2006_regids.xml"
+0x00005B18 358 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=13
+0x00005B18 358 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS192C2007_regids.xml"
+0x00005B18 358 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=14
+0x00005B18 358 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS192C2008_regids.xml"
+0x00005B18 358 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=15
+0x00005B18 358 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS192C2010_regids.xml"
+0x00005B18 358 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=16
+0x00005B18 359 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS192C2011_regids.xml"
+0x00005B18 359 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=17
+0x00005B18 359 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS192C2012_regids.xml"
+0x00005B18 359 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=18
+0x00005B18 359 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS192C2013_regids.xml"
+0x00005B18 359 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=19
+0x00005B18 359 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS192C2014_regids.xml"
+0x00005B18 359 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=20
+0x00005B18 359 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS192C2015_regids.xml"
+0x00005B18 360 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=21
+0x00005B18 360 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS192C2026_regids.xml"
+0x00005B18 360 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=22
+0x00005B18 360 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS192C2027_regids.xml"
+0x00005B18 360 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=23
+0x00005B18 360 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS192C2028_regids.xml"
+0x00005B18 360 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=24
+0x00005B18 360 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS192C2029_regids.xml"
+0x00005B18 360 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=25
+0x00005B18 360 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS192C2030_regids.xml"
+0x00005B18 360 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=26
+0x00005B18 360 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS192C2031_regids.xml"
+0x00005B18 360 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=27
+0x00005B18 360 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS192C2032_regids.xml"
+0x00005B18 360 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=28
+0x00005B18 361 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS225C00_regids.xml"
+0x00005B18 361 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=29
+0x00005B18 361 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS225C100_regids.xml"
+0x00005B18 361 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=30
+0x00005B18 361 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS320C28XX_regids.xml"
+0x00005B18 361 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=31
+0x00005B18 361 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS320C29XX_regids.xml"
+0x00005B18 361 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=32
+0x00005B18 362 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS320C55XX_regids.xml"
+0x00005B18 362 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=33
+0x00005B18 362 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS320C64XX_regids.xml"
+0x00005B18 362 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=34
+0x00005B18 362 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS320C66XX_regids.xml"
+0x00005B18 362 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=35
+0x00005B18 362 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS320C674X_regids.xml"
+0x00005B18 362 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=36
+0x00005B18 362 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS320C6XXX_regids.xml"
+0x00005B18 362 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=37
+0x00005B18 362 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS320C71XX_regids.xml"
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=38
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS320C75XX_regids.xml"
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=39
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS3CXX_regids.xml"
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=40
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS470R15X_regids.xml"
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=41
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS470R25X_regids.xml"
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=42
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS470R2X_regids.xml"
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=43
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS470R33X_regids.xml"
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=44
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS470R4X_regids.xml"
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=45
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS470R53X_regids.xml"
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=46
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS470R7X_regids.xml"
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=47
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS470R9X_regids.xml"
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=48
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS470RAX_regids.xml"
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=49
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS470RCX_regids.xml"
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=50
+0x00005B18 363 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS470RDX_regids.xml"
+0x00005B18 365 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=51
+0x00005B18 365 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS470REX_regids.xml"
+0x00005B18 365 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=52
+0x00005B18 365 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="TMS470RXX_regids.xml"
+0x00005B18 365 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=53
+0x00005B18 365 3  SETUP I: END TRANSACTION
+0x00005B18 365 3  SETUP I: SELECT count(*) FROM TargetDB_Files WHERE State=0
+0x00005B18 365 3  SETUP I: Scrubbing database
+0x00005B18 365 3  SETUP I: SELECT * FROM TargetDB_Files
+0x00005B18 377 3  SETUP I: Loading file "C:\Users\elweber\AppData\Local\TEXASI~1\CCS\TICLOU~1\0\0\9010425138390493198.cache"
+0x00005B18 377 3  SETUP I: SELECT * FROM TargetDB_Files WHERE Filename="9010425138390493198.cache"
+0x00005B18 377 3  SETUP I: SELECT * FROM TargetDB_Files WHERE dbid=114
+0x00005B18 377 3  SETUP I: SELECT count(*) FROM TargetDB_Files WHERE State=0
+0x00005B18 377 3  SETUP I: SELECT Systems.dbid FROM Systems, TargetDB_Files WHERE Systems.Source_File = TargetDB_Files.dbid AND TargetDB_Files.dbid = 114
+0x00005B18 377 3  SETUP I: SELECT * FROM Systems WHERE dbid=2
+0x00005B18 378 3  JSON R: {"data":{"id":0,"isCancellable":false,"isComplete":true,"isFirstUpdate":false,"name":"Reading configuration...","percent":null,"subActivity":"Initializing Register Database...","task":""},"event":"progress.update"}
+0x00005B18 378 3  LIB C: dlopen( "C:\ti\uniflash_9.4.1\deskdb\content\TICloudAgent\win\ccs_base\DebugServer\bin\GTIRemoteProxy.dll", 0 )
+0x00005B18 378 3  LIB R: dlopen( "C:\ti\uniflash_9.4.1\deskdb\content\TICloudAgent\win\ccs_base\DebugServer\bin\GTIRemoteProxy.dll", 0 ) = 0000000000000000
+0x00005B18 378 3  LIB C: dlopen( "C:\ti\uniflash_9.4.1\deskdb\content\TICloudAgent\win\ccs_base\DebugServer\drivers\msp430_emu.dvr", 0 )
+0x00005B18 384 3  LIB R: dlopen( "C:\ti\uniflash_9.4.1\deskdb\content\TICloudAgent\win\ccs_base\DebugServer\drivers\msp430_emu.dvr", 0 ) = 00007FFA93940000
+0x00005B18 384 3  LIB C: dlsym( 00007FFA93940000, "GTI_BLINK_LEDS" )
+0x00005B18 384 3  LIB R: dlsym( 00007FFA93940000, "GTI_BLINK_LEDS" ) = 0000000000000000
+0x00005B18 384 3  LIB C: dlsym( 00007FFA93940000, "_GTI_BLINK_LEDS" )
+0x00005B18 384 3  LIB R: dlsym( 00007FFA93940000, "_GTI_BLINK_LEDS" ) = 0000000000000000
+0x00005B18 384 3  LIB C: dlclose( 00007FFA93940000 )
+0x00005B18 384 3  LIB R: dlclose( 00007FFA93940000 ) = 1
+0x00005B18 384 3  JSON R: {"data":{"message":"This connection does not require a board.dat file"},"error":null}
+0x00005B18 384 4  POLL I: TimeToSleep() found shorter sleep time of 5000 ms from class `anonymous namespace'::CommandSink
+0x000040A8 384 3  XPCOM E: System is already shut down
+0x00005B18 384 3  JSON C: ~Translator()
+0x00005B18 384 3  JSON R: ~Translator()
+0x00005B18 384 5  COM_DBG_IF I: Final Release for class DbgProperties::DebugPropertiesManager (this = 0000020FED356E68)
+0x000040A8 384 3  LIB C: dlclose( 00007FFAA9A90000 )
+0x000040A8 384 3  LIB R: dlclose( 00007FFAA9A90000 ) = 1
+0x000040A8 386 3  LIB C: dlclose( 00007FFAA9A90000 )
+0x000040A8 386 3  LIB R: dlclose( 00007FFAA9A90000 ) = 1
+0x000040A8 386 3  LIB C: dlclose( 00007FFA91E00000 )
+0x000040A8 386 3  LIB R: dlclose( 00007FFA91E00000 ) = 1

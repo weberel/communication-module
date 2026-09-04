@@ -29,6 +29,11 @@ typedef struct {
     int      cell_rssi_dbm;    /* 0 if modem never attached */
     int      wifi_rssi_dbm;    /* 0 if WiFi unused */
     uint8_t  cell_reg_stat;    /* last +CEREG stat seen (registration diagnostics) */
+    uint16_t vbat_load_mv;     /* lowest VBAT seen while the modem was attached and
+                                * transmitting -- 0 if never sampled. Every other
+                                * VBAT reading is taken with the radio off, so this
+                                * is the only measurement of the sag that the
+                                * MODEM_MIN_VBAT_MV floor actually exists to avoid. */
 } uplink_result_t;
 
 typedef struct {

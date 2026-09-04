@@ -5,7 +5,7 @@
  */
 #pragma once
 
-#define FW_VERSION              "idf-0.10"
+#define FW_VERSION              "idf-0.11"
 
 /* ---- Duty cycle ---- */
 #define SAMPLE_INTERVAL_S       300     /* 5 min */
@@ -30,7 +30,30 @@
 
 /* ---- Solar MPPT (fractional-Voc + P&O), validated on hardware ---- */
 #define MPPT_FOC_PCT            80
-#define MPPT_VOC_PERIOD_WAKES   12
+/* Per-wake work that does NOT need to happen every 5 minutes. The battery and
+ * charger are still read on every wake -- that is the cheap part and it keeps
+ * full diagnostic resolution -- but the expensive extras are duty-cycled:
+ *   mppt_step()   ~600-900 ms/wake outdoors (3 perturb steps at 150 ms settle,
+ *                 plus the hourly 250 ms Voc). The panel's operating point does
+ *                 not move on a 5-minute timescale.
+ * Voc cadence is now measured in SECONDS (MPPT_VOC_PERIOD_S), so the sun-hours
+ * detector stays hourly no matter how the wake interval or these divisors are
+ * changed -- it used to be a wake count, which silently broke if either moved. */
+#define MPPT_EVERY_N_WAKES      3       /* -> perturb-and-observe every 15 min */
+/* Ultrasonic recovery backoff: after this many consecutive silent wakes, stop
+ * power-cycling the sensor rail on every wake and try only every Nth. */
+/* Motion wake. The accelerometer runs continuously in low-power mode (~2 uA)
+ * and pulls the shared INT line on movement, which wakes the ESP out of turn.
+ * The burst cap is the safety valve: an installation that vibrates would
+ * otherwise wake the node continuously and flatten the battery, so after this
+ * many out-of-turn wakes in a row the interrupt is left disarmed until the next
+ * ordinary timer wake. */
+#define MOTION_THRESHOLD_MG     96      /* rounded to the part's 16 mg/LSB step */
+#define MOTION_WAKE_BURST_MAX   5
+
+#define USS_RETRY_STREAK        3
+#define USS_RETRY_EVERY_N_WAKES 12      /* -> once an hour at a 5 min interval */
+#define MPPT_VOC_PERIOD_S       3600    /* open-circuit Voc once an hour */
 #define MPPT_VOC_SETTLE_MS      250
 #define MPPT_COLLAPSE_MA        30
 #define MPPT_STEPS_PER_WAKE     3
@@ -85,8 +108,16 @@
  * every 5 min would cost the link. */
 /* Autonomous measurement period on the module, seconds. It measures and
  * integrates at this rate continuously; we just read the accumulated volume
- * whenever we wake, so this is decoupled from SAMPLE_INTERVAL_S. 1 Hz is
- * comfortable now that the AFE rails stay up for the whole autonomous run. */
+ * whenever we wake, so this is decoupled from SAMPLE_INTERVAL_S.
+ *
+ * 1 Hz is comfortable because the AFE rails stay up for the whole autonomous
+ * run -- but that is exactly what makes the module expensive: the OPA836 sits
+ * enabled between captures at ~1 mA (~24 mAh/day, the largest single load on
+ * the node -- measured 2026-09-02 over 22 days of indoor discharge). The fix
+ * belongs on the module (PD-gate the amp per capture, DEVLOG S13), NOT here:
+ * once gated a capture costs ~50 uA-s, so this period is worth only ~1-2
+ * mAh/day and lengthening it buys ~3% of the node budget. Change it for
+ * totalizer integration accuracy, not for power. */
 #define USS_AUTO_PERIOD_S       1
 
 /* How long to wait for STATUS.AUTO after commanding AUTO_START. The module

@@ -10,7 +10,10 @@
 
 static RTC_DATA_ATTR uint16_t s_vindpm_mv;
 static RTC_DATA_ATTR int8_t   s_dir;
-static RTC_DATA_ATTR uint16_t s_wakes_since_voc;
+/* Seconds, not wakes: the Voc schedule must stay hourly regardless of the wake
+ * interval or how often mppt_step() is actually called. As a wake count it
+ * silently became 3-hourly the moment either changed. */
+static RTC_DATA_ATTR uint32_t s_secs_since_voc;
 static RTC_DATA_ATTR uint32_t s_day_mas;        /* today's harvest, mA-seconds */
 static RTC_DATA_ATTR uint32_t s_prev_day_mas;
 static RTC_DATA_ATTR int32_t  s_day_num;
@@ -57,7 +60,7 @@ void solar_reset(void)
 {
     s_vindpm_mv       = MPPT_VINDPM_START_MV;
     s_dir             = +1;
-    s_wakes_since_voc = MPPT_VOC_PERIOD_WAKES;   /* force Voc on first solar wake */
+    s_secs_since_voc  = MPPT_VOC_PERIOD_S;       /* force Voc on first solar wake */
     s_day_mas         = 0;
     s_prev_day_mas    = 0;
     s_day_num         = -1;
@@ -88,7 +91,7 @@ static int32_t input_power_mw(void)
 
 static void mppt_step(void)
 {
-    bool hourly   = (++s_wakes_since_voc >= MPPT_VOC_PERIOD_WAKES);
+    bool hourly   = (s_secs_since_voc >= MPPT_VOC_PERIOD_S);
     bool need_voc = hourly || (bq_ibus_ma() < MPPT_COLLAPSE_MA);
 
     if (need_voc && bq_vbat_mv() > 3400) {
@@ -96,7 +99,7 @@ static void mppt_step(void)
         vTaskDelay(pdMS_TO_TICKS(MPPT_VOC_SETTLE_MS));
         uint16_t voc = bq_vac2_mv();
         bq_set_hiz(false);
-        s_wakes_since_voc = 0;
+        if (hourly) s_secs_since_voc = 0;
 
         /* Battery-independent sun detection: track the panel's best-ever Voc
          * and count "sun hours" where the hourly Voc clears a fraction of it.
@@ -129,18 +132,23 @@ static void mppt_step(void)
     }
 }
 
-solar_status_t solar_on_wake(uint32_t interval_s, int32_t day_num)
+solar_status_t solar_on_wake(uint32_t interval_s, int32_t day_num, bool do_mppt)
 {
     solar_status_t st = { 0 };
     st.usb_present   = bq_ac1_present();
     st.solar_present = bq_ac2_present();
+
+    /* Advance the Voc clock on EVERY wake, including ones that skip the hill
+     * climb, so "hourly" stays hourly. */
+    s_secs_since_voc += interval_s;
 
     if (st.usb_present) {
         bq_set_iindpm_ma(INPUT_LIMIT_USB_MA);
         bq_set_vindpm_mv(USB_VINDPM_MV);
     } else if (st.solar_present) {
         bq_set_iindpm_ma(INPUT_LIMIT_SOLAR_MA);
-        mppt_step();
+        if (do_mppt) mppt_step();
+        else         bq_set_vindpm_mv(s_vindpm_mv);   /* hold the last operating point */
     }
 
     if (st.solar_present && !st.usb_present) {
