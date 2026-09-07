@@ -5,7 +5,7 @@
  */
 #pragma once
 
-#define FW_VERSION              "idf-0.16"
+#define FW_VERSION              "idf-0.17"
 
 /* ---- Duty cycle ---- */
 #define SAMPLE_INTERVAL_S       300     /* 5 min */
@@ -118,7 +118,16 @@
  * once gated a capture costs ~50 uA-s, so this period is worth only ~1-2
  * mAh/day and lengthening it buys ~3% of the node budget. Change it for
  * totalizer integration accuracy, not for power. */
-#define USS_AUTO_PERIOD_S       1
+/* Autonomous measurement period, seconds.
+ *
+ * 1 -> 10 as an EXPERIMENT (2026-09-06): the power audit's differential is
+ * AUTO-running vs AUTO-stopped, so the 1665 +/- 139 uA it measures includes the
+ * whole energy cost of the captures themselves, not just a static rail load.
+ * The RX bias divider is 2M/2M = 0.8 uA and the other static fixes total
+ * ~100 uA, so static cannot explain 1.665 mA. If the cost is the captures,
+ * measuring 10x less often should take the figure toward ~170 uA. If it stays
+ * put, the load is static after all and only the rail FETs can reach it. */
+#define USS_AUTO_PERIOD_S       10
 
 /* How long to wait for STATUS.AUTO after commanding AUTO_START. The module
  * raises its AFE rails, settles them and runs one discard capture first, so

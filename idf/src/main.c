@@ -353,6 +353,14 @@ static void power_audit(bool uss_present)
      * and uss_stop_auto() succeeds trivially when it was never running -- so
      * both halves would be measured with the rails already down and the audit
      * would report a confident, entirely wrong 0 uA. */
+    /* Force a restart so the configured period is actually applied.
+     * uss_start_auto() deliberately returns early when STATUS.AUTO is already
+     * set -- re-issuing AUTO_START would zero the totalizer -- which also means
+     * it never writes AUTO_PERIOD to a module that is already running. Without
+     * this stop first, changing USS_AUTO_PERIOD_S would have no effect on a
+     * module that never rebooted, and the experiment would silently measure the
+     * old rate. */
+    (void) uss_stop_auto();
     if (!uss_start_auto(USS_AUTO_PERIOD_S)) {
         ESP_LOGW(TAG, "power audit: autonomous mode unavailable, skipping");
         return;
