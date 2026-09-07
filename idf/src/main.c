@@ -12,6 +12,7 @@
  *   - error-event log (coredump partition), health telemetry
  *   - OTA with rollback, NVS provisioning, ATECC identity, LP-core sampling
  */
+#include <math.h>
 #include <string.h>
 #include <time.h>
 
@@ -21,6 +22,7 @@
 #include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_task_wdt.h"
+#include "esp_pm.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -33,6 +35,7 @@
 #include "solar.h"
 #include "sensors.h"
 #include "uss.h"
+#include "uss_link.h"   /* USS_ST_BOOT: the module resets its own counters */
 #include "i2c_bus.h"
 #include "esp_timer.h"
 #include "wf280a.h"
@@ -57,6 +60,19 @@ static RTC_DATA_ATTR uint16_t s_boot_count;
 static RTC_DATA_ATTR uint16_t s_wake_count;
 static RTC_DATA_ATTR uint16_t s_crash_count;
 static RTC_DATA_ATTR uint8_t  s_parked;      /* battery park mode latch */
+/* Previous capture counters, for the per-record delta. Free-running u16s on the
+ * module, so the subtraction is correct modulo 65536 and needs no handshake. */
+static RTC_DATA_ATTR uint16_t s_prev_cap_n;
+static RTC_DATA_ATTR uint16_t s_prev_cap_badcode;
+static RTC_DATA_ATTR uint16_t s_prev_cap_badsnr;
+static RTC_DATA_ATTR uint8_t  s_cap_seen;   /* a previous sample exists */
+/* Set for the wake that a button press caused. A press means a person is at the
+ * board asking for attention, so it overrides the USS recovery backoff: the
+ * backoff exists to stop a node with no gas cell power-cycling its rail every
+ * 5 minutes forever, but it also means a module hot-plugged onto a live bus --
+ * which can leave it wedged half-powered off the bus's ESD clamps -- waits up
+ * to an hour for the rail cycle that would clear it. Observed 2026-09-06. */
+static bool s_force_uss_recovery;
 /* upload scheduling: bounded tempo (2026-08-11 spec) */
 static RTC_DATA_ATTR int32_t  s_next_upload_in_s;
 static RTC_DATA_ATTR uint8_t  s_retries_left;
@@ -188,7 +204,8 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
      * within that hour and costs nothing in between. */
     bool try_recovery = uss_ok ? false
                       : (s_uss_fail_streak < USS_RETRY_STREAK) ||
-                        ((s_wake_count % USS_RETRY_EVERY_N_WAKES) == 0);
+                        ((s_wake_count % USS_RETRY_EVERY_N_WAKES) == 0) ||
+                        s_force_uss_recovery;
     if (!uss_ok && !try_recovery) {
         ESP_LOGW(TAG, "USS silent (%u wakes) -- recovery backed off",
                  s_uss_fail_streak);
@@ -222,6 +239,39 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
         r->uss_snr_db2   = u.snr_db2;
         r->uss_status    = u.status;
         r->uss_vol_ml    = u.vol_ml;
+        /* Delta since the previous sample. Skipped on the first sample after a
+         * cold boot and whenever the module reports the BOOT bit -- its
+         * counters restart at zero on its own reset, so a difference across
+         * that boundary is meaningless rather than merely inaccurate. */
+        uint16_t dn  = (uint16_t)(u.cap_n       - s_prev_cap_n);
+        uint16_t dbc = (uint16_t)(u.cap_badcode - s_prev_cap_badcode);
+        uint16_t dbs = (uint16_t)(u.cap_badsnr  - s_prev_cap_badsnr);
+        /* Sanity-check the delta instead of trusting the BOOT bit alone.
+         *
+         * BOOT is cleared by the first command, and uss_start_auto() runs
+         * before uss_sample() -- so by the time we look, a module that rebooted
+         * this wake already reports BOOT clear and its counters have restarted
+         * at zero. The subtraction then wraps and produces nonsense: on
+         * 2026-09-06 16:07 that published n=64582, badsnr=65533, i.e. "101.5 %
+         * bad", sitting next to three honest records reading 0.0-0.3 %.
+         *
+         * Two invariants catch it without needing to know why. Bad counts can
+         * never exceed the total, and the module cannot have run more captures
+         * than the interval allows -- 4x the nominal rate is generous headroom
+         * for a period change and still rejects a wrap by three orders. */
+        bool plausible = (dbc <= dn) && (dbs <= dn) &&
+                         (dn <= (uint16_t)(SAMPLE_INTERVAL_S * 4u));
+        if (s_cap_seen && !(u.status & USS_ST_BOOT) && plausible) {
+            r->uss_cap_n       = dn;
+            r->uss_cap_badcode = dbc;
+            r->uss_cap_badsnr  = dbs;
+        } else {
+            r->uss_cap_n = r->uss_cap_badcode = r->uss_cap_badsnr = 0;
+        }
+        s_prev_cap_n       = u.cap_n;
+        s_prev_cap_badcode = u.cap_badcode;
+        s_prev_cap_badsnr  = u.cap_badsnr;
+        s_cap_seen         = 1;
         r->uss_tof_ups_q40 = u.tof_ups_q40;
         r->uss_tof_dns_q40 = u.tof_dns_q40;
         r->sensor_ok |= SOK_USS;
@@ -247,9 +297,133 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
         r->wf_praw = praw;
         r->wf_traw = traw;
         r->sensor_ok |= SOK_WF280A;
+        ESP_LOGI(TAG, "WF280A: praw=%lu traw=%lu st=0x%02X",
+                 (unsigned long)praw, (unsigned long)traw, wst);
     } else {
         r->wf_praw = r->wf_traw = 0;
     }
+}
+
+/* ===================== power audit ==========================================
+ *
+ * A direct, automatic measurement of what the ultrasonic board's analog front
+ * end costs, in microamps, replacing the multi-day battery-discharge slopes
+ * that could not resolve anything smaller than about 10 % of the budget.
+ *
+ * Method: average the BQ25792's IBAT with the module's rails up, command
+ * AUTO_STOP (which drops its 5 V boost and both AFE rails but leaves the
+ * MSP430 running), average again, then restore. The difference is the rails.
+ *
+ * Two design constraints worth recording, because both were nearly got wrong:
+ *
+ *  - The load step is NOT "cut the SENSOR rail". Making that rail actually fall
+ *    needs eco_i2c_hold_low(), because the module's ESD clamps back-feed from an
+ *    idle-high bus -- and that call deletes the I2C bus the ammeter itself sits
+ *    on. The meter would go blind exactly when the load went away.
+ *
+ *  - Both halves are taken seconds apart in the same CPU state, so every slow
+ *    drift (temperature, pack voltage, sun) cancels. That is what a differential
+ *    buys over comparing absolute numbers taken days apart.
+ *
+ * Only valid on battery: with a charger attached the load step is absorbed by
+ * the input and IBAT barely moves. Costs one interval of totalized volume,
+ * since AUTO_START zeroes it -- so this runs on a button press, not every wake.
+ */
+#define AUDIT_CYCLES       3    /* interleaved up/down pairs */
+#define AUDIT_SAMPLES    160    /* x 50 ms = 8 s per half */
+#define AUDIT_SPACING_MS  50    /* > one ADC conversion cycle, or we average
+                                 * the same register contents 160 times */
+#define AUDIT_SETTLE_MS  700
+
+static int32_t s_audit_rail_ua;   /* AFE rails + boost, uA (mean of the pairs) */
+static int32_t s_audit_se_ua;     /* standard error of that mean */
+static int32_t s_audit_base_ua;   /* node discharge with those rails down, uA */
+static bool    s_audit_valid;
+
+static void power_audit(bool uss_present)
+{
+    s_audit_valid = false;
+    if (!uss_present) return;
+    if (bq_vbus_present()) {
+        ESP_LOGI(TAG, "power audit skipped: charger attached");
+        return;
+    }
+    /* Establish the precondition rather than assuming it. The recovery backoff
+     * can leave AUTO un-asserted for a wake or two after the module reappears,
+     * and uss_stop_auto() succeeds trivially when it was never running -- so
+     * both halves would be measured with the rails already down and the audit
+     * would report a confident, entirely wrong 0 uA. */
+    if (!uss_start_auto(USS_AUTO_PERIOD_S)) {
+        ESP_LOGW(TAG, "power audit: autonomous mode unavailable, skipping");
+        return;
+    }
+
+    /* Pin the CPU out of light sleep for the whole audit. Otherwise the ESP's
+     * own draw depends on how tickless idle happened to schedule around our
+     * I2C reads, which is a variable we do not want inside a differential. */
+    esp_pm_lock_handle_t lock = NULL;
+    if (esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "audit", &lock) != ESP_OK)
+        lock = NULL;
+    if (lock) esp_pm_lock_acquire(lock);
+
+    /* Interleaved up/down pairs, not one long A followed by one long B.
+     *
+     * The first attempt (idf-0.12, 2026-09-06) used 40 samples over 2 s per
+     * half and returned +7.5 mA then -1.9 mA on the same hardware minutes
+     * apart -- the second physically impossible, reading rails-down as drawing
+     * MORE than rails-up. All of the scatter was in the rails-up half, because
+     * the module fires a capture burst once a second and 2 s of instantaneous
+     * samples either lands on those bursts or does not. Eight seconds covers
+     * ~8 bursts per half, interleaving cancels any slow drift between halves,
+     * and the spread across pairs is published so the number arrives with its
+     * own error bar instead of an assumption of precision. */
+    int32_t diff[AUDIT_CYCLES];
+    int32_t last_down = 0;
+    for (int c = 0; c < AUDIT_CYCLES; c++) {
+        esp_task_wdt_reset();
+        (void) uss_start_auto(USS_AUTO_PERIOD_S);
+        vTaskDelay(pdMS_TO_TICKS(AUDIT_SETTLE_MS));
+        int32_t up = bq_ibat_avg_ua(AUDIT_SAMPLES, AUDIT_SPACING_MS);
+
+        esp_task_wdt_reset();
+        if (!uss_stop_auto()) {
+            ESP_LOGW(TAG, "power audit: AUTO_STOP refused mid-run, aborting");
+            goto done;
+        }
+        vTaskDelay(pdMS_TO_TICKS(AUDIT_SETTLE_MS));
+        int32_t down = bq_ibat_avg_ua(AUDIT_SAMPLES, AUDIT_SPACING_MS);
+
+        /* IBAT is negative while discharging, so removing a load makes it less
+         * negative and the difference comes out positive. */
+        diff[c] = down - up;
+        last_down = down;
+        ESP_LOGI(TAG, "audit pair %d/%d: up %ld uA, down %ld uA -> %ld uA",
+                 c + 1, AUDIT_CYCLES, (long)up, (long)down, (long)diff[c]);
+    }
+
+    {
+        double mean = 0.0;
+        for (int i = 0; i < AUDIT_CYCLES; i++) mean += diff[i];
+        mean /= AUDIT_CYCLES;
+        double var = 0.0;
+        for (int i = 0; i < AUDIT_CYCLES; i++) {
+            double e = diff[i] - mean;
+            var += e * e;
+        }
+        var /= (AUDIT_CYCLES - 1);                 /* sample variance */
+        double se = sqrt(var / AUDIT_CYCLES);      /* of the mean */
+
+        s_audit_rail_ua = (int32_t) mean;
+        s_audit_se_ua   = (int32_t) se;
+        s_audit_base_ua = last_down;
+        s_audit_valid   = true;
+        ESP_LOGI(TAG, "power audit: USS AFE = %ld +/- %ld uA (n=%d)",
+                 (long)s_audit_rail_ua, (long)s_audit_se_ua, AUDIT_CYCLES);
+    }
+
+done:
+    (void) uss_start_auto(USS_AUTO_PERIOD_S);      /* always restore */
+    if (lock) { esp_pm_lock_release(lock); esp_pm_lock_delete(lock); }
 }
 
 void app_main(void)
@@ -273,6 +447,8 @@ void app_main(void)
         esp_task_wdt_init(&wdt_cfg);
     esp_task_wdt_add(NULL);
     board_init();
+
+
 
     /* Raise the switched SENSOR rail (J404) BEFORE the first I2C transaction.
      *
@@ -359,17 +535,52 @@ void app_main(void)
     }
 
     s_boot_count++;
+    s_force_uss_recovery = button_wake;   /* consumed by read_sample() below */
 
     /* Charger first: park-mode decision needs VBAT before we touch anything. */
     bool bq_ok = bq_begin();
-    if (bq_ok) bq_adc_enable(true);
+    if (bq_ok) {
+        /* Order matters: EN_IBAT/SFET_PRESENT before the ADC starts. Enabling
+         * the sense path after bq_adc_enable()'s 150 ms settle left the IBAT
+         * channel un-converted when read_sample() ran a moment later -- the
+         * discharge column read a flat zero for 22 days. */
+        bq_ibat_sense(true);
+        bq_adc_enable(true);
+    }
     uint16_t vbat = bq_ok ? bq_vbat_mv() : 0;
 
     /* Battery park mode: below PARK_VBAT_MV (and nothing plugged in) do the
      * absolute minimum -- no flash writes, no sensors, long sleeps -- until the
      * pack recovers past the hysteresis threshold. Brownout mid-flash-write is
      * the failure this avoids. */
-    bool input_present = bq_ok && (bq_ac1_present() || bq_ac2_present());
+    bool usb_present = bq_ok && bq_ac1_present();
+
+    /* Power management. Frequency scaling always; automatic LIGHT SLEEP only
+     * when USB is absent.
+     *
+     * Light sleep stops the clock during every vTaskDelay -- sensor
+     * conversions, the ADC settle, the rail cycle -- which is most of a wake,
+     * so it is the single biggest saving available on this side. But the C6's
+     * USB-Serial/JTAG peripheral loses its clock with it, and the console does
+     * not take a PM lock, so the port stops enumerating: no logs, and no
+     * wake-window flashing. On a deployed node nobody is watching and that is
+     * a fine trade; on the bench it makes the board unreachable.
+     *
+     * USB presence is exactly the right discriminator -- if a cable is plugged
+     * in, someone is working on it. */
+    esp_pm_config_t pm = {
+        .max_freq_mhz = 80,
+        .min_freq_mhz = 40,                    /* XTAL */
+        .light_sleep_enable = !usb_present,
+    };
+    esp_err_t pm_err = esp_pm_configure(&pm);
+    if (pm_err != ESP_OK)
+        ESP_LOGW(TAG, "esp_pm_configure failed: %s", esp_err_to_name(pm_err));
+    else
+        ESP_LOGI(TAG, "PM: 40-80 MHz, light sleep %s",
+                 usb_present ? "OFF (USB attached)" : "on");
+
+    bool input_present = bq_ok && (usb_present || bq_ac2_present());
     if (bq_ok && !input_present) {
         if (s_parked && vbat < PARK_RESUME_VBAT_MV) {
             ESP_LOGW(TAG, "parked (VBAT %u mV) -- sleeping %d s", vbat, PARK_SLEEP_S);
@@ -392,7 +603,6 @@ void app_main(void)
 
     solar_status_t sol = { 0 };
     if (bq_ok) {
-        bq_ibat_sense(true);
         bq_configure_charging(CHARGE_CURRENT_MA, 0, 0);
         bq_enable_acdrv1(true);
         bq_enable_acdrv2(true);
@@ -433,6 +643,12 @@ void app_main(void)
              (r.sensor_ok & 0x04) ? 'y' : 'N', (r.sensor_ok & 0x08) ? 'y' : 'N',
              (r.sensor_ok & 0x10) ? 'y' : 'N', (r.sensor_ok & 0x20) ? 'y' : 'N');
 
+    /* A button press means someone is standing at the board wanting an answer,
+     * which is exactly when spending ~5 s and one totalizer interval on a real
+     * current measurement is worth it. The same press forces an upload below,
+     * so the number reaches ThingsBoard in the same wake. */
+    if (button_wake) power_audit((r.sensor_ok & SOK_USS) != 0);
+
     /* Upload if due (or the button asked). Tempo is bounded: 2 quick retries,
      * then only the 12 h schedule -- an outage costs ~2 short attempts a day
      * while everything banks in flash. */
@@ -450,6 +666,10 @@ void app_main(void)
             .sun_hours    = sol.sun_hours,
             .voc_max_mv   = sol.voc_max_mv,
             .uptime_s     = s_uptime_s,
+            .audit_valid  = s_audit_valid,
+            .audit_rail_ua = s_audit_rail_ua,
+            .audit_se_ua  = s_audit_se_ua,
+            .audit_base_ua = s_audit_base_ua,
         };
         if (ctx.deep_search) s_last_deep_uptime = s_uptime_s;
 

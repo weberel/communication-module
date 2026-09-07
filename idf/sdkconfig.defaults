@@ -66,3 +66,16 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_80=y
 # are still printed.
 CONFIG_BOOTLOADER_LOG_LEVEL_INFO=n
 CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+
+# Power management: scale the clock down and light-sleep whenever a task blocks.
+# A sampling wake is almost entirely vTaskDelay -- LTR-303 150 ms, MS5837 60 ms,
+# the BQ's 150 ms ADC settle, the 800 ms rail cycle -- and without PM the CPU
+# spins in the idle task at full speed through all of it. Tickless idle turns
+# that dead time into light sleep.
+#
+# The modem is the risk: its UART baud derives from a clock that DFS moves, so
+# uplink.c holds a NO_LIGHT_SLEEP + APB_FREQ_MAX lock for the whole session.
+CONFIG_PM_ENABLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+CONFIG_PM_SLP_IRAM_OPT=y
+CONFIG_PM_RTOS_IDLE_OPT=y

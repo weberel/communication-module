@@ -97,7 +97,15 @@ typedef struct __attribute__((packed)) {
      * scaling assumption. */
     uint32_t uss_tof_ups_q40;
     uint32_t uss_tof_dns_q40;
-    uint8_t  rsvd[28];     /* spare for future fields (0xFF) */
+    /* --- capture-quality deltas since the previous record ---
+     * The module runs ~300 captures between our samples, so uss_code alone is
+     * one coin flip out of 300. These make the real rate visible per record.
+     * 0xFFFF means "record written before this field existed" -- the ring is
+     * 0xFF-filled -- and must not be published as a count. */
+    uint16_t uss_cap_n;
+    uint16_t uss_cap_badcode;
+    uint16_t uss_cap_badsnr;
+    uint8_t  rsvd[22];     /* spare for future fields (0xFF) */
     uint16_t crc;          /* CRC16-CCITT over bytes [0 .. offsetof(crc)-1] */
 } LogRecord;
 

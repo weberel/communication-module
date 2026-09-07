@@ -26,6 +26,13 @@ typedef struct {
     uint8_t  snr_db2;     /* SNR, dB x2 */
     uint8_t  gain;        /* PGA gain index used */
     uint32_t vol_ml;      /* totalized volume, mL (0 until autonomous mode) */
+    /* Free-running capture counters (USS_REG_CAP_*). They WRAP; take the
+     * difference between consecutive reads. All three zero = a module that
+     * predates them. These are the only way to see the true failure rate: we
+     * sample one capture per 5 min while the module runs ~300. */
+    uint16_t cap_n;
+    uint16_t cap_badcode;
+    uint16_t cap_badsnr;
     /* Absolute time-of-flight, RAW Q40 seconds exactly as the USS library
      * produced it -- deliberately not scaled here. This is the speed-of-sound
      * observable (gas composition), so the conversion is applied off-device:
@@ -48,6 +55,10 @@ bool uss_sample(uss_result_t *out);
  * after the module reboots. With this running, uss_sample() stops commanding
  * measurements and simply reads the latest latched block plus vol_ml. */
 bool uss_start_auto(uint16_t period_s);
+
+/* Stop autonomous mode; the module drops its 5 V boost and AFE rails with it.
+ * Used by the power audit as a clean, bus-preserving load step. */
+bool uss_stop_auto(void);
 
 #ifdef __cplusplus
 }

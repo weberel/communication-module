@@ -5,7 +5,7 @@
  */
 #pragma once
 
-#define FW_VERSION              "idf-0.11"
+#define FW_VERSION              "idf-0.16"
 
 /* ---- Duty cycle ---- */
 #define SAMPLE_INTERVAL_S       300     /* 5 min */

@@ -91,7 +91,28 @@
  *   microseconds = raw * 1e6 / 2^40   (= raw / 1099511.627776)             */
 #define USS_REG_TOF_UPS_Q40 0x20    /* u32 absolute ToF upstream,   Q40 s     */
 #define USS_REG_TOF_DNS_Q40 0x24    /* u32 absolute ToF downstream, Q40 s     */
-/* 0x28..0x2E reserved (0x00) */
+/* -- capture-quality counters, ADDED 2026-09-06 (additive, no PROTO bump) --
+ * Free-running u16 counts of every capture the module has run since ITS last
+ * reset. They WRAP; the master takes the difference between consecutive reads,
+ * which is correct modulo 65536 and needs no read-clear handshake (read-clear
+ * would race the auto-incrementing register pointer during a block read).
+ *
+ * Why they exist: the master samples one capture per 5 minutes while the module
+ * runs ~300, so a single uss_code is a coin flip, not a rate. On 2026-09-06 the
+ * real bad-sample rate was ~30 % and two thirds of it was INVISIBLE -- those
+ * captures reported code 122 "valid" with dtof 100-1000x out of family, and
+ * only SNR gave them away. These two counters make the rate observable in one
+ * telemetry cycle instead of an afternoon of guessing.
+ *
+ * A module that predates them answers 0 in all three, which is a clean
+ * "not implemented" sentinel: a running module always has CAP_N != 0.
+ * Deliberately NOT a PROTO bump -- they land in space that was already
+ * reserved and CRC-covered, so an old master still reads a CRC-valid block. */
+#define USS_REG_CAP_N       0x28    /* u16 total captures (wraps)             */
+#define USS_REG_CAP_BADCODE 0x2A    /* u16 captures whose code != 122 (wraps) */
+#define USS_REG_CAP_BADSNR  0x2C    /* u16 code==122 but SNR below threshold;
+                                     * the silent failures (wraps)            */
+/* 0x2E reserved (0x00) */
 #define USS_REG_CRC8        0x2F    /* u8  CRC8 over regs 0x04..0x2E          */
 /* -- control -- */
 #define USS_REG_CMD         0x40    /* u8  write-only, USS_CMD_*              */

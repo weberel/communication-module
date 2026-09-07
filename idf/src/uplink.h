@@ -49,6 +49,12 @@ typedef struct {
     uint16_t voc_max_mv;
     uint32_t uptime_s;         /* uptime at the newest record: the reference for
                                 * back-dating records logged before a clock sync */
+    bool     audit_valid;      /* a power audit ran this wake (button press) */
+    int32_t  audit_rail_ua;    /* ultrasonic AFE rails + boost, microamps */
+    int32_t  audit_se_ua;      /* standard error of that mean -- publish it, so
+                                * a noisy audit announces itself instead of
+                                * being mistaken for a precise one */
+    int32_t  audit_base_ua;    /* node discharge with those rails down, uA */
 } uplink_ctx_t;
 
 uplink_result_t uplink_upload_all(const uplink_ctx_t *ctx);

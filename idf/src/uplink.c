@@ -21,6 +21,7 @@
 #include "mqtt_client.h"
 #include "driver/gpio.h"
 #include "esp_task_wdt.h"
+#include "esp_pm.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -47,7 +48,7 @@ extern const char isrg_root_pem[];
  * publish, comfortably under what made ThingsBoard Cloud drop the connection
  * (that was ~320, at 40 datapoints x 8). Larger batches drain a backlog in
  * fewer round trips, which matters over a slow cellular link. */
-#define BATCH_RECORDS        8
+#define BATCH_RECORDS        4       /* starting batch; drain() shrinks on failure */
 #define BATCH_GAP_MS         400     /* ThingsBoard Cloud dislikes bursts */
 
 #define CLOCK_MIN 1767225600L        /* 2026-01-01 */
@@ -92,6 +93,12 @@ static bool mqtt_up(void)
         .credentials.username = TB_ACCESS_TOKEN,
         .network.timeout_ms = 15000,
         .session.keepalive = 60,
+        /* esp-mqtt defaults to a 1024-byte buffer. A full telemetry batch is
+         * ~1.1 kB per record, so anything but a one-record batch overran it.
+         * That is why the drain stalled at 132 pending on 2026-09-05 while the
+         * short status payload kept getting through in the same session. */
+        .buffer.size = 4096,
+        .buffer.out_size = 12288,
     };
     s_mqtt = esp_mqtt_client_init(&cfg);
     if (!s_mqtt) return false;
@@ -203,7 +210,30 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
             tof_us, r->uss_dtof_ps / 1e6f,
             r->uss_code, r->uss_snr_db2 / 2.0f,
             (unsigned long)r->uss_vol_ml);
+        /* Capture-quality rate over the whole interval (~300 captures) rather
+         * than the single capture uss_code describes. Suppressed when the count
+         * is 0 (no delta available) or 0xFFFF (a record written before the
+         * field existed -- the ring is 0xFF-filled), so the dashboard never
+         * averages a sentinel against a real measurement. */
+        if (r->uss_cap_n != 0 && r->uss_cap_n != 0xFFFF && (size_t)n < cap) {
+            n += snprintf(out + n, cap - n,
+                ",\"uss_cap_n\":%u,\"uss_cap_badcode\":%u,\"uss_cap_badsnr\":%u",
+                r->uss_cap_n, r->uss_cap_badcode, r->uss_cap_badsnr);
+        }
     }
+
+    /* WF280A raw counts. Re-enabled 2026-09-05: the part answers reliably, and
+     * if it sits in a DIFFERENT pressure domain than the MS5837 (ambient rather
+     * than the line) it is the live atmospheric reference that dp_hpa currently
+     * fakes with a compile-time constant -- which means dp_hpa is presently
+     * measuring the weather as much as the gas. No counts->hPa conversion
+     * exists (the compensation polynomial is vendor-private), so these go out
+     * raw and the map gets fitted from data: log them against p_gas_hpa and see
+     * whether they track (same domain, useless) or diverge (usable reference). */
+    if ((r->sensor_ok & SOK_WF280A) && n > 0 && (size_t)n < cap)
+        n += snprintf(out + n, cap - n,
+            ",\"wf_praw\":%lu,\"wf_traw\":%lu",
+            (unsigned long)r->wf_praw, (unsigned long)r->wf_traw);
 
     /* Gas pressure from the MS5837 (it sits in the LINE, not ambient), and the
      * differential against the per-site atmospheric constant in config.h. */
@@ -266,11 +296,19 @@ static void note_vbat_under_load(uplink_result_t *res)
 static uint32_t drain(uplink_result_t *res)
 {
     uint32_t sent = 0;
+    /* Batch size is adaptive, not fixed. A publish can fail for reasons that
+     * depend on SIZE -- the broker's message limit, its per-message datapoint
+     * limit, a marginal link -- and the old code simply gave up, leaving the
+     * ring stalled forever: every later session republished the same oversized
+     * batch and failed identically. Halving on failure means the drain finds
+     * whatever ceiling actually applies and gets under it, turning a permanent
+     * stall into a slower drain. */
+    uint32_t batch = BATCH_RECORDS;
     while (flashlog_pending() > 0) {
         esp_task_wdt_reset();
         int64_t now_ms = clock_valid() ? (int64_t)time(NULL) * 1000 : 0;
         uint32_t n = flashlog_pending();
-        if (n > BATCH_RECORDS) n = BATCH_RECORDS;
+        if (n > batch) n = batch;
 
         size_t len = 0;
         uint32_t included = 0;
@@ -321,7 +359,13 @@ static uint32_t drain(uplink_result_t *res)
                                 pdMS_TO_TICKS(15000));
             esp_task_wdt_reset();
             if (!publish_acked(s_json)) {
-                ESP_LOGW(TAG, "drain stopped, %lu pending",
+                if (batch > 1) {
+                    batch /= 2;
+                    ESP_LOGW(TAG, "publish failed -- retrying with batch=%lu",
+                             (unsigned long)batch);
+                    continue;          /* same records, smaller payload */
+                }
+                ESP_LOGW(TAG, "drain stopped at batch=1, %lu pending",
                          (unsigned long)flashlog_pending());
                 break;
             }
@@ -363,6 +407,16 @@ static void send_status(const uplink_ctx_t *ctx, const uplink_result_t *res)
              ctx->reset_reason, ctx->boot_count, ctx->wake_count,
              ctx->crash_count, ctx->vbat_mv, res->vbat_load_mv,
              ctx->sun_hours, ctx->voc_max_mv);
+    /* Appended only on wakes that actually measured. Publishing a placeholder
+     * would put zeros in the timeseries and make the dashboard average them
+     * against real readings. */
+    if (ctx->audit_valid) {
+        size_t n = strlen(vals);
+        snprintf(vals + n, sizeof(vals) - n,
+                 ",\"uss_rail_ua\":%ld,\"uss_rail_se_ua\":%ld,\"base_ua\":%ld",
+                 (long)ctx->audit_rail_ua, (long)ctx->audit_se_ua,
+                 (long)ctx->audit_base_ua);
+    }
     if (now_ms > 0)
         snprintf(s_json, sizeof(s_json), "{\"ts\":%lld,\"values\":{%s}}",
                  (long long)now_ms, vals);
@@ -639,9 +693,26 @@ out:
 
 /* ===================== entry point ===================== */
 
+/* Held for the duration of an uplink. The modem's UART derives its baud from a
+ * clock that DFS moves, and esp_modem does not take its own lock -- without
+ * this the first frequency change mid-session corrupts the AT stream. Cheap
+ * insurance: a session is ~2 minutes twice a day, and the sampling wakes (which
+ * are the ones worth optimising) are unaffected. */
+static esp_pm_lock_handle_t s_pm_lock;
+
+static void pm_hold(bool hold)
+{
+    if (!s_pm_lock &&
+        esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "uplink", &s_pm_lock) != ESP_OK)
+        return;
+    if (hold) esp_pm_lock_acquire(s_pm_lock);
+    else      esp_pm_lock_release(s_pm_lock);
+}
+
 uplink_result_t uplink_upload_all(const uplink_ctx_t *ctx)
 {
     uplink_result_t res = { 0 };
+    pm_hold(true);
 
     s_ref_uptime_s = ctx->uptime_s;
     s_ref_boot_id  = ctx->boot_id;
@@ -671,6 +742,7 @@ uplink_result_t uplink_upload_all(const uplink_ctx_t *ctx)
         wifi_session(ctx, &res);
 #endif
 
+    pm_hold(false);
     res.all_sent = (flashlog_pending() == 0);
     ESP_LOGI(TAG, "%lu records sent%s, %lu pending",
              (unsigned long)res.sent, res.used_wifi ? " (wifi used)" : "",

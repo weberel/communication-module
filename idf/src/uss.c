@@ -91,6 +91,30 @@ bool uss_start_auto(uint16_t period_s)
     return false;
 }
 
+/* Stop autonomous mode. On the module this also drops the 5 V boost and both
+ * AFE rails, which is the whole point: it is the only load step on that board
+ * we can make without cutting the SENSOR rail -- and cutting that rail requires
+ * holding the I2C bus low, which deletes the bus the ammeter lives on. */
+bool uss_stop_auto(void)
+{
+    if (!s_dev) {
+        eco_i2c_add_tracked(&s_dev, USS_LINK_ADDR7);
+        if (!s_dev) return false;
+    }
+    if (!wr(USS_REG_CMD, USS_CMD_AUTO_STOP)) return false;
+
+    /* The command is only queued by the write; the module services it from its
+     * main loop. Wait for STATUS.AUTO to clear rather than assuming. */
+    for (int waited = 0; waited < USS_AUTO_START_TIMEOUT_MS; waited += USS_POLL_MS) {
+        uint8_t st = 0;
+        vTaskDelay(pdMS_TO_TICKS(USS_POLL_MS));
+        if (!rd(USS_REG_STATUS, &st, 1)) return false;
+        if (!(st & USS_ST_AUTO)) return true;
+    }
+    ESP_LOGW(TAG, "autonomous stop not confirmed");
+    return false;
+}
+
 bool uss_sample(uss_result_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -166,6 +190,9 @@ bool uss_sample(uss_result_t *out)
     out->vol_ml    = le32(&blk[USS_REG_VOL_ML - USS_LINK_RESULT_OFF]);
     out->tof_ups_q40 = le32(&blk[USS_REG_TOF_UPS_Q40 - USS_LINK_RESULT_OFF]);
     out->tof_dns_q40 = le32(&blk[USS_REG_TOF_DNS_Q40 - USS_LINK_RESULT_OFF]);
+    out->cap_n       = le16(&blk[USS_REG_CAP_N       - USS_LINK_RESULT_OFF]);
+    out->cap_badcode = le16(&blk[USS_REG_CAP_BADCODE - USS_LINK_RESULT_OFF]);
+    out->cap_badsnr  = le16(&blk[USS_REG_CAP_BADSNR  - USS_LINK_RESULT_OFF]);
 
     if (out->status & USS_ST_BOOT)
         ESP_LOGW(TAG, "slave rebooted since last contact");

@@ -26,7 +26,12 @@ bool bq_begin(void);                 /* true if a BQ25792 (PN=001) answers */
 /* ---- ADC ---- */
 void bq_adc_enable(bool continuous); /* blocks ~150 ms for first conversion */
 void bq_adc_disable(void);
-void bq_ibat_sense(bool on);         /* EN_IBAT: off across sleep (quiescent) */
+void bq_ibat_sense(bool on);         /* EN_IBAT + SFET_PRESENT; off across sleep */
+
+/* Mean IBAT in microamps over `samples` readings spaced `spacing_ms` apart.
+ * Averaging is what makes a 1 mA-LSB ADC able to resolve a ~1 mA rail; the
+ * spacing must exceed one ADC conversion cycle or the samples are duplicates. */
+int32_t bq_ibat_avg_ua(int samples, int spacing_ms);
 
 uint16_t bq_vbat_mv(void);
 uint16_t bq_vbus_mv(void);
