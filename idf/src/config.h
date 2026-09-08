@@ -5,10 +5,19 @@
  */
 #pragma once
 
-#define FW_VERSION              "idf-0.17"
+#define FW_VERSION              "idf-0.19"
 
 /* ---- Duty cycle ---- */
-#define SAMPLE_INTERVAL_S       300     /* 5 min */
+#define SAMPLE_INTERVAL_S       300     /* 5 min.
+                                         * Measured 2026-09-08: one wake costs
+                                         * 67.1 mC = 0.0186 mAh, so 300 s costs
+                                         * 5.4 mAh/day and 900 s would cost 1.8.
+                                         * uss_vol_ml is TOTALIZED on the USS
+                                         * side, so a slower log rate would lose
+                                         * temporal resolution, not volume.
+                                         * Kept at 300 s for resolution; the
+                                         * 15.7 mAh/day sleep floor is 67% of the
+                                         * budget and independent of this. */
 #define CRITICAL_VBAT_MV        3350
 #define CRITICAL_INTERVAL_MULT  6       /* -> 30 min when critical */
 
@@ -50,6 +59,11 @@
  * ordinary timer wake. */
 #define MOTION_THRESHOLD_MG     96      /* rounded to the part's 16 mg/LSB step */
 #define MOTION_WAKE_BURST_MAX   5
+
+/* Motion wake. MEASURED 2026-09-08 to cost nothing: the shipping firmware slept
+ * at 1467.5 uA with it disabled, against 1467.1 uA with it enabled. It was
+ * briefly suspected and cleared. Left ON. */
+#define MOTION_WAKE_ENABLE      1
 
 #define USS_RETRY_STREAK        3
 #define USS_RETRY_EVERY_N_WAKES 12      /* -> once an hour at a 5 min interval */
@@ -118,16 +132,18 @@
  * once gated a capture costs ~50 uA-s, so this period is worth only ~1-2
  * mAh/day and lengthening it buys ~3% of the node budget. Change it for
  * totalizer integration accuracy, not for power. */
-/* Autonomous measurement period, seconds.
- *
- * 1 -> 10 as an EXPERIMENT (2026-09-06): the power audit's differential is
- * AUTO-running vs AUTO-stopped, so the 1665 +/- 139 uA it measures includes the
- * whole energy cost of the captures themselves, not just a static rail load.
- * The RX bias divider is 2M/2M = 0.8 uA and the other static fixes total
- * ~100 uA, so static cannot explain 1.665 mA. If the cost is the captures,
- * measuring 10x less often should take the figure toward ~170 uA. If it stays
- * put, the load is static after all and only the rail FETs can reach it. */
-#define USS_AUTO_PERIOD_S       10
+/* Autonomous measurement period, seconds. Back to 1 Hz for the 2026-09-08 soak:
+ * measured cost is 84 uC per capture (~84 uA at 1 Hz) against a ~235 uA board,
+ * and 1 Hz is what the totalizer wants. 10 s was an experiment to find where the
+ * energy went; it turned out to be the gas configuration itself (300 us capture
+ * window, multi-tone, OPA836, 5 V boost) -- the water build measures 5.4 uC on
+ * the same firmware, near TI's ~3 uC, so there is no hidden fault to chase. */
+#define USS_AUTO_PERIOD_S       1
+
+/* Consecutive 5-minute records with EVERY capture failing before the comm board
+ * power-cycles the sensor rail. 3 records is ~15 min. See the stuck abs-ToF lock
+ * note in main.c. */
+#define USS_ALLBAD_RECOVER      3
 
 /* How long to wait for STATUS.AUTO after commanding AUTO_START. The module
  * raises its AFE rails, settles them and runs one discard capture first, so

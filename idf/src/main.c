@@ -38,6 +38,7 @@
 #include "uss_link.h"   /* USS_ST_BOOT: the module resets its own counters */
 #include "i2c_bus.h"
 #include "esp_timer.h"
+#include "driver/gpio.h"
 #include "wf280a.h"
 #include "uplink.h"
 
@@ -64,8 +65,18 @@ static RTC_DATA_ATTR uint8_t  s_parked;      /* battery park mode latch */
  * module, so the subtraction is correct modulo 65536 and needs no handshake. */
 static RTC_DATA_ATTR uint16_t s_prev_cap_n;
 static RTC_DATA_ATTR uint16_t s_prev_cap_badcode;
+
+
 static RTC_DATA_ATTR uint16_t s_prev_cap_badsnr;
 static RTC_DATA_ATTR uint8_t  s_cap_seen;   /* a previous sample exists */
+/* Consecutive records in which EVERY capture failed. The module's abs-ToF search
+ * can latch onto a reflection instead of the direct echo and then TRACK it
+ * (absState=1), after which every capture returns code 135 with perfectly
+ * healthy amplitude, SNR, gain and clock. Measured on the bench 2026-09-08: AGC
+ * recalibration does not break the lock and only a power cycle does. Any reboot
+ * re-rolls that dice, so an unattended node can silently produce no flow data
+ * for the rest of a deployment. */
+static RTC_DATA_ATTR uint8_t  s_uss_allbad_streak;
 /* Set for the wake that a button press caused. A press means a person is at the
  * board asking for attention, so it overrides the USS recovery backoff: the
  * backoff exists to stop a node with no gas cell power-cycling its rail every
@@ -86,7 +97,7 @@ static RTC_DATA_ATTR uint16_t s_uss_fail_streak;
 /* Consecutive out-of-turn motion wakes, reset by any ordinary timer wake. */
 static RTC_DATA_ATTR uint8_t  s_motion_streak;
 
-#define UPLOAD_PERIOD_S (12 * 3600)
+#define UPLOAD_PERIOD_S (24 * 3600)   /* one uplink per day */
 #define UPLOAD_RETRY_S  (30 * 60)
 #define UPLOAD_RETRIES  2
 
@@ -272,6 +283,31 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
         s_prev_cap_badcode = u.cap_badcode;
         s_prev_cap_badsnr  = u.cap_badsnr;
         s_cap_seen         = 1;
+
+        /* Break a stuck abs-ToF lock by power-cycling the module.
+         *
+         * Judged on the COUNTER DELTA, not on uss_code: the single latched
+         * sample we read is biased -- it is whatever capture happened to be
+         * latest, and that is preferentially the first one after a restart, the
+         * one most likely to be bad. r->uss_cap_n is ~300 captures, so
+         * "badcode == n" really does mean every capture failed.
+         *
+         * Three consecutive records is ~15 minutes: far longer than any
+         * transient dropout, short enough that a wedged module is not a lost
+         * deployment. The rail cycle is the same recovery the silent-module path
+         * uses, and it is the only thing measured to clear this state. */
+        if (r->uss_cap_n != 0 && r->uss_cap_n != 0xFFFF &&
+            r->uss_cap_badcode >= r->uss_cap_n) {
+            if (++s_uss_allbad_streak >= USS_ALLBAD_RECOVER) {
+                s_uss_allbad_streak = 0;
+                ESP_LOGW(TAG, "every capture failing -- power-cycling the module");
+                board_sensor_power_cycle(800);
+                (void) uss_start_auto(USS_AUTO_PERIOD_S);
+                uss_ok = uss_sample(&u);
+            }
+        } else {
+            s_uss_allbad_streak = 0;
+        }
         r->uss_tof_ups_q40 = u.tof_ups_q40;
         r->uss_tof_dns_q40 = u.tof_dns_q40;
         r->sensor_ok |= SOK_USS;
@@ -458,6 +494,15 @@ void app_main(void)
 
 
 
+
+
+
+
+
+
+
+
+
     /* Raise the switched SENSOR rail (J404) BEFORE the first I2C transaction.
      *
      * This is not just about powering the ultrasonic module: an UNPOWERED board
@@ -593,6 +638,7 @@ void app_main(void)
         if (s_parked && vbat < PARK_RESUME_VBAT_MV) {
             ESP_LOGW(TAG, "parked (VBAT %u mV) -- sleeping %d s", vbat, PARK_SLEEP_S);
             bq_adc_disable();
+            bq_ibat_sense(false);   /* measured 2026-09-08: 321 uA if left on */
             s_last_sleep_s = PARK_SLEEP_S;
             board_deep_sleep(PARK_SLEEP_S);
         }
@@ -600,6 +646,7 @@ void app_main(void)
             ESP_LOGW(TAG, "entering park mode (VBAT %u mV < %d)", vbat, PARK_VBAT_MV);
             s_parked = 1;
             bq_adc_disable();
+            bq_ibat_sense(false);   /* measured 2026-09-08: 321 uA if left on */
             s_last_sleep_s = PARK_SLEEP_S;
             board_deep_sleep(PARK_SLEEP_S);
         }
@@ -698,6 +745,7 @@ void app_main(void)
         }
     }
 
+
     if (bq_ok) {
         bq_adc_disable();
         bq_ibat_sense(false);   /* EN_IBAT off across sleep (quiescent) */
@@ -713,7 +761,8 @@ void app_main(void)
      * immediately) and re-arm -- unless we are in a motion burst, in which case
      * leave it disarmed until the next ordinary timer wake. */
     (void) sc7a20_motion_fired();
-    bool arm_motion = (s_motion_streak < MOTION_WAKE_BURST_MAX);
+    bool arm_motion = MOTION_WAKE_ENABLE &&
+                      (s_motion_streak < MOTION_WAKE_BURST_MAX);
     if (arm_motion) arm_motion = sc7a20_arm_motion(MOTION_THRESHOLD_MG);
     else ESP_LOGW(TAG, "motion wakes suppressed (%u in a row)", s_motion_streak);
     board_set_motion_wake(arm_motion);
