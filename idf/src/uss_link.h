@@ -116,6 +116,25 @@
 #define USS_REG_CRC8        0x2F    /* u8  CRC8 over regs 0x04..0x2E          */
 /* -- control -- */
 #define USS_REG_CMD         0x40    /* u8  write-only, USS_CMD_*              */
+/* USSXT settling time, units of 10 us, little-endian u16. 0 = module keeps
+ * its compiled default. The module CLAMPS to 1 ms .. 400 ms: a 120 us settle
+ * hangs its capture, and these writes are NOT CRC-protected (the CRC8 covers
+ * the read block only). Written before every AUTO_START so it survives a
+ * module reboot -- the module deliberately keeps it in RAM so a bad value
+ * cannot persist. */
+/* Read-back of the settle the module ACTUALLY applied, 10 us units, u16.
+ * USS_REG_XT_SETTLE (0x44) is write-only -- outside the readable window -- so
+ * this is the only way to confirm the write landed, and it reports the value
+ * AFTER the module's 1 ms..400 ms clamp. Inside the CRC8 block (0x04..0x2E),
+ * so it arrives already integrity-checked. 0 on a module that predates it. */
+/* Count of abs-ToF latch recoveries on the module, u8, wraps. 0 = never fired
+ * (or a module predating it). Take the DIFFERENCE between reads, like the
+ * capture counters. The module re-searches after 5 consecutive bad captures
+ * instead of waiting for our 3-record rail cycle, which costs ~900 captures
+ * per event; this is how that recovery stays visible rather than silent. */
+#define USS_REG_RECOVERIES  0x1D    /* u8  abs-ToF recoveries (wraps)         */
+#define USS_REG_XT_APPLIED  0x1E    /* u16 applied settle, 10 us units        */
+#define USS_REG_XT_SETTLE   0x44    /* u16 USSXT settle, units of 10 us       */
 #define USS_REG_AUTO_PERIOD 0x42    /* u16 autonomous measurement period, s
                                      *     (future; 0 = off)                  */
 
@@ -133,6 +152,7 @@
 #define USS_ST_BUSY         0x02    /* measurement in progress                */
 #define USS_ST_ERR          0x04    /* last measurement failed to run at all
                                      * (USS init/config error; CODE has detail) */
+#define USS_ST_RECOVERED    0x10    /* module recovered an abs-ToF latch      */
 #define USS_ST_AUTO         0x08    /* autonomous totalizer running (future)  */
 #define USS_ST_BOOT         0x80    /* set from reset until the first command:
                                      * lets the master detect a slave reboot

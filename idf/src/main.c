@@ -63,6 +63,7 @@ static RTC_DATA_ATTR uint16_t s_crash_count;
 static RTC_DATA_ATTR uint8_t  s_parked;      /* battery park mode latch */
 /* Previous capture counters, for the per-record delta. Free-running u16s on the
  * module, so the subtraction is correct modulo 65536 and needs no handshake. */
+static RTC_DATA_ATTR uint8_t  s_prev_recov;
 static RTC_DATA_ATTR uint16_t s_prev_cap_n;
 static RTC_DATA_ATTR uint16_t s_prev_cap_badcode;
 
@@ -279,6 +280,9 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
         } else {
             r->uss_cap_n = r->uss_cap_badcode = r->uss_cap_badsnr = 0;
         }
+        r->uss_recov       = (uint8_t)(u.recoveries - s_prev_recov);
+        s_prev_recov       = u.recoveries;
+        r->uss_xt_x10us    = u.xt_applied_x10us;
         s_prev_cap_n       = u.cap_n;
         s_prev_cap_badcode = u.cap_badcode;
         s_prev_cap_badsnr  = u.cap_badsnr;
@@ -587,6 +591,14 @@ void app_main(void)
         s_motion_streak = 0;
     }
 
+/* Top of the repeatable measurement cycle. Everything above is one-time init
+ * and wake classification; everything below runs once per SAMPLE_INTERVAL_S.
+ *
+ * A label rather than a for(;;) purely to keep the diff honest -- wrapping the
+ * ~200 lines below in a loop would re-indent all of them for a five-line
+ * behaviour change. Only USB_STAY_AWAKE jumps back here; on battery the cycle
+ * still ends in board_deep_sleep(), which never returns. */
+uss_cycle:
     s_boot_count++;
     s_force_uss_recovery = button_wake;   /* consumed by read_sample() below */
 
@@ -774,8 +786,16 @@ void app_main(void)
      * seconds to enumerate after a wake, so the sampling log at the top of the
      * cycle is unobservable on a console that attaches mid-wake -- this recap
      * always lands. */
-    ESP_LOGI(TAG, "USS recap: st=0x%02X%s code=%u vol=%lu mL tof=%.2f/%.2f us dtof=%.4f us",
+    /* caps/bad/badsnr are the DELTAS since the previous record, i.e. the real
+     * rate over ~300 captures. Without them the recap shows a single sampled
+     * code -- one coin flip out of 300 -- which is exactly what made the
+     * code-135 rate invisible for days. Logged here as well as published so the
+     * console alone is a sufficient instrument while a cable is attached. */
+    ESP_LOGI(TAG, "USS recap: st=0x%02X%s code=%u caps=%u bad=%u badsnr=%u xt=%uus recov=%u "
+                  "vol=%lu mL tof=%.2f/%.2f us dtof=%.4f us",
              r.uss_status, (r.uss_status & 0x08) ? " AUTO" : "", r.uss_code,
+             r.uss_cap_n, r.uss_cap_badcode, r.uss_cap_badsnr,
+             (unsigned)r.uss_xt_x10us * 10u, r.uss_recov,
              (unsigned long)r.uss_vol_ml,
              r.uss_tof_ups_q40 / 1099511.627776,
              r.uss_tof_dns_q40 / 1099511.627776,
@@ -786,5 +806,98 @@ void app_main(void)
      * mAh/day at a 5 min interval, for output nobody can see unless USB is
      * attached. Pay it only when someone is actually watching. */
     if (sol.usb_present) vTaskDelay(pdMS_TO_TICKS(200));
+
+    /* USB attached: keep the console alive instead of deep sleeping.
+     *
+     * USB presence is bq_ac1_present(), i.e. the USB port specifically -- solar
+     * arrives on AC2 -- so this cannot keep a field node awake; it only ever
+     * triggers with a bench cable in. Deep sleep kills the USB-Serial/JTAG
+     * peripheral, so every 5 minute cycle dropped the console and made the
+     * board impossible to watch or talk to while plugged in.
+     *
+     * LOOP, DO NOT esp_restart(). The first version restarted, and measured
+     * 2026-09-10 that comes back as "cold boot (reset reason 3)" -- esp_restart()
+     * does NOT preserve RTC memory here. That wiped s_boot_count, s_wake_count,
+     * s_uptime_s, s_parked AND s_prev_cap_* -- the capture-counter baselines the
+     * USS bad-rate telemetry differences against. A cable left plugged in would
+     * have quietly destroyed the very counters the settle experiment reads.
+     *
+     * The WDT is fed each second rather than deleted, so a hang during the wait
+     * is still caught. */
+#if USB_STAY_AWAKE
+    if (sol.usb_present) {
+        /* Print the upload countdown: it is the only way to see that the
+         * scheduler advance below is actually happening. Without it the failure
+         * mode is silent for a full UPLOAD_PERIOD_S. */
+        ESP_LOGI(TAG, "USB attached: staying awake %lu s (no deep sleep), "
+                      "next upload in %ld s",
+                 (unsigned long)sleep_s, (long)s_next_upload_in_s);
+#if USS_POLL_STRESS_S
+        /* ACCELERATED POLL TEST.
+         *
+         * The code-135 trigger is the master's I2C poll -- proven from the
+         * record-boundary statistics (only 1 partial record in 188; latches
+         * only ever begin at a boundary; 3 of 4 episodes preceded by a record
+         * with exactly one bad capture). Polling 60x more often than the normal
+         * 300 s therefore multiplies the event rate by ~60 and turns a two-hour
+         * measurement into ten minutes.
+         *
+         * This is accelerated-life testing, not the field condition: it is only
+         * legitimate BECAUSE the trigger is known. It reports the counter
+         * deltas per poll, so a poll that corrupts a capture shows up directly
+         * as bad>0 rather than waiting for a latch. */
+        {
+            uss_result_t su;
+            uint16_t pn = 0, pb = 0;
+            bool have = false;
+            uint32_t polls = 0, hits = 0;
+            for (uint32_t i = 0; i < sleep_s; i += USS_POLL_STRESS_S) {
+                for (uint32_t j = 0; j < USS_POLL_STRESS_S; j++) {
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    esp_task_wdt_reset();
+                }
+                if (!uss_sample(&su)) continue;
+                polls++;
+                if (have) {
+                    uint16_t dn = (uint16_t)(su.cap_n - pn);
+                    uint16_t db = (uint16_t)(su.cap_badcode - pb);
+                    if (dn && dn < 1000) {
+                        if (db) hits++;
+                        ESP_LOGW(TAG, "stress poll %lu: caps=%u bad=%u  (hits %lu/%lu)",
+                                 (unsigned long)polls, dn, db,
+                                 (unsigned long)hits, (unsigned long)polls);
+                    }
+                }
+                pn = su.cap_n; pb = su.cap_badcode; have = true;
+            }
+            ESP_LOGW(TAG, "stress window done: %lu polls, %lu with bad captures",
+                     (unsigned long)polls, (unsigned long)hits);
+        }
+#else
+        for (uint32_t i = 0; i < sleep_s; i++) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            esp_task_wdt_reset();
+        }
+#endif
+        /* Do what a timer wake would have done to the schedulers. They are
+         * advanced up at the wake-classification block, which `goto uss_cycle`
+         * jumps back PAST -- so without this, s_next_upload_in_s never counts
+         * down and the board stops uploading entirely once the first upload
+         * sets it to UPLOAD_PERIOD_S. That fails only while a cable is
+         * attached, i.e. exactly when someone is watching the console rather
+         * than the telemetry, so it would have gone unnoticed. */
+        s_uptime_s         += sleep_s;
+        s_next_upload_in_s -= (int32_t)sleep_s;
+        s_wake_count++;
+        /* Clear the one-shot wake flags HERE, at the end of the lap -- not at
+         * the top of the cycle. Clearing button_wake early broke the button
+         * entirely: it is read further down for power_audit() and for
+         * `s_next_upload_in_s = 0` (upload now), so a press did nothing at all.
+         * Regression introduced with USB_STAY_AWAKE, found 2026-09-11. */
+        button_wake = false;
+        motion_wake = false;
+        goto uss_cycle;                     /* RTC state intact */
+    }
+#endif
     board_deep_sleep(sleep_s);
 }

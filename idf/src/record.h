@@ -102,10 +102,16 @@ typedef struct __attribute__((packed)) {
      * one coin flip out of 300. These make the real rate visible per record.
      * 0xFFFF means "record written before this field existed" -- the ring is
      * 0xFF-filled -- and must not be published as a count. */
+    /* Taken from rsvd[] (22 -> 20) to keep LogRecord at exactly 128 bytes --
+     * the flash ring geometry asserts on it. 0 = module predates the
+     * read-back register, 0xFFFF = record written before this field. */
+    uint8_t  uss_recov;      /* abs-ToF recoveries this record (delta) */
+    uint8_t  uss_rsv1;       /* pad, keeps the 128-byte record aligned */
+    uint16_t uss_xt_x10us;   /* settle the USS applied, 10 us units */
     uint16_t uss_cap_n;
     uint16_t uss_cap_badcode;
     uint16_t uss_cap_badsnr;
-    uint8_t  rsvd[22];     /* spare for future fields (0xFF) */
+    uint8_t  rsvd[18];     /* spare for future fields (0xFF) */
     uint16_t crc;          /* CRC16-CCITT over bytes [0 .. offsetof(crc)-1] */
 } LogRecord;
 

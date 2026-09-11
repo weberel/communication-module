@@ -55,6 +55,7 @@ static uint32_t le32(const uint8_t *p)
 bool uss_start_auto(uint16_t period_s)
 {
     uint8_t lo = (uint8_t)(period_s & 0xFF), hi = (uint8_t)(period_s >> 8);
+    uint16_t settle_x10 = USS_XT_SETTLE_X10US;
     uint8_t st = 0;
     if (!s_dev) {
         eco_i2c_add_tracked(&s_dev, USS_LINK_ADDR7);
@@ -70,6 +71,23 @@ bool uss_start_auto(uint16_t period_s)
 
     if (!wr(USS_REG_AUTO_PERIOD, lo))     return false;
     if (!wr(USS_REG_AUTO_PERIOD + 1, hi)) return false;
+
+    /* USSXT settle, written BEFORE the command because AUTO_START is what
+     * applies it (it sets the prime tier, runs the discard, then drops to the
+     * operational tier). Writing 0 leaves the module's compiled default, so a
+     * module that predates the register is unaffected -- it simply ignores a
+     * write to an address it does not decode.
+     *
+     * This is the lever for the code-135 investigation: the settle is the
+     * prime suspect for the regression that began 2026-09-05, and before this
+     * register the only way to change it was a reflash, which is impossible on
+     * a deployed node. Sweep it here, read the rate back from
+     * USS_REG_CAP_BADCODE. */
+    if (settle_x10) {
+        if (!wr(USS_REG_XT_SETTLE,     (uint8_t)(settle_x10 & 0xFF))) return false;
+        if (!wr(USS_REG_XT_SETTLE + 1, (uint8_t)(settle_x10 >> 8)))   return false;
+    }
+
     if (!wr(USS_REG_CMD, USS_CMD_AUTO_START)) return false;
 
     /* WAIT for STATUS.AUTO before returning.
@@ -190,6 +208,8 @@ bool uss_sample(uss_result_t *out)
     out->vol_ml    = le32(&blk[USS_REG_VOL_ML - USS_LINK_RESULT_OFF]);
     out->tof_ups_q40 = le32(&blk[USS_REG_TOF_UPS_Q40 - USS_LINK_RESULT_OFF]);
     out->tof_dns_q40 = le32(&blk[USS_REG_TOF_DNS_Q40 - USS_LINK_RESULT_OFF]);
+    out->recoveries       = blk[USS_REG_RECOVERIES - USS_LINK_RESULT_OFF];
+    out->xt_applied_x10us = le16(&blk[USS_REG_XT_APPLIED - USS_LINK_RESULT_OFF]);
     out->cap_n       = le16(&blk[USS_REG_CAP_N       - USS_LINK_RESULT_OFF]);
     out->cap_badcode = le16(&blk[USS_REG_CAP_BADCODE - USS_LINK_RESULT_OFF]);
     out->cap_badsnr  = le16(&blk[USS_REG_CAP_BADSNR  - USS_LINK_RESULT_OFF]);

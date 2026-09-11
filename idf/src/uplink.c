@@ -217,8 +217,10 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
          * averages a sentinel against a real measurement. */
         if (r->uss_cap_n != 0 && r->uss_cap_n != 0xFFFF && (size_t)n < cap) {
             n += snprintf(out + n, cap - n,
-                ",\"uss_cap_n\":%u,\"uss_cap_badcode\":%u,\"uss_cap_badsnr\":%u",
-                r->uss_cap_n, r->uss_cap_badcode, r->uss_cap_badsnr);
+                ",\"uss_cap_n\":%u,\"uss_cap_badcode\":%u,\"uss_cap_badsnr\":%u"
+                ",\"uss_xt_us\":%u,\"uss_recov\":%u",
+                r->uss_cap_n, r->uss_cap_badcode, r->uss_cap_badsnr,
+                (unsigned)r->uss_xt_x10us * 10u, r->uss_recov);
         }
     }
 

@@ -30,6 +30,8 @@ typedef struct {
      * difference between consecutive reads. All three zero = a module that
      * predates them. These are the only way to see the true failure rate: we
      * sample one capture per 5 min while the module runs ~300. */
+    uint8_t  recoveries;         /* abs-ToF latch recoveries, wraps */
+    uint16_t xt_applied_x10us;   /* settle the module applied, 10 us units */
     uint16_t cap_n;
     uint16_t cap_badcode;
     uint16_t cap_badsnr;
