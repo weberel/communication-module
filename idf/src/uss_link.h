@@ -114,6 +114,33 @@
                                      * the silent failures (wraps)            */
 /* 0x2E reserved (0x00) */
 #define USS_REG_CRC8        0x2F    /* u8  CRC8 over regs 0x04..0x2E          */
+
+/* -- LINK HEALTH block, ADDED 2026-09-11. Additive, no PROTO bump --
+ * Offsets MUST match the module's copy in Ultrasonic/Firmware/fw/uss_link.h.
+ *
+ * 0x30..0x3F was already inside the readable window and unused. Own CRC at
+ * 0x3F; the result block's CRC at 0x2F is untouched.
+ *
+ * This exists because uss_sample() returning false collapses at least three
+ * different failures into one bool, and the only response is an 800 ms rail
+ * power-cycle that reboots the module and loses the volume total. STARTS tells
+ * the two halves apart:
+ *   delta(STARTS) ~ transactions issued -> the bus reached the slave
+ *   delta(STARTS) ~ 0                   -> the master never got on the bus
+ * RSTCAUSE answers whether the module's own watchdog fired, which ST_BOOT
+ * cannot: it says "I rebooted", never why.                                   */
+#define USS_REG_LH_RSTCAUSE 0x30    /* u16 SYSRSTIV latched at boot           */
+#define USS_REG_LH_STARTS   0x32    /* u16 I2C address matches (wraps)        */
+#define USS_REG_LH_STOPS    0x34    /* u16 STOP conditions seen (wraps)       */
+#define USS_REG_LH_RXBYTES  0x36    /* u16 bytes the master wrote (wraps)     */
+#define USS_REG_LH_TXBYTES  0x38    /* u16 bytes the master read (wraps)      */
+#define USS_REG_LH_CMDS     0x3A    /* u16 commands accepted (wraps)          */
+#define USS_REG_LH_UPTIME_S 0x3C    /* u16 seconds since boot, saturates      */
+#define USS_REG_LH_LASTCMD  0x3E    /* u8  last command byte received         */
+#define USS_REG_LH_CRC8     0x3F    /* u8  CRC8 over regs 0x30..0x3E          */
+#define USS_LINK_HEALTH_OFF 0x30
+#define USS_LINK_HEALTH_LEN 16      /* 0x30..0x3F inclusive, CRC included     */
+
 /* -- control -- */
 #define USS_REG_CMD         0x40    /* u8  write-only, USS_CMD_*              */
 /* USSXT settling time, units of 10 us, little-endian u16. 0 = module keeps

@@ -62,6 +62,47 @@ bool uss_start_auto(uint16_t period_s);
  * Used by the power audit as a clean, bus-preserving load step. */
 bool uss_stop_auto(void);
 
+/* ---- link diagnostics (USS_REG_LH_*, added 2026-09-11) ------------------- */
+
+/* The module's own view of the bus, read from its 0x30..0x3F block. Counters
+ * are free-running u16 and WRAP; difference consecutive reads. */
+typedef struct {
+    uint16_t rst_cause;   /* SYSRSTIV latched at the module's boot */
+    uint16_t starts;      /* I2C address matches the module actually saw */
+    uint16_t stops;
+    uint16_t rx_bytes;    /* bytes we wrote to it */
+    uint16_t tx_bytes;    /* bytes it handed back */
+    uint16_t cmds;
+    uint16_t uptime_s;
+    uint8_t  last_cmd;
+} uss_health_t;
+
+/* Read + CRC-check the link-health block. False means absent, corrupt, or a
+ * module built before the block existed (it answers all-zero, which fails the
+ * CRC -- deliberately, so "not implemented" cannot be mistaken for "healthy"). */
+bool uss_read_health(uss_health_t *out);
+
+/* Per-failure-class tally from uss_link_probe(). uss_sample() collapses all of
+ * these into one bool, which is why an evening could be spent arguing whether
+ * the bus or the module was at fault. */
+typedef struct {
+    uint32_t attempts;
+    uint32_t ok;
+    uint32_t err_tx;     /* the address/register write itself failed */
+    uint32_t err_rx;     /* addressed fine, the data phase failed */
+    uint32_t err_crc;    /* block arrived, CRC wrong -> corruption in flight */
+    uint32_t err_id;     /* WHO_AM_I not 0x5A -> we read something else entirely */
+    uint32_t err_stale;  /* CRC-valid but seq never advanced -> module stopped */
+    uint16_t slave_starts_delta;  /* address matches the MODULE counted */
+} uss_linkstat_t;
+
+/* Hammer the link n times and classify every failure, then read the module's
+ * own address-match counter so the two ends can be compared:
+ *   slave_starts_delta ~ n  -> transactions arrived; fault is downstream
+ *   slave_starts_delta ~ 0  -> we never got on the bus; fault is the master
+ * Pure measurement: changes no module state and issues no commands. */
+void uss_link_probe(uint32_t n, uss_linkstat_t *out);
+
 #ifdef __cplusplus
 }
 #endif

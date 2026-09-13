@@ -23,6 +23,7 @@
 #include "esp_system.h"
 #include "esp_task_wdt.h"
 #include "esp_pm.h"
+#include "esp_ota_ops.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -64,6 +65,8 @@ static RTC_DATA_ATTR uint8_t  s_parked;      /* battery park mode latch */
 /* Previous capture counters, for the per-record delta. Free-running u16s on the
  * module, so the subtraction is correct modulo 65536 and needs no handshake. */
 static RTC_DATA_ATTR uint8_t  s_prev_recov;
+static RTC_DATA_ATTR uint16_t s_prev_lh_starts;
+static RTC_DATA_ATTR bool     s_lh_seen;
 static RTC_DATA_ATTR uint16_t s_prev_cap_n;
 static RTC_DATA_ATTR uint16_t s_prev_cap_badcode;
 
@@ -214,10 +217,21 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
      * fleet unit without a gas cell sits in. After USS_RETRY_STREAK failures,
      * attempt it only once an hour; a module that comes back is picked up
      * within that hour and costs nothing in between. */
+    /* NEVER cut the rail on the first failure. s_uss_fail_streak is updated
+     * below, so here it counts PRIOR consecutive failures -- it was 0 on a
+     * first miss, 0 < USS_RETRY_STREAK was true, and the rail went down.
+     *
+     * Measured overnight 2026-09-12: 15 read failures, every one ISOLATED (the
+     * closest pair was two wakes apart), and each produced a power cycle, an
+     * SVSHIFG reset and a forced abs-ToF re-lock. Not one of them needed it.
+     * Requiring a second consecutive failure costs a deployed node 5 extra
+     * minutes before recovering a genuinely dead module, and buys back every
+     * one of those reboots -- each of which also zeroes the volume totalizer. */
     bool try_recovery = uss_ok ? false
-                      : (s_uss_fail_streak < USS_RETRY_STREAK) ||
-                        ((s_wake_count % USS_RETRY_EVERY_N_WAKES) == 0) ||
-                        s_force_uss_recovery;
+                      : s_force_uss_recovery ||
+                        (s_uss_fail_streak >= USS_RECOVER_AFTER_FAILS &&
+                         ((s_uss_fail_streak < USS_RETRY_STREAK) ||
+                          ((s_wake_count % USS_RETRY_EVERY_N_WAKES) == 0)));
     if (!uss_ok && !try_recovery) {
         ESP_LOGW(TAG, "USS silent (%u wakes) -- recovery backed off",
                  s_uss_fail_streak);
@@ -283,6 +297,32 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
         r->uss_recov       = (uint8_t)(u.recoveries - s_prev_recov);
         s_prev_recov       = u.recoveries;
         r->uss_xt_x10us    = u.xt_applied_x10us;
+
+        /* Link health into the record. Console-only diagnostics are useless
+         * here: the module drops off the bus on a battery-powered node with
+         * light sleep active, and attaching a cable to watch sets
+         * light_sleep_enable = !usb_present, i.e. it stops reproducing the
+         * condition. These two fields are the same evidence, delivered by
+         * telemetry instead. */
+        {
+            uss_health_t h;
+            if (uss_read_health(&h)) {
+                uint16_t ds = (uint16_t)(h.starts - s_prev_lh_starts);
+                r->uss_rst_cause = h.rst_cause;
+                /* Same wrap guard the capture counters need: the module's
+                 * counters restart at zero on its own reset, and BOOT is
+                 * already cleared by then, so a raw subtraction across that
+                 * boundary produces a huge meaningless number. */
+                r->uss_lh_starts = (s_lh_seen && ds <= 4096u) ? ds : 0;
+                s_prev_lh_starts = h.starts;
+                s_lh_seen        = true;
+            } else {
+                /* Unreadable is itself information: either the module predates
+                 * the block, or it did not answer this poll at all. */
+                r->uss_rst_cause = 0;
+                r->uss_lh_starts = 0;
+            }
+        }
         s_prev_cap_n       = u.cap_n;
         s_prev_cap_badcode = u.cap_badcode;
         s_prev_cap_badsnr  = u.cap_badsnr;
@@ -494,6 +534,31 @@ void app_main(void)
     if (esp_task_wdt_reconfigure(&wdt_cfg) != ESP_OK)
         esp_task_wdt_init(&wdt_cfg);
     esp_task_wdt_add(NULL);
+
+    /* MARK THIS IMAGE GOOD, or a single panic silently reverts the board.
+     *
+     * partitions.csv has ota_0 and ota_1 and NO factory slot, and
+     * CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y. An app started from a slot in
+     * PENDING_VERIFY that never marks itself valid is rolled back on the next
+     * boot. Nothing here ever called this, so when a watchdog panic loop hit on
+     * 2026-09-11 the bootloader quietly reverted to ota_1 -- a February 2025
+     * Arduino image -- and every serial flash afterwards wrote ota_0, a slot
+     * the bootloader was no longer booting. Hours went into "LTE is broken" and
+     * "the button does not work" before the Arduino-style STA.cpp log lines
+     * gave it away: the firmware under test had not been running at all.
+     *
+     * Called after the watchdog is armed but before any hardware work, so a
+     * hang later still reboots -- it just no longer loses the image. */
+    {
+        const esp_partition_t *run = esp_ota_get_running_partition();
+        esp_ota_img_states_t st;
+        if (run && esp_ota_get_state_partition(run, &st) == ESP_OK &&
+            st == ESP_OTA_IMG_PENDING_VERIFY) {
+            esp_ota_mark_app_valid_cancel_rollback();
+            ESP_LOGI(TAG, "OTA image marked valid (was pending verify)");
+        }
+    }
+
     board_init();
 
 
@@ -644,6 +709,52 @@ uss_cycle:
     else
         ESP_LOGI(TAG, "PM: 40-80 MHz, light sleep %s",
                  usb_present ? "OFF (USB attached)" : "on");
+
+#if USS_LINK_TEST_N
+    /* LINK CHARACTERISATION. Diagnostic build only -- see config.h.
+     *
+     * Deliberately overrides the light-sleep policy set immediately above,
+     * because that policy is itself the observer effect: light sleep is
+     * disabled whenever USB is attached, so the only way to watch the console
+     * is to stop reproducing the condition under test. Here the arms set it
+     * explicitly, so the field condition can be observed with a cable in. */
+    {
+        ESP_LOGW(TAG, "=== USS link test: %d transactions x %d interleaved blocks ===",
+                 USS_LINK_TEST_N, USS_LINK_TEST_BLOCKS);
+        ESP_LOGW(TAG, "arm  lightsleep   ok   tx_err  rx_err  crc  id  stale | slave_starts");
+        for (int blk = 0; blk < USS_LINK_TEST_BLOCKS; blk++) {
+            for (int arm = 0; arm < 2; arm++) {
+                uss_linkstat_t s;
+                esp_pm_config_t p = { .max_freq_mhz = 80, .min_freq_mhz = 40,
+                                      .light_sleep_enable = (arm == 1) };
+                esp_pm_configure(&p);
+                vTaskDelay(pdMS_TO_TICKS(300));      /* let the new policy settle */
+                esp_task_wdt_reset();
+                uss_link_probe(USS_LINK_TEST_N, &s);
+                esp_task_wdt_reset();
+                ESP_LOGW(TAG, "%d/%d  %-10s %4lu   %4lu    %4lu  %3lu %3lu  %4lu | %u of %d",
+                         blk + 1, USS_LINK_TEST_BLOCKS, (arm == 1) ? "ON" : "off",
+                         (unsigned long)s.ok, (unsigned long)s.err_tx,
+                         (unsigned long)s.err_rx, (unsigned long)s.err_crc,
+                         (unsigned long)s.err_id, (unsigned long)s.err_stale,
+                         s.slave_starts_delta, USS_LINK_TEST_N);
+            }
+        }
+        {
+            uss_health_t h;
+            if (uss_read_health(&h))
+                ESP_LOGW(TAG, "module health: rst_cause=0x%04X uptime=%us "
+                              "starts=%u stops=%u rx=%u tx=%u cmds=%u lastcmd=0x%02X",
+                         h.rst_cause, h.uptime_s, h.starts, h.stops,
+                         h.rx_bytes, h.tx_bytes, h.cmds, h.last_cmd);
+            else
+                ESP_LOGW(TAG, "module health block unreadable "
+                              "(absent, corrupt, or firmware predates it)");
+        }
+        ESP_LOGW(TAG, "=== USS link test done ===");
+        esp_pm_configure(&pm);                   /* restore the normal policy */
+    }
+#endif
 
     bool input_present = bq_ok && (usb_present || bq_ac2_present());
     if (bq_ok && !input_present) {
@@ -832,6 +943,10 @@ uss_cycle:
         ESP_LOGI(TAG, "USB attached: staying awake %lu s (no deep sleep), "
                       "next upload in %ld s",
                  (unsigned long)sleep_s, (long)s_next_upload_in_s);
+        /* How much of sleep_s was actually spent, and whether the button ended
+         * the wait early. Both are consumed after the #endif. */
+        uint32_t waited  = sleep_s;
+        bool     pressed = false;
 #if USS_POLL_STRESS_S
         /* ACCELERATED POLL TEST.
          *
@@ -874,10 +989,29 @@ uss_cycle:
                      (unsigned long)polls, (unsigned long)hits);
         }
 #else
-        for (uint32_t i = 0; i < sleep_s; i++) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
+        /* Poll the button, do not just sleep.
+         *
+         * board_woke_from_button() reads esp_sleep_get_wakeup_cause(), which is
+         * only ever set by a deep sleep -- and this branch exists precisely to
+         * avoid deep sleep. So with a cable attached NO press could ever be
+         * seen, whatever the flag handling below did. The 2026-09-11 fix (clear
+         * the one-shot flags at the end of the lap) repaired a genuine latch
+         * bug but not this: it made a press that was never detected survive
+         * correctly. Hence the level poll.
+         *
+         * 50 ms granularity, not 1 s: at 1 s the button has to be held for up
+         * to a full second to register, which is indistinguishable from
+         * "the button does nothing". */
+        for (waited = 0; waited < sleep_s && !pressed; waited++) {
+            for (int k = 0; k < 20 && !pressed; k++) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                pressed = board_button_pressed();
+            }
             esp_task_wdt_reset();
         }
+        if (pressed)
+            ESP_LOGI(TAG, "button pressed while awake (after %lu s) -- "
+                          "sample + upload now", (unsigned long)waited);
 #endif
         /* Do what a timer wake would have done to the schedulers. They are
          * advanced up at the wake-classification block, which `goto uss_cycle`
@@ -886,15 +1020,19 @@ uss_cycle:
          * sets it to UPLOAD_PERIOD_S. That fails only while a cable is
          * attached, i.e. exactly when someone is watching the console rather
          * than the telemetry, so it would have gone unnoticed. */
-        s_uptime_s         += sleep_s;
-        s_next_upload_in_s -= (int32_t)sleep_s;
+        s_uptime_s         += waited;
+        s_next_upload_in_s -= (int32_t)waited;
         s_wake_count++;
-        /* Clear the one-shot wake flags HERE, at the end of the lap -- not at
-         * the top of the cycle. Clearing button_wake early broke the button
-         * entirely: it is read further down for power_audit() and for
-         * `s_next_upload_in_s = 0` (upload now), so a press did nothing at all.
-         * Regression introduced with USB_STAY_AWAKE, found 2026-09-11. */
-        button_wake = false;
+        /* Set the one-shot wake flags HERE, at the end of the lap -- not at the
+         * top of the cycle. They are read further down for power_audit() and
+         * for `s_next_upload_in_s = 0` (upload now), so clearing them early
+         * made a press do nothing even once it WAS detected.
+         *
+         * Two separate bugs, both introduced with USB_STAY_AWAKE and both found
+         * 2026-09-11: this ordering one, and -- the reason a press still did
+         * nothing after it was fixed -- that no press was ever detected in the
+         * first place, because there is no deep sleep here to wake from. */
+        button_wake = pressed;              /* a press ends the wait, not the flag */
         motion_wake = false;
         goto uss_cycle;                     /* RTC state intact */
     }

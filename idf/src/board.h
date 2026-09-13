@@ -73,6 +73,10 @@ void board_deep_sleep(uint32_t seconds);
 bool board_woke_from_timer(void);
 bool board_woke_from_button(void);
 
+/* Live button level (pressed == QON low). Needed only while the board stays
+ * awake, where no EXT1 wake ever happens. */
+bool board_button_pressed(void);
+
 #ifdef __cplusplus
 }
 #endif

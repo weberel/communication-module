@@ -131,6 +131,17 @@ bool board_woke_from_button(void)
     return (esp_sleep_get_ext1_wakeup_status() & (1ULL << ECO_PIN_QON)) != 0;
 }
 
+/* Live level of the button, for the USB_STAY_AWAKE window where there is no
+ * deep sleep to wake FROM and so board_woke_from_button() can never be true.
+ * QON has an external pull-up and the button pulls it down, so pressed == low.
+ * Two reads 5 ms apart reject the odd glitch without a real debounce. */
+bool board_button_pressed(void)
+{
+    if (gpio_get_level(ECO_PIN_QON) != 0) return false;
+    vTaskDelay(pdMS_TO_TICKS(5));
+    return gpio_get_level(ECO_PIN_QON) == 0;
+}
+
 bool board_woke_from_motion(void)
 {
     if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT1) return false;

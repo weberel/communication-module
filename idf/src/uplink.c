@@ -222,6 +222,17 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
                 r->uss_cap_n, r->uss_cap_badcode, r->uss_cap_badsnr,
                 (unsigned)r->uss_xt_x10us * 10u, r->uss_recov);
         }
+
+        /* Link health, published SEPARATELY and deliberately not inside the
+         * gate above. A module that rebooted reports cap_n = 0, so folding
+         * these into that block would suppress them in exactly the records
+         * where they matter most -- the reboots are the thing under
+         * investigation. 0xFFFF is the pre-field sentinel and stays out. */
+        if (r->uss_rst_cause != 0xFFFF && (size_t)n < cap) {
+            n += snprintf(out + n, cap - n,
+                ",\"uss_rst_cause\":%u,\"uss_lh_starts\":%u",
+                r->uss_rst_cause, r->uss_lh_starts);
+        }
     }
 
     /* WF280A raw counts. Re-enabled 2026-09-05: the part answers reliably, and

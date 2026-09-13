@@ -111,7 +111,28 @@ typedef struct __attribute__((packed)) {
     uint16_t uss_cap_n;
     uint16_t uss_cap_badcode;
     uint16_t uss_cap_badsnr;
-    uint8_t  rsvd[18];     /* spare for future fields (0xFF) */
+    /* Link health, taken from rsvd[] (18 -> 14) 2026-09-11. Same 128-byte
+     * budget; the flash ring geometry asserts on it.
+     *
+     * uss_rst_cause is the module's SYSRSTIV, latched once at ITS boot. This is
+     * the field answer to a question the console cannot reach: the module has a
+     * mandatory watchdog, so when it hangs it silently resets, and until now the
+     * master could only ever learn ST_BOOT -- "I rebooted", never why. A
+     * watchdog cause here says the module wedged; a power-on cause says the comm
+     * board cut its rail.
+     *
+     * uss_lh_starts is the module's own count of I2C address matches, delta'd
+     * per record like the capture counters. Against the transactions we issued
+     * it separates "the bus never reached the module" from "it was addressed and
+     * failed downstream" -- the distinction that cost an evening of arguing both
+     * sides on 2026-09-11.
+     *
+     * 0 = module predates the link-health block; 0xFFFF = record written before
+     * these fields existed (the ring is 0xFF-filled). Neither may be published
+     * as a real count. */
+    uint16_t uss_rst_cause;  /* module SYSRSTIV latched at its boot */
+    uint16_t uss_lh_starts;  /* module I2C address matches this record (delta) */
+    uint8_t  rsvd[14];     /* spare for future fields (0xFF) */
     uint16_t crc;          /* CRC16-CCITT over bytes [0 .. offsetof(crc)-1] */
 } LogRecord;
 

@@ -197,5 +197,40 @@
  * ~700 ms is normal; 3 s is the give-up point. */
 #define USS_AUTO_START_TIMEOUT_MS  3000
 
-#define USS_MEAS_TIMEOUT_MS     3000
+/* Raised 3000 -> 8000 (2026-09-12). Eleven records in the overnight export
+ * consumed the FULL 3 s and still succeeded, i.e. they were grazing the limit;
+ * fifteen more tipped over it. A timeout is now cheap (main.c skips the sample
+ * instead of cutting the rail), so buy the margin. */
+#define USS_MEAS_TIMEOUT_MS     8000
 #define USS_POLL_MS             25
+
+/* ---- link characterisation test (2026-09-11) -----------------------------
+ * Diagnostic only. Set USS_LINK_TEST_N to 0 for normal operation.
+ *
+ * Runs at the top of a wake, BEFORE the normal cycle, and classifies every
+ * link failure by kind instead of collapsing them into uss_sample()'s single
+ * bool. It alternates light sleep off/on between blocks because dynamic
+ * frequency scaling and tickless idle were enabled on 2026-09-05 -- the modem
+ * was given an ESP_PM_NO_LIGHT_SLEEP lock for exactly this reason and the I2C
+ * bus was not -- and because the USS dropping off the bus began somewhere after
+ * 2026-09-02, having not happened once in the preceding 18 days.
+ *
+ * Blocks are INTERLEAVED (A,B,A,B,...) rather than run as two long halves. A
+ * monotone sweep on this rig has already produced one false result: a settle
+ * "dose-response" on 2026-09-10 that turned out to be warm-up drift, and cost
+ * a day before an interleaved A/B showed both arms identical. */
+#define USS_LINK_TEST_N         0       /* 0 = off; the console A/B needs a stable cable */
+#define USS_LINK_TEST_BLOCKS    3       /* interleaved A/B blocks */
+
+/* Per-transaction retry on the USS link (2026-09-11). One failed transfer used
+ * to become "USS silent", whose only remedy is an 800 ms rail power-cycle that
+ * reboots the module and zeroes its volume totalizer -- a reboot and a day's
+ * volume for one glitch on a 100 kHz bus. */
+#define USS_XFER_RETRIES        3
+#define USS_XFER_RETRY_MS       5
+
+/* Prior consecutive USS read failures required before the rail is cut.
+ * 0 = the old behaviour (recover on the first miss), which produced 17 reboots
+ * from 15 isolated failures overnight 2026-09-12 -- every reboot forcing a
+ * fresh abs-ToF search and zeroing the volume totalizer. */
+#define USS_RECOVER_AFTER_FAILS 1

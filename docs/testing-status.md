@@ -166,6 +166,15 @@ I2C, logs a record and uploads it. Measured, not inferred:
 
 ### Bench gotchas for whoever picks this up
 
+* **`USB_STAY_AWAKE` changes how the button is read.** With a cable attached
+  the board never deep-sleeps, so `esp_sleep_get_wakeup_cause()` is stale and
+  `board_woke_from_button()` can never be true -- a press is invisible no
+  matter how the wake flags are handled. `main.c` therefore polls
+  `board_button_pressed()` (QON level, active low) every 50 ms through the wait
+  window and ends the wait early. On battery nothing changed: EXT1 still wakes
+  the chip. Two separate bugs bit here on 2026-09-11 -- the flags were also
+  being cleared before the code that reads them -- and fixing only the first
+  left the button just as dead, so **test a press with the cable in AND out.**
 * **The ultrasonic board needs a power cycle after flashing.** SBW flashing
   succeeds while the CPU never starts. On the node its rail comes from this
   board, so it only bites on the bench.
