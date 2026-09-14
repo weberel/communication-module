@@ -98,31 +98,13 @@ void bq_ibat_sense(bool on)
     /* SFET_PRESENT (bit 7) alongside EN_IBAT (bit 5). Discharge current leaves
      * the pack through the external ship FET Q204, and the part only senses
      * that path when it is told the FET is fitted -- without it the IBAT ADC
-     * reports charge current normally and discharge as a flat zero, which is
-     * exactly what 22 days of telemetry show (496 of 562 battery-only samples
-     * read 0 mA while the node was demonstrably drawing tens of mA). The
-     * Arduino driver set this bit; the IDF port dropped it. docs/power-states.md
-     * also requires it before any SDRV_CTRL action. */
+     * reports charge current normally and discharge as a FLAT ZERO. That is
+     * exactly what the telemetry shows: ibat_ma read 0.0 on every single
+     * battery-only record while the node was demonstrably drawing tens of mA.
+     * The Arduino driver set this bit; the IDF port dropped it. Leave SFET
+     * PRESENT set when disabling IBAT sense -- docs/power-states.md requires it
+     * before any SDRV_CTRL action. */
     set_bits(REG_CHG_CTRL5, on ? 0xA0 : 0x80, on ? 0x00 : 0x20);
-}
-
-/* Mean IBAT over `samples` conversions, in microamps.
- *
- * The ADC quantises at 1 mA, which alone cannot resolve a ~1 mA sensor rail
- * against a node drawing tens of mA. Averaging recovers it: the ESP's own
- * activity dithers the quantiser, so the mean carries sub-LSB information that
- * any single reading throws away. Samples must be spaced by at least one
- * conversion cycle -- reading faster just returns the same register contents
- * repeatedly and averaging duplicates buys nothing. */
-int32_t bq_ibat_avg_ua(int samples, int spacing_ms)
-{
-    if (samples < 1) samples = 1;
-    int64_t acc = 0;
-    for (int i = 0; i < samples; i++) {
-        vTaskDelay(pdMS_TO_TICKS(spacing_ms));
-        acc += (int64_t) bq_ibat_ma() * 1000;
-    }
-    return (int32_t) (acc / samples);
 }
 
 uint16_t bq_vbat_mv(void) { return rd16(REG_VBAT_ADC); }

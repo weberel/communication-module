@@ -21,13 +21,12 @@
 #include "mqtt_client.h"
 #include "driver/gpio.h"
 #include "esp_task_wdt.h"
-#include "esp_pm.h"
+#include "esp_pm.h"   /* reproduction experiment 2026-09-14 */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 
 #include "board.h"
-#include "bq25792.h"
 #include "secrets.h"
 
 static const char *TAG = "uplink";
@@ -48,7 +47,7 @@ extern const char isrg_root_pem[];
  * publish, comfortably under what made ThingsBoard Cloud drop the connection
  * (that was ~320, at 40 datapoints x 8). Larger batches drain a backlog in
  * fewer round trips, which matters over a slow cellular link. */
-#define BATCH_RECORDS        4       /* starting batch; drain() shrinks on failure */
+#define BATCH_RECORDS        8
 #define BATCH_GAP_MS         400     /* ThingsBoard Cloud dislikes bursts */
 
 #define CLOCK_MIN 1767225600L        /* 2026-01-01 */
@@ -93,12 +92,6 @@ static bool mqtt_up(void)
         .credentials.username = TB_ACCESS_TOKEN,
         .network.timeout_ms = 15000,
         .session.keepalive = 60,
-        /* esp-mqtt defaults to a 1024-byte buffer. A full telemetry batch is
-         * ~1.1 kB per record, so anything but a one-record batch overran it.
-         * That is why the drain stalled at 132 pending on 2026-09-05 while the
-         * short status payload kept getting through in the same session. */
-        .buffer.size = 4096,
-        .buffer.out_size = 12288,
     };
     s_mqtt = esp_mqtt_client_init(&cfg);
     if (!s_mqtt) return false;
@@ -151,23 +144,14 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
      *
      * Dropped and why:
      *   bat_mw                 = vbat * ibat, derivable
-     *   vsys_mv, vreg_mv,
-     *   vindpm_mv              charger internals; post-mortem, not decisions
-     * RESTORED 2026-09-04 (the trim went one key too far):
-     *   vac2_mv                without it there is no way to tell "no panel
-     *                          voltage" from "panel fine, charger refusing" --
-     *                          the exact question that could not be answered
-     *                          remotely during the 2026-09 discharge test
-     *   tdie_c, ts_stat        the two JEITA channels: they distinguish
-     *                          "charging stopped because the CELL was hot"
-     *                          (ts_stat) from "because the CHARGER was hot"
-     *                          (tdie_c). Without them both look identical from
-     *                          a dashboard: current fell, nobody knows why.
+     *   vac2_mv, vsys_mv,
+     *   vreg_mv, vindpm_mv     charger internals; post-mortem, not decisions
      *   fault0, fault1         almost always 0; the record keeps them
      *   weather_good, eco_chg  derived heuristics, recomputable from harvest
      *   light_ch1              IR channel; ch0 is the one that means anything
      *   press_mbar             DUPLICATE of p_gas_hpa (same MS5837 reading)
-     *   ts_pct                 raw NTC ratio; ts_stat carries the verdict
+     *   tdie_c, ts_pct,
+     *   ts_stat                charger thermal diagnostics
      *   flow_lpm               VFR constants are wrong for this cell; it is a
      *                          misleading number until the lab calibration
      *   uss_amp_ups/dns, gain  summarised by uss_snr_db (a degrading signal
@@ -184,20 +168,17 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
     int n = snprintf(out, cap,
         "\"vbat_mv\":%u,\"ibat_ma\":%d,\"soc_pct\":%u,"
         "\"vbus_mv\":%u,\"ibus_ma\":%d,\"chg_stat\":%u,"
-        "\"harvest_mah\":%u,\"solar\":%u,\"usb\":%u,\"motion\":%u,"
+        "\"harvest_mah\":%u,\"solar\":%u,\"usb\":%u,"
         "\"light_ch0\":%u,"
         "\"acc_x_mg\":%d,\"acc_y_mg\":%d,\"acc_z_mg\":%d,"
-        "\"temp_c\":%.2f,\"sensor_ok\":%u,"
-        "\"vac2_mv\":%u,\"tdie_c\":%.1f,\"ts_stat\":%u",
+        "\"temp_c\":%.2f,\"sensor_ok\":%u",
         r->vbat_mv, r->ibat_ma, r->soc_pct,
         r->vbus_mv, r->ibus_ma, r->chg_stat,
         r->harvest_mah,
         (r->flags & RECF_SOLAR) ? 1 : 0, (r->flags & RECF_USB) ? 1 : 0,
-        (r->flags & RECF_MOTION) ? 1 : 0,
         r->light_ch0,
         r->acc_mg[0], r->acc_mg[1], r->acc_mg[2],
-        r->temp_cC / 100.0f, r->sensor_ok,
-        r->vac2_mv, r->tdie_dC / 10.0f, r->ts_stat);
+        r->temp_cC / 100.0f, r->sensor_ok);
 
     /* Ultrasonic: four core values plus SNR as the health indicator. Only when
      * the module answered, so boards without a gas cell burn no quota. */
@@ -206,47 +187,13 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
                          r->uss_tof_dns_q40 / 1099511.627776) / 2.0;
         n += snprintf(out + n, cap - n,
             ",\"uss_tof_us\":%.4f,\"uss_dtof_us\":%.6f,"
-            "\"uss_code\":%u,\"uss_snr_db\":%.1f,\"uss_vol_ml\":%lu",
+            "\"uss_code\":%u,\"uss_snr_db\":%.1f,\"uss_vol_ml\":%lu,\"uss_seq\":%d",
             tof_us, r->uss_dtof_ps / 1e6f,
             r->uss_code, r->uss_snr_db2 / 2.0f,
-            (unsigned long)r->uss_vol_ml);
-        /* Capture-quality rate over the whole interval (~300 captures) rather
-         * than the single capture uss_code describes. Suppressed when the count
-         * is 0 (no delta available) or 0xFFFF (a record written before the
-         * field existed -- the ring is 0xFF-filled), so the dashboard never
-         * averages a sentinel against a real measurement. */
-        if (r->uss_cap_n != 0 && r->uss_cap_n != 0xFFFF && (size_t)n < cap) {
-            n += snprintf(out + n, cap - n,
-                ",\"uss_cap_n\":%u,\"uss_cap_badcode\":%u,\"uss_cap_badsnr\":%u"
-                ",\"uss_xt_us\":%u,\"uss_recov\":%u",
-                r->uss_cap_n, r->uss_cap_badcode, r->uss_cap_badsnr,
-                (unsigned)r->uss_xt_x10us * 10u, r->uss_recov);
-        }
-
-        /* Link health, published SEPARATELY and deliberately not inside the
-         * gate above. A module that rebooted reports cap_n = 0, so folding
-         * these into that block would suppress them in exactly the records
-         * where they matter most -- the reboots are the thing under
-         * investigation. 0xFFFF is the pre-field sentinel and stays out. */
-        if (r->uss_rst_cause != 0xFFFF && (size_t)n < cap) {
-            n += snprintf(out + n, cap - n,
-                ",\"uss_rst_cause\":%u,\"uss_lh_starts\":%u",
-                r->uss_rst_cause, r->uss_lh_starts);
-        }
+            (unsigned long)r->uss_vol_ml,
+            /* 0xFFFF = logged before this field existed */
+            r->uss_seq == 0xFFFFu ? -1 : (int) r->uss_seq);
     }
-
-    /* WF280A raw counts. Re-enabled 2026-09-05: the part answers reliably, and
-     * if it sits in a DIFFERENT pressure domain than the MS5837 (ambient rather
-     * than the line) it is the live atmospheric reference that dp_hpa currently
-     * fakes with a compile-time constant -- which means dp_hpa is presently
-     * measuring the weather as much as the gas. No counts->hPa conversion
-     * exists (the compensation polynomial is vendor-private), so these go out
-     * raw and the map gets fitted from data: log them against p_gas_hpa and see
-     * whether they track (same domain, useless) or diverge (usable reference). */
-    if ((r->sensor_ok & SOK_WF280A) && n > 0 && (size_t)n < cap)
-        n += snprintf(out + n, cap - n,
-            ",\"wf_praw\":%lu,\"wf_traw\":%lu",
-            (unsigned long)r->wf_praw, (unsigned long)r->wf_traw);
 
     /* Gas pressure from the MS5837 (it sits in the LINE, not ambient), and the
      * differential against the per-site atmospheric constant in config.h. */
@@ -295,33 +242,14 @@ static int64_t record_ts_ms(const LogRecord *r, int64_t now_ms, uint32_t head)
     return now_ms - (int64_t)(head - 1 - r->seq) * SAMPLE_INTERVAL_S * 1000;
 }
 
-/* Sample VBAT under load and keep the minimum. Called straight after a publish,
- * i.e. while the radio is still hot -- the A7672's 2 A bursts are what actually
- * threaten the modem's brown-out limit, and no other sample in the system ever
- * sees them (every logged VBAT is taken with the modem powered down). */
-static void note_vbat_under_load(uplink_result_t *res)
-{
-    uint16_t v = bq_vbat_mv();
-    if (v == 0) return;                       /* BQ absent or ADC off */
-    if (res->vbat_load_mv == 0 || v < res->vbat_load_mv) res->vbat_load_mv = v;
-}
-
 static uint32_t drain(uplink_result_t *res)
 {
     uint32_t sent = 0;
-    /* Batch size is adaptive, not fixed. A publish can fail for reasons that
-     * depend on SIZE -- the broker's message limit, its per-message datapoint
-     * limit, a marginal link -- and the old code simply gave up, leaving the
-     * ring stalled forever: every later session republished the same oversized
-     * batch and failed identically. Halving on failure means the drain finds
-     * whatever ceiling actually applies and gets under it, turning a permanent
-     * stall into a slower drain. */
-    uint32_t batch = BATCH_RECORDS;
     while (flashlog_pending() > 0) {
         esp_task_wdt_reset();
         int64_t now_ms = clock_valid() ? (int64_t)time(NULL) * 1000 : 0;
         uint32_t n = flashlog_pending();
-        if (n > batch) n = batch;
+        if (n > BATCH_RECORDS) n = BATCH_RECORDS;
 
         size_t len = 0;
         uint32_t included = 0;
@@ -372,19 +300,12 @@ static uint32_t drain(uplink_result_t *res)
                                 pdMS_TO_TICKS(15000));
             esp_task_wdt_reset();
             if (!publish_acked(s_json)) {
-                if (batch > 1) {
-                    batch /= 2;
-                    ESP_LOGW(TAG, "publish failed -- retrying with batch=%lu",
-                             (unsigned long)batch);
-                    continue;          /* same records, smaller payload */
-                }
-                ESP_LOGW(TAG, "drain stopped at batch=1, %lu pending",
+                ESP_LOGW(TAG, "drain stopped, %lu pending",
                          (unsigned long)flashlog_pending());
                 break;
             }
         }
         flashlog_advance(n);
-        note_vbat_under_load(res);
         sent += included;
         if (flashlog_pending() > 0) vTaskDelay(pdMS_TO_TICKS(BATCH_GAP_MS));
     }
@@ -413,23 +334,20 @@ static void send_status(const uplink_ctx_t *ctx, const uplink_result_t *res)
              "\"rssi_dbm\":%d,\"wifi_rssi_dbm\":%d,\"transport\":\"%s\","
              "\"cereg_stat\":%u,\"backlog\":%lu,\"boot_id\":%u,"
              "\"reset_reason\":%u,\"boot_count\":%u,\"wake_count\":%u,"
-             "\"crash_count\":%u,\"vbat_mv\":%u,\"vbat_load_mv\":%u,"
-             "\"sun_h\":%u,\"voc_max_mv\":%u,\"fw\":\"" FW_VERSION "\"",
+             "\"crash_count\":%u,\"vbat_mv\":%u,"
+             "\"sun_h\":%u,\"voc_max_mv\":%u,\"fw\":\"" FW_VERSION "\","
+             "\"uss_rst_cause\":%d,\"uss_lh_starts\":%d,\"uss_lh_uptime\":%d",
              res->cell_rssi_dbm, res->wifi_rssi_dbm, transport,
              res->cell_reg_stat, (unsigned long)flashlog_pending(), ctx->boot_id,
              ctx->reset_reason, ctx->boot_count, ctx->wake_count,
-             ctx->crash_count, ctx->vbat_mv, res->vbat_load_mv,
-             ctx->sun_hours, ctx->voc_max_mv);
-    /* Appended only on wakes that actually measured. Publishing a placeholder
-     * would put zeros in the timeseries and make the dashboard average them
-     * against real readings. */
-    if (ctx->audit_valid) {
-        size_t n = strlen(vals);
-        snprintf(vals + n, sizeof(vals) - n,
-                 ",\"uss_rail_ua\":%ld,\"uss_rail_se_ua\":%ld,\"base_ua\":%ld",
-                 (long)ctx->audit_rail_ua, (long)ctx->audit_se_ua,
-                 (long)ctx->audit_base_ua);
-    }
+             ctx->crash_count, ctx->vbat_mv,
+             ctx->sun_hours, ctx->voc_max_mv,
+             /* -1 when the health read itself failed, which is itself the
+              * datum: it separates "the module restarted" from "we never
+              * reached the module at all". */
+             ctx->uss_health_valid ? (int) ctx->uss_rst_cause   : -1,
+             ctx->uss_health_valid ? (int) ctx->uss_lh_starts   : -1,
+             ctx->uss_health_valid ? (int) ctx->uss_lh_uptime_s : -1);
     if (now_ms > 0)
         snprintf(s_json, sizeof(s_json), "{\"ts\":%lld,\"values\":{%s}}",
                  (long long)now_ms, vals);
@@ -619,7 +537,6 @@ static bool cell_session(const uplink_ctx_t *ctx, uplink_result_t *res)
     }
     ESP_LOGI(TAG, "registered (stat %u, %d dBm)",
              res->cell_reg_stat, res->cell_rssi_dbm);
-    note_vbat_under_load(res);   /* attach bursts are the heaviest load of all */
 
     xEventGroupClearBits(s_ev, EV_IP_UP);
     if (esp_modem_set_mode(dce, ESP_MODEM_MODE_DATA) != ESP_OK) {
@@ -706,11 +623,15 @@ out:
 
 /* ===================== entry point ===================== */
 
-/* Held for the duration of an uplink. The modem's UART derives its baud from a
+/* Held for the duration of an uplink. The modem UART derives its baud from a
  * clock that DFS moves, and esp_modem does not take its own lock -- without
- * this the first frequency change mid-session corrupts the AT stream. Cheap
- * insurance: a session is ~2 minutes twice a day, and the sampling wakes (which
- * are the ones worth optimising) are unaffected. */
+ * this the first frequency change mid-session corrupts the AT stream. Restored
+ * verbatim in intent from e86c644: it shipped ALONGSIDE the PM config, so a
+ * reproduction without it is not the historical firmware. It also matters for
+ * the experiment itself -- an AT-stream corruption can panic the upload, and a
+ * panic reboots this board, cycles the sensor rail, resets the module and
+ * forces an abs-ToF re-search. That is the exact code-135 signature we are
+ * using as the positive result, so leaving this out could fake one. */
 static esp_pm_lock_handle_t s_pm_lock;
 
 static void pm_hold(bool hold)
@@ -755,10 +676,10 @@ uplink_result_t uplink_upload_all(const uplink_ctx_t *ctx)
         wifi_session(ctx, &res);
 #endif
 
-    pm_hold(false);
     res.all_sent = (flashlog_pending() == 0);
     ESP_LOGI(TAG, "%lu records sent%s, %lu pending",
              (unsigned long)res.sent, res.used_wifi ? " (wifi used)" : "",
              (unsigned long)flashlog_pending());
+    pm_hold(false);
     return res;
 }

@@ -35,47 +35,36 @@ CONFIG_LWIP_PPP_SUPPORT=y
 CONFIG_LWIP_PPP_PAP_SUPPORT=y
 CONFIG_LWIP_PPP_NOTIFY_PHASE_SUPPORT=y
 
-# Multi-server SNTP. uplink.c asks for two servers (time.google.com and
-# pool.ntp.org); lwip defaults to ONE, so esp_netif_sntp_init() failed outright
-# with "Tried to configure more servers than enabled in lwip" -- observed on
-# hardware 2026-09-04. The clock was being carried entirely by the HTTPS-Date
-# cross-check, i.e. the redundancy we thought we had did not exist.
-CONFIG_LWIP_SNTP_MAX_SERVERS=2
-
-# CPU at 80 MHz instead of 160. A sampling wake is dominated by waiting -- I2C
-# sensor conversions (LTR-303 150 ms, MS5837 60 ms), flash writes, rail settle
-# -- not by computing, so halving the clock roughly halves active current for
-# nearly the same elapsed time. The TLS handshake is the one compute-bound step
-# and does get slower, but by seconds inside a session already dominated by the
-# modem's attach time.
-CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=n
-CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_80=y
-
-# Skip re-validating the app image on a DEEP-SLEEP wake. The bootloader
-# otherwise SHA-256s the whole 1.2 MB application 288 times a day, and the only
-# cost that matters on this node is ESP32 awake-milliseconds. Power-on boots and
-# post-OTA boots still validate, which is where validation actually earns its
-# keep -- this only skips the case where the image was already verified moments
-# earlier and the chip never lost power.
-# CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP -- NOT enabled: it makes the
-# bootloader retain the image digest in RTC reserved memory, which overflows
-# lp_reserved_seg by 16 bytes on this build. Worth ~1 mAh/day; not worth
-# reshuffling the RTC memory layout for.
-
-# Bootloader chatter costs formatting time on every wake; warnings and errors
-# are still printed.
-CONFIG_BOOTLOADER_LOG_LEVEL_INFO=n
-CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
-
-# Power management: scale the clock down and light-sleep whenever a task blocks.
-# A sampling wake is almost entirely vTaskDelay -- LTR-303 150 ms, MS5837 60 ms,
-# the BQ's 150 ms ADC settle, the 800 ms rail cycle -- and without PM the CPU
-# spins in the idle task at full speed through all of it. Tickless idle turns
-# that dead time into light sleep.
+# Power management: FREQUENCY SCALING ONLY. Automatic light sleep is deliberately
+# NOT enabled, and CONFIG_FREERTOS_USE_TICKLESS_IDLE is deliberately absent --
+# esp_pm_configure() rejects light_sleep_enable without it, so leaving it out is
+# a second, independent guarantee on top of the runtime flag.
 #
-# The modem is the risk: its UART baud derives from a clock that DFS moves, so
-# uplink.c holds a NO_LIGHT_SLEEP + APB_FREQ_MAX lock for the whole session.
+# WHY, measured 2026-09-14. With PM restored exactly as it shipped on 09-07, the
+# USB cable became the treatment variable, because light sleep was gated on
+# !usb_present:
+#     light sleep OFF (cable in):   0 of 11 records failed
+#     light sleep ON  (cable out):  4 of 8  records failed   <- 50 %
+#     Fisher exact one-tailed p = 0.018, against a 131-record baseline of zero.
+# Every failure read sensor_ok = 15: bits 4 and 5 clear, i.e. USS and WF280A --
+# exactly and only the two devices on the SWITCHED sensor rail. The likely
+# mechanism is that gpio_hold_en(ECO_PIN_SENSOR_PWR) is applied only on the path
+# into DEEP sleep, so during the 3 s BOARD_SENSOR_BOOT_MS settle -- 100x the
+# 30 ms tickless threshold -- the rail enable is unheld while the core light
+# sleeps, and the rail collapses under the module.
+#
+# It bought +0.1 uA. The real saving was gpio_pullup_dis (1467.5 -> 356.5 uA).
+# DFS stayed clean for all 11 records with light sleep off, so it is kept.
 CONFIG_PM_ENABLE=y
-CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
-CONFIG_PM_SLP_IRAM_OPT=y
-CONFIG_PM_RTOS_IDLE_OPT=y
+
+# A5, skip app validation on deep-sleep wake: NOT ENABLED -- it does not fit.
+#
+# Turning it on makes the bootloader cache the app entry point in RTC memory,
+# and on this part that overflows:
+#     section .rtc_reserved will not fit in region lp_reserved_seg
+#     region lp_reserved_seg overflowed by 16 bytes
+# Verified in isolation 2026-09-14: this line alone is the difference between a
+# clean link and that error. Re-enabling it means finding 16 bytes in the RTC
+# reserved segment, which is IDF-internal retain state, not ours to shrink.
+# The prize was a few tens of ms of CPU per wake, so it is not worth the surgery.
+# CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP=y

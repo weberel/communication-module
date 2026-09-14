@@ -34,16 +34,6 @@
 #define RECF_USB      0x02   /* USB input present (VAC1) */
 #define RECF_WEATHER  0x04   /* weather classified good this day */
 #define RECF_ECO_CHG  0x08   /* charge target limited to ~80 % SoC */
-#define RECF_MOTION   0x10   /* this wake was triggered by the accelerometer's
-                              * motion interrupt, not the timer or the button */
-
-/* sensor_ok bits */
-#define SOK_BQ        0x01
-#define SOK_LTR303    0x02
-#define SOK_SC7A20    0x04
-#define SOK_MS5837    0x08
-#define SOK_USS       0x10
-#define SOK_WF280A    0x20
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;        /* REC_MAGIC */
@@ -76,7 +66,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  sensor_ok;    /* bit0 BQ, bit1 LTR303, bit2 SC7A20, bit3 MS5837,
                             * bit4 USS flow module, bit5 WF280A -- set only when
                             * the source answered correctly, so a zero reading
-                            * is distinguishable from a dead sensor. */
+                            * is distinguishable from a dead sensor */
     /* --- v4: ultrasonic flow module (MSP430FR6043 I2C slave, uss_link.h)
      *         + WF280A raw pressure. All zero when absent (see sensor_ok). --- */
     int32_t  uss_flow_ulpm;  /* calibrated flow, uL/min */
@@ -97,42 +87,25 @@ typedef struct __attribute__((packed)) {
      * scaling assumption. */
     uint32_t uss_tof_ups_q40;
     uint32_t uss_tof_dns_q40;
-    /* --- capture-quality deltas since the previous record ---
-     * The module runs ~300 captures between our samples, so uss_code alone is
-     * one coin flip out of 300. These make the real rate visible per record.
-     * 0xFFFF means "record written before this field existed" -- the ring is
-     * 0xFF-filled -- and must not be published as a count. */
-    /* Taken from rsvd[] (22 -> 20) to keep LogRecord at exactly 128 bytes --
-     * the flash ring geometry asserts on it. 0 = module predates the
-     * read-back register, 0xFFFF = record written before this field. */
-    uint8_t  uss_recov;      /* abs-ToF recoveries this record (delta) */
-    uint8_t  uss_rsv1;       /* pad, keeps the 128-byte record aligned */
-    uint16_t uss_xt_x10us;   /* settle the USS applied, 10 us units */
-    uint16_t uss_cap_n;
-    uint16_t uss_cap_badcode;
-    uint16_t uss_cap_badsnr;
-    /* Link health, taken from rsvd[] (18 -> 14) 2026-09-11. Same 128-byte
-     * budget; the flash ring geometry asserts on it.
+    /* --- v6: module measurement counter ---
      *
-     * uss_rst_cause is the module's SYSRSTIV, latched once at ITS boot. This is
-     * the field answer to a question the console cannot reach: the module has a
-     * mandatory watchdog, so when it hangs it silently resets, and until now the
-     * master could only ever learn ST_BOOT -- "I rebooted", never why. A
-     * watchdog cause here says the module wedged; a power-on cause says the comm
-     * board cut its rail.
+     * The module measures at 1 Hz but we log every SAMPLE_INTERVAL_S, so ~300
+     * captures happen between records and telemetry carries exactly one of
+     * them. delta(uss_seq) across consecutive records is how many measurements
+     * actually COMPLETED -- expect ~300 per 5 min interval.
      *
-     * uss_lh_starts is the module's own count of I2C address matches, delta'd
-     * per record like the capture counters. Against the transactions we issued
-     * it separates "the bus never reached the module" from "it was addressed and
-     * failed downstream" -- the distinction that cost an evening of arguing both
-     * sides on 2026-09-11.
+     * This is the only visibility we have into captures being dropped. The
+     * maxSampleShift gate (3) rejects a capture whose ToF difference exceeds it,
+     * and the rejection RATE is a property of the signal -- echo quality,
+     * temperature, transducer ageing -- not of the firmware, so it cannot be
+     * inferred from the reported version. On this rig the two tallest lobes sit
+     * ~1 % apart, so the margin is thin enough for that rate to move with
+     * conditions.
      *
-     * 0 = module predates the link-health block; 0xFFFF = record written before
-     * these fields existed (the ring is 0xFF-filled). Neither may be published
-     * as a real count. */
-    uint16_t uss_rst_cause;  /* module SYSRSTIV latched at its boot */
-    uint16_t uss_lh_starts;  /* module I2C address matches this record (delta) */
-    uint8_t  rsvd[14];     /* spare for future fields (0xFF) */
+     * Taken from rsvd so sizeof(LogRecord) stays 128: records already in flash
+     * remain valid and simply read 0xFFFF here, which telemetry reports as -1. */
+    uint16_t uss_seq;      /* module measurement counter (wraps at 65535) */
+    uint8_t  rsvd[26];     /* spare for future fields (0xFF) */
     uint16_t crc;          /* CRC16-CCITT over bytes [0 .. offsetof(crc)-1] */
 } LogRecord;
 

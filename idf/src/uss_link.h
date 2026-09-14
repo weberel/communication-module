@@ -70,6 +70,20 @@
 #define USS_REG_GAIN        0x17    /* u8  PGA gain index actually used       */
 #define USS_REG_VOL_ML      0x18    /* u32 totalized volume, mL (autonomous
                                      *     mode, future -- 0 until implemented) */
+#define USS_REG_VOL_WRAPS   0x1D    /* u8  times VOL_ML wrapped (see below)   */
+/* VOL_ML is u32 MILLILITRES and the slave accumulates in microlitres, so the
+ * published value rolls over every 4,294,967 mL. Measured 2026-09-14: with the
+ * dTOF zero-offset uncorrected the bench integrated 14.6 L/min of pure bias and
+ * wrapped every ~4.9 h, silently -- it looked exactly like a module reset.
+ * Reconstruct the true total as:
+ *     total_mL = VOL_ML + (uint64_t) VOL_WRAPS * 4294967296ULL
+ * The slave now accumulates in SIGNED 64-bit microlitres, so VOL_ML only rolls
+ * at 2^32 mL = 4.29 million litres -- years at any real flow. VOL_WRAPS is
+ * therefore normally 0 and exists so the total stays reconstructible anyway.
+ * Reversals SUBTRACT (the header text below always claimed this; the code used
+ * to reset the total to zero instead). While the signed accumulator is
+ * negative, VOL_ML and VOL_WRAPS both read 0 and recover if flow returns.
+ * Additive: 0x1D was reserved, so no PROTO bump. */
 #define USS_REG_VARIANT     0x1C    /* u8  USS_VARIANT_*: which medium the slave
                                      *     image was built for. Gas and water
                                      *     are separate builds (different USS
@@ -91,44 +105,27 @@
  *   microseconds = raw * 1e6 / 2^40   (= raw / 1099511.627776)             */
 #define USS_REG_TOF_UPS_Q40 0x20    /* u32 absolute ToF upstream,   Q40 s     */
 #define USS_REG_TOF_DNS_Q40 0x24    /* u32 absolute ToF downstream, Q40 s     */
-/* -- capture-quality counters, ADDED 2026-09-06 (additive, no PROTO bump) --
- * Free-running u16 counts of every capture the module has run since ITS last
- * reset. They WRAP; the master takes the difference between consecutive reads,
- * which is correct modulo 65536 and needs no read-clear handshake (read-clear
- * would race the auto-incrementing register pointer during a block read).
- *
- * Why they exist: the master samples one capture per 5 minutes while the module
- * runs ~300, so a single uss_code is a coin flip, not a rate. On 2026-09-06 the
- * real bad-sample rate was ~30 % and two thirds of it was INVISIBLE -- those
- * captures reported code 122 "valid" with dtof 100-1000x out of family, and
- * only SNR gave them away. These two counters make the rate observable in one
- * telemetry cycle instead of an afternoon of guessing.
- *
- * A module that predates them answers 0 in all three, which is a clean
- * "not implemented" sentinel: a running module always has CAP_N != 0.
- * Deliberately NOT a PROTO bump -- they land in space that was already
- * reserved and CRC-covered, so an old master still reads a CRC-valid block. */
+/* 0x28..0x2E reserved (0x00) */
+/* -- capture-quality counters. Additive, no PROTO bump: 0x28..0x2E was
+ * reserved space inside the CRC'd block. These restore PER-CAPTURE statistics,
+ * which the master otherwise cannot see -- it samples one capture per record
+ * while the slave runs ~300 between records. */
 #define USS_REG_CAP_N       0x28    /* u16 total captures (wraps)             */
 #define USS_REG_CAP_BADCODE 0x2A    /* u16 captures whose code != 122 (wraps) */
-#define USS_REG_CAP_BADSNR  0x2C    /* u16 code==122 but SNR below threshold;
-                                     * the silent failures (wraps)            */
-/* 0x2E reserved (0x00) */
+#define USS_REG_CAP_BADSNR  0x2C    /* u16 code==122 but SNR below threshold  */
 #define USS_REG_CRC8        0x2F    /* u8  CRC8 over regs 0x04..0x2E          */
-
-/* -- LINK HEALTH block, ADDED 2026-09-11. Additive, no PROTO bump --
- * Offsets MUST match the module's copy in Ultrasonic/Firmware/fw/uss_link.h.
+/* -- LINK HEALTH block. Additive, no PROTO bump, and guarded by its OWN CRC so
+ * it can be read without disturbing the latched result block.
  *
- * 0x30..0x3F was already inside the readable window and unused. Own CRC at
- * 0x3F; the result block's CRC at 0x2F is untouched.
+ * This exists because the module's UART cannot be attached while it sits on the
+ * comm board, and under ECOTRACE_LPM3 the UART cannot receive at all -- so the
+ * only way to ask the module why it restarted is over I2C.
  *
- * This exists because uss_sample() returning false collapses at least three
- * different failures into one bool, and the only response is an 800 ms rail
- * power-cycle that reboots the module and loses the volume total. STARTS tells
- * the two halves apart:
- *   delta(STARTS) ~ transactions issued -> the bus reached the slave
- *   delta(STARTS) ~ 0                   -> the master never got on the bus
- * RSTCAUSE answers whether the module's own watchdog fired, which ST_BOOT
- * cannot: it says "I rebooted", never why.                                   */
+ * STARTS is the useful one when a read fails: delta(STARTS) ~= the number of
+ * transactions attempted means the bus reached the module and the fault is
+ * above the physical layer; delta(STARTS) ~= 0 means the master never got on
+ * the bus at all. RSTCAUSE carries the raw SYSRSTIV latched at boot
+ * (0x0002 brownout, 0x000E SVSH, 0x0014 PMMSWPOR). */
 #define USS_REG_LH_RSTCAUSE 0x30    /* u16 SYSRSTIV latched at boot           */
 #define USS_REG_LH_STARTS   0x32    /* u16 I2C address matches (wraps)        */
 #define USS_REG_LH_STOPS    0x34    /* u16 STOP conditions seen (wraps)       */
@@ -138,30 +135,11 @@
 #define USS_REG_LH_UPTIME_S 0x3C    /* u16 seconds since boot, saturates      */
 #define USS_REG_LH_LASTCMD  0x3E    /* u8  last command byte received         */
 #define USS_REG_LH_CRC8     0x3F    /* u8  CRC8 over regs 0x30..0x3E          */
-#define USS_LINK_HEALTH_OFF 0x30
-#define USS_LINK_HEALTH_LEN 16      /* 0x30..0x3F inclusive, CRC included     */
+#define USS_LH_OFF          0x30
+#define USS_LH_LEN          0x10
 
 /* -- control -- */
 #define USS_REG_CMD         0x40    /* u8  write-only, USS_CMD_*              */
-/* USSXT settling time, units of 10 us, little-endian u16. 0 = module keeps
- * its compiled default. The module CLAMPS to 1 ms .. 400 ms: a 120 us settle
- * hangs its capture, and these writes are NOT CRC-protected (the CRC8 covers
- * the read block only). Written before every AUTO_START so it survives a
- * module reboot -- the module deliberately keeps it in RAM so a bad value
- * cannot persist. */
-/* Read-back of the settle the module ACTUALLY applied, 10 us units, u16.
- * USS_REG_XT_SETTLE (0x44) is write-only -- outside the readable window -- so
- * this is the only way to confirm the write landed, and it reports the value
- * AFTER the module's 1 ms..400 ms clamp. Inside the CRC8 block (0x04..0x2E),
- * so it arrives already integrity-checked. 0 on a module that predates it. */
-/* Count of abs-ToF latch recoveries on the module, u8, wraps. 0 = never fired
- * (or a module predating it). Take the DIFFERENCE between reads, like the
- * capture counters. The module re-searches after 5 consecutive bad captures
- * instead of waiting for our 3-record rail cycle, which costs ~900 captures
- * per event; this is how that recovery stays visible rather than silent. */
-#define USS_REG_RECOVERIES  0x1D    /* u8  abs-ToF recoveries (wraps)         */
-#define USS_REG_XT_APPLIED  0x1E    /* u16 applied settle, 10 us units        */
-#define USS_REG_XT_SETTLE   0x44    /* u16 USSXT settle, units of 10 us       */
 #define USS_REG_AUTO_PERIOD 0x42    /* u16 autonomous measurement period, s
                                      *     (future; 0 = off)                  */
 
@@ -179,7 +157,6 @@
 #define USS_ST_BUSY         0x02    /* measurement in progress                */
 #define USS_ST_ERR          0x04    /* last measurement failed to run at all
                                      * (USS init/config error; CODE has detail) */
-#define USS_ST_RECOVERED    0x10    /* module recovered an abs-ToF latch      */
 #define USS_ST_AUTO         0x08    /* autonomous totalizer running (future)  */
 #define USS_ST_BOOT         0x80    /* set from reset until the first command:
                                      * lets the master detect a slave reboot
@@ -194,6 +171,22 @@
 #define USS_CMD_MEASURE     0x01
 #define USS_CMD_AUTO_START  0x02    /* future */
 #define USS_CMD_AUTO_STOP   0x03    /* future */
+#define USS_CMD_VOL_RESET   0x05    /* zero the volume totalizer.
+                                 * AUTO_START used to zero it implicitly, which
+                                 * made the total useless the moment the master
+                                 * power-cycled the module: every recovery threw
+                                 * the reading away. The total now PERSISTS in
+                                 * FRAM across module resets, so clearing it had
+                                 * to become something you ask for.           */
+#define USS_CMD_ZEROCAL     0x04    /* null the dTOF offset at the CURRENT flow.
+                                 * ONLY valid at genuine zero flow -- it folds
+                                 * whatever is being measured into the offset.
+                                 * Needed because the deployment image has no
+                                 * other calibration path: LPM3 stops SMCLK, so
+                                 * the backchannel UART cannot receive, and the
+                                 * offset is otherwise a compile-time constant
+                                 * that a reset restores. Result lands in
+                                 * DTOF_PS; persisted to FRAM.               */
 #define USS_CMD_SOFT_RESET  0x0F
 
 /* USS message codes we care about on the master side (from the USS library) */

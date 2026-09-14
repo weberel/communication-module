@@ -29,11 +29,6 @@ typedef struct {
     int      cell_rssi_dbm;    /* 0 if modem never attached */
     int      wifi_rssi_dbm;    /* 0 if WiFi unused */
     uint8_t  cell_reg_stat;    /* last +CEREG stat seen (registration diagnostics) */
-    uint16_t vbat_load_mv;     /* lowest VBAT seen while the modem was attached and
-                                * transmitting -- 0 if never sampled. Every other
-                                * VBAT reading is taken with the radio off, so this
-                                * is the only measurement of the sag that the
-                                * MODEM_MIN_VBAT_MV floor actually exists to avoid. */
 } uplink_result_t;
 
 typedef struct {
@@ -49,12 +44,16 @@ typedef struct {
     uint16_t voc_max_mv;
     uint32_t uptime_s;         /* uptime at the newest record: the reference for
                                 * back-dating records logged before a clock sync */
-    bool     audit_valid;      /* a power audit ran this wake (button press) */
-    int32_t  audit_rail_ua;    /* ultrasonic AFE rails + boost, microamps */
-    int32_t  audit_se_ua;      /* standard error of that mean -- publish it, so
-                                * a noisy audit announces itself instead of
-                                * being mistaken for a precise one */
-    int32_t  audit_base_ua;    /* node discharge with those rails down, uA */
+    /* Module link health, read over I2C from regs 0x30..0x3F.
+     *
+     * Carried in the STATUS record, NOT in LogRecord: LogRecord is CRC'd and
+     * stored in external flash, so widening it would invalidate every record
+     * already buffered there. This is session diagnostics, not per-sample
+     * measurement, so the status record is where it belongs anyway. */
+    bool     uss_health_valid;
+    uint16_t uss_rst_cause;    /* raw SYSRSTIV: 2 brownout, 0xE SVSH, 0x14 SWPOR */
+    uint16_t uss_lh_starts;    /* I2C address matches the module has seen */
+    uint16_t uss_lh_uptime_s;  /* module uptime; a drop means it restarted */
 } uplink_ctx_t;
 
 uplink_result_t uplink_upload_all(const uplink_ctx_t *ctx);

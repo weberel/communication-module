@@ -82,50 +82,6 @@ bool sc7a20_sample(int16_t *x_mg, int16_t *y_mg, int16_t *z_mg)
     return ok;
 }
 
-/* --- motion wake ---------------------------------------------------------
- * Register set is LIS2DH-compatible. The sequence matters: configure while the
- * interrupt is disabled, reset the high-pass filter by reading REFERENCE, then
- * enable the INT1 pin last, or the latch fires on the configuration transient
- * itself and every sleep wakes instantly. */
-bool sc7a20_arm_motion(uint16_t threshold_mg)
-{
-    if (!s_acc) return false;
-
-    uint8_t ths = (uint8_t)(threshold_mg / 16);     /* 16 mg/LSB at +-2 g */
-    if (ths == 0) ths = 1;
-    if (ths > 0x7F) ths = 0x7F;
-
-    bool ok = true;
-    ok &= dev_wr(s_acc, 0x22, 0x00);   /* CTRL_REG3: INT1 pin off while we set up */
-    ok &= dev_wr(s_acc, 0x20, 0x2F);   /* CTRL_REG1: 10 Hz, low-power, X/Y/Z on */
-    ok &= dev_wr(s_acc, 0x21, 0x01);   /* CTRL_REG2: high-pass filter feeds INT1
-                                        * -- without it 1 g of gravity sits above
-                                        * any useful threshold and the interrupt
-                                        * is permanently asserted */
-    ok &= dev_wr(s_acc, 0x23, 0x00);   /* CTRL_REG4: +-2 g */
-    ok &= dev_wr(s_acc, 0x24, 0x08);   /* CTRL_REG5: latch INT1 (LIR_INT1) */
-    ok &= dev_wr(s_acc, 0x25, 0x02);   /* CTRL_REG6: H_LACTIVE -> INT is ACTIVE LOW */
-    ok &= dev_wr(s_acc, 0x32, ths);    /* INT1_THS */
-    ok &= dev_wr(s_acc, 0x33, 0x01);   /* INT1_DURATION: 1 sample at 10 Hz */
-
-    uint8_t ref = 0;
-    dev_rd(s_acc, 0x26, &ref, 1);      /* REFERENCE: resets the HP filter */
-    uint8_t src = 0;
-    dev_rd(s_acc, 0x31, &src, 1);      /* INT1_SRC: clear any stale latch */
-
-    ok &= dev_wr(s_acc, 0x30, 0x2A);   /* INT1_CFG: OR of X/Y/Z high events */
-    ok &= dev_wr(s_acc, 0x22, 0x40);   /* CTRL_REG3: route AOI1 to the INT1 pin */
-    return ok;
-}
-
-bool sc7a20_motion_fired(void)
-{
-    if (!s_acc) return false;
-    uint8_t src = 0;
-    if (!dev_rd(s_acc, 0x31, &src, 1)) return false;   /* the read clears the latch */
-    return (src & 0x40) != 0;                          /* IA: an event was active */
-}
-
 /* ===================== MS5837-02BA (0x76) ===================== */
 
 static i2c_master_dev_handle_t s_baro;

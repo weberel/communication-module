@@ -12,18 +12,17 @@
  *   - error-event log (coredump partition), health telemetry
  *   - OTA with rollback, NVS provisioning, ATECC identity, LP-core sampling
  */
-#include <math.h>
 #include <string.h>
 #include <time.h>
 
 #include "esp_attr.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 #include "esp_random.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_task_wdt.h"
-#include "esp_pm.h"
-#include "esp_ota_ops.h"
+#include "esp_pm.h"   /* reproduction experiment 2026-09-14 -- see sdkconfig */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -36,17 +35,12 @@
 #include "solar.h"
 #include "sensors.h"
 #include "uss.h"
-#include "uss_link.h"   /* USS_ST_BOOT: the module resets its own counters */
 #include "i2c_bus.h"
 #include "esp_timer.h"
-#include "driver/gpio.h"
 #include "wf280a.h"
 #include "uplink.h"
 
 static const char *TAG = "ecotrace";
-
-/* Set for the duration of a wake that the accelerometer triggered. */
-static bool s_motion_flag;
 
 /* When the switched SENSOR rail came up this wake; the ultrasonic module needs
  * BOARD_SENSOR_BOOT_MS from that point before its I2C slave answers. */
@@ -62,46 +56,21 @@ static RTC_DATA_ATTR uint16_t s_boot_count;
 static RTC_DATA_ATTR uint16_t s_wake_count;
 static RTC_DATA_ATTR uint16_t s_crash_count;
 static RTC_DATA_ATTR uint8_t  s_parked;      /* battery park mode latch */
-/* Previous capture counters, for the per-record delta. Free-running u16s on the
- * module, so the subtraction is correct modulo 65536 and needs no handshake. */
-static RTC_DATA_ATTR uint8_t  s_prev_recov;
-static RTC_DATA_ATTR uint16_t s_prev_lh_starts;
-static RTC_DATA_ATTR bool     s_lh_seen;
-static RTC_DATA_ATTR uint16_t s_prev_cap_n;
-static RTC_DATA_ATTR uint16_t s_prev_cap_badcode;
-
-
-static RTC_DATA_ATTR uint16_t s_prev_cap_badsnr;
-static RTC_DATA_ATTR uint8_t  s_cap_seen;   /* a previous sample exists */
-/* Consecutive records in which EVERY capture failed. The module's abs-ToF search
- * can latch onto a reflection instead of the direct echo and then TRACK it
- * (absState=1), after which every capture returns code 135 with perfectly
- * healthy amplitude, SNR, gain and clock. Measured on the bench 2026-09-08: AGC
- * recalibration does not break the lock and only a power cycle does. Any reboot
- * re-rolls that dice, so an unattended node can silently produce no flow data
- * for the rest of a deployment. */
-static RTC_DATA_ATTR uint8_t  s_uss_allbad_streak;
-/* Set for the wake that a button press caused. A press means a person is at the
- * board asking for attention, so it overrides the USS recovery backoff: the
- * backoff exists to stop a node with no gas cell power-cycling its rail every
- * 5 minutes forever, but it also means a module hot-plugged onto a live bus --
- * which can leave it wedged half-powered off the bus's ESD clamps -- waits up
- * to an hour for the rail cycle that would clear it. Observed 2026-09-06. */
-static bool s_force_uss_recovery;
 /* upload scheduling: bounded tempo (2026-08-11 spec) */
 static RTC_DATA_ATTR int32_t  s_next_upload_in_s;
+
+/* Module link health for the status record. Plain statics, not RTC_DATA_ATTR:
+ * they are re-read every wake and only ever used within the same wake. */
+static bool     s_uss_health_valid;
+static uint16_t s_uss_rst_cause;
+static uint16_t s_uss_lh_starts;
+static uint16_t s_uss_lh_uptime_s;
 static RTC_DATA_ATTR uint8_t  s_retries_left;
 static RTC_DATA_ATTR uint32_t s_last_deep_uptime;   /* deep search once/day */
 static RTC_DATA_ATTR uint8_t  s_upload_inflight;
 static RTC_DATA_ATTR uint8_t  s_upload_crashed;
-/* Consecutive wakes on which the ultrasonic module did not answer. Used to back
- * the recovery off: retrying a rail power-cycle every 5 minutes forever is the
- * worst case for power on a node whose module is absent or dead. */
-static RTC_DATA_ATTR uint16_t s_uss_fail_streak;
-/* Consecutive out-of-turn motion wakes, reset by any ordinary timer wake. */
-static RTC_DATA_ATTR uint8_t  s_motion_streak;
 
-#define UPLOAD_PERIOD_S (24 * 3600)   /* one uplink per day */
+#define UPLOAD_PERIOD_S (12 * 3600)
 #define UPLOAD_RETRY_S  (30 * 60)
 #define UPLOAD_RETRIES  2
 
@@ -137,31 +106,26 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
     r->flags = (sol->solar_present ? RECF_SOLAR   : 0) |
                (sol->usb_present   ? RECF_USB     : 0) |
                (sol->weather_good  ? RECF_WEATHER : 0) |
-               (sol->eco_target    ? RECF_ECO_CHG : 0) |
-               (s_motion_flag      ? RECF_MOTION  : 0);
+               (sol->eco_target    ? RECF_ECO_CHG : 0);
 
     /* Log what is actually on the bus. Cheap (absent devices NACK immediately)
      * and it turns "the reading is zero" into "that chip is not there", which
      * are entirely different faults. */
     eco_i2c_scan();
 
-    r->sensor_ok = bq_ok ? SOK_BQ : 0x00;
+    r->sensor_ok = bq_ok ? 0x01 : 0x00;
 
 
-    /* Sampled every wake. Duty-cycling it was considered and rejected: the
-     * 150 ms integration wait is only ~0.5 mAh/day (0.4 % of the budget), and
-     * leaving the sensor in continuous mode instead would cost ~2.4 mAh/day of
-     * its own active current -- five times more than it saves. */
     uint16_t c0, c1;
     if (ltr303_sample(&c0, &c1)) {
         r->light_ch0 = c0; r->light_ch1 = c1;
-        r->sensor_ok |= SOK_LTR303;
+        r->sensor_ok |= 0x02;
     } else { r->light_ch0 = r->light_ch1 = 0; }
 
     int16_t ax, ay, az;
     if (sc7a20_sample(&ax, &ay, &az)) {
         r->acc_mg[0] = ax; r->acc_mg[1] = ay; r->acc_mg[2] = az;
-        r->sensor_ok |= SOK_SC7A20;
+        r->sensor_ok |= 0x04;
     } else {
         r->acc_mg[0] = r->acc_mg[1] = r->acc_mg[2] = 0;
     }
@@ -170,7 +134,7 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
     if (ms5837_sample(&mbar, &degc)) {
         r->press_dmbar = (uint16_t)(mbar * 10.0f + 0.5f);
         r->temp_cC     = (int16_t)(degc * 100.0f + (degc >= 0 ? 0.5f : -0.5f));
-        r->sensor_ok |= SOK_MS5837;
+        r->sensor_ok |= 0x08;
     } else {
         r->press_dmbar = 0;
         r->temp_cC     = 0;
@@ -204,56 +168,85 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
      * Costs ~1 s and only on the failing path; a healthy node never sees it. */
     /* Keep the module in autonomous 1 Hz mode. Idempotent, and re-asserting it
      * every wake is what makes it recover by itself if the module rebooted. */
-    if (s_uss_fail_streak < USS_RETRY_STREAK ||
-        (s_wake_count % USS_RETRY_EVERY_N_WAKES) == 0)
-        (void) uss_start_auto(USS_AUTO_PERIOD_S);
+    (void) uss_start_auto(USS_AUTO_PERIOD_S);
 
     bool uss_ok = uss_sample(&u);
-    /* Back off the recovery. The power-cycle costs ~2 s of awake time (800 ms
-     * rail-down plus the module's boot and a second sample), which is the
-     * single most expensive thing a wake can do. Worth it when a working module
-     * has wedged; pure waste every 5 minutes on a node whose module is absent,
-     * unpowered, or dead -- which is exactly the state a bench board or a
-     * fleet unit without a gas cell sits in. After USS_RETRY_STREAK failures,
-     * attempt it only once an hour; a module that comes back is picked up
-     * within that hour and costs nothing in between. */
-    /* NEVER cut the rail on the first failure. s_uss_fail_streak is updated
-     * below, so here it counts PRIOR consecutive failures -- it was 0 on a
-     * first miss, 0 < USS_RETRY_STREAK was true, and the rail went down.
+
+    /* RECOVERY LADDER -- cheapest rung first, rail cycle LAST.
      *
-     * Measured overnight 2026-09-12: 15 read failures, every one ISOLATED (the
-     * closest pair was two wakes apart), and each produced a power cycle, an
-     * SVSHIFG reset and a forced abs-ToF re-lock. Not one of them needed it.
-     * Requiring a second consecutive failure costs a deployed node 5 extra
-     * minutes before recovering a genuinely dead module, and buys back every
-     * one of those reboots -- each of which also zeroes the volume totalizer. */
-    bool try_recovery = uss_ok ? false
-                      : s_force_uss_recovery ||
-                        (s_uss_fail_streak >= USS_RECOVER_AFTER_FAILS &&
-                         ((s_uss_fail_streak < USS_RETRY_STREAK) ||
-                          ((s_wake_count % USS_RETRY_EVERY_N_WAKES) == 0)));
-    if (!uss_ok && !try_recovery) {
-        ESP_LOGW(TAG, "USS silent (%u wakes) -- recovery backed off",
-                 s_uss_fail_streak);
+     * This used to be a single rung: one failed sample went straight to
+     * board_sensor_power_cycle(). That is the most destructive action available
+     * and it was the FIRST response. Every one of those reboots reset the
+     * module's abs-ToF lock, and a fresh search on a ~1 % lobe margin is close
+     * to a coin flip -- roughly one in four came back locked to the wrong lobe
+     * and then TRACKED it, producing code-135 until something reset it again.
+     * The reboots also reset the volume totalizer. So a single glitched byte
+     * could cost the running total and corrupt measurements for minutes.
+     *
+     * The rungs, in order:
+     *   0. the transaction retry inside uss.c (3 attempts) -- already tried
+     *      before we get here;
+     *   1. read link health. If the module answers THIS, it is alive and on the
+     *      bus, so a power cycle would be pure damage. Just re-assert AUTO;
+     *   2. soft reset -- resets the slave state machine without dropping the
+     *      rail, so the totalizer survives (it is persisted in FRAM now);
+     *   3. rail cycle, only once nothing else answered. */
+    if (!uss_ok) {
+        uss_health_t h;
+        bool alive = uss_read_health(&h);
+
+        if (alive) {
+            ESP_LOGW(TAG, "USS sample failed but link healthy "
+                          "(starts=%u rst=0x%04X up=%us) -- re-asserting AUTO",
+                     h.starts, h.rst_cause, h.uptime_s);
+            (void) uss_start_auto(USS_AUTO_PERIOD_S);
+            uss_ok = uss_sample(&u);
+        }
+
+        if (!uss_ok) {
+            ESP_LOGW(TAG, "USS: soft reset");
+            if (uss_soft_reset()) {
+                vTaskDelay(pdMS_TO_TICKS(USS_SOFT_RESET_SETTLE_MS));
+                (void) uss_start_auto(USS_AUTO_PERIOD_S);
+                uss_ok = uss_sample(&u);
+            }
+        }
+
+        if (!uss_ok) {
+            ESP_LOGW(TAG, "USS still silent, power-cycling the sensor rail");
+            /* 800 ms, not 300: the SENSOR rail is a high-side switch with no
+             * bleed resistor, so when it opens the node is left floating and the
+             * decoupling caps discharge only through the slave's own quiescent
+             * draw. Confirmed on the bench 2026-08-15 with an LED across the
+             * header -- it fades rather than switching off. Too short a window
+             * means no power-on reset at all, which defeats the purpose. */
+            board_sensor_power_cycle(800);
+            /* The module has just rebooted, so STATUS.AUTO is clear -- restart
+             * autonomous mode before sampling, or it would stay in one-shot
+             * until the next wake and the totalizer would never accumulate. */
+            (void) uss_start_auto(USS_AUTO_PERIOD_S);
+            uss_ok = uss_sample(&u);
+            ESP_LOGW(TAG, "USS after power cycle: %s",
+                     uss_ok ? "recovered" : "still silent");
+        }
     }
-    if (!uss_ok && try_recovery) {
-        ESP_LOGW(TAG, "USS silent, power-cycling the sensor rail");
-        /* 800 ms, not 300: the SENSOR rail is a high-side switch with no
-         * bleed resistor, so when it opens the node is left floating and the
-         * decoupling caps discharge only through the slave's own quiescent
-         * draw. Confirmed on the bench 2026-08-15 with an LED across the
-         * header -- it fades rather than switching off. Too short a window
-         * means no power-on reset at all, which defeats the purpose. */
-        board_sensor_power_cycle(800);
-        /* The module has just rebooted, so STATUS.AUTO is clear -- restart
-         * autonomous mode before sampling, or it would stay in one-shot until
-         * the next wake and the totalizer would never accumulate. */
-        (void) uss_start_auto(USS_AUTO_PERIOD_S);
-        uss_ok = uss_sample(&u);
-        ESP_LOGW(TAG, "USS after power cycle: %s", uss_ok ? "recovered" : "still silent");
+    /* Read link health every wake, pass or fail.
+     *
+     * On a FAILED wake it says whether we reached the module at all. On a
+     * PASSING wake it is the baseline that makes the failing one readable: a
+     * drop in uptime_s means the module restarted between wakes, and delta
+     * starts tells us how many address matches it actually saw. Without a
+     * healthy reference the failure numbers mean nothing on their own. */
+    {
+        uss_health_t h;
+        s_uss_health_valid = uss_read_health(&h);
+        if (s_uss_health_valid) {
+            s_uss_rst_cause   = h.rst_cause;
+            s_uss_lh_starts   = h.starts;
+            s_uss_lh_uptime_s = h.uptime_s;
+        }
     }
-    s_uss_fail_streak = uss_ok ? 0
-                      : (s_uss_fail_streak < 0xFFFF ? s_uss_fail_streak + 1 : 0xFFFF);
+
     if (uss_ok) {
         r->uss_flow_ulpm = u.flow_ulpm;
         r->uss_dtof_ps   = u.dtof_ps;
@@ -264,97 +257,11 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
         r->uss_gain      = u.gain;
         r->uss_snr_db2   = u.snr_db2;
         r->uss_status    = u.status;
+        r->uss_seq       = u.seq;
         r->uss_vol_ml    = u.vol_ml;
-        /* Delta since the previous sample. Skipped on the first sample after a
-         * cold boot and whenever the module reports the BOOT bit -- its
-         * counters restart at zero on its own reset, so a difference across
-         * that boundary is meaningless rather than merely inaccurate. */
-        uint16_t dn  = (uint16_t)(u.cap_n       - s_prev_cap_n);
-        uint16_t dbc = (uint16_t)(u.cap_badcode - s_prev_cap_badcode);
-        uint16_t dbs = (uint16_t)(u.cap_badsnr  - s_prev_cap_badsnr);
-        /* Sanity-check the delta instead of trusting the BOOT bit alone.
-         *
-         * BOOT is cleared by the first command, and uss_start_auto() runs
-         * before uss_sample() -- so by the time we look, a module that rebooted
-         * this wake already reports BOOT clear and its counters have restarted
-         * at zero. The subtraction then wraps and produces nonsense: on
-         * 2026-09-06 16:07 that published n=64582, badsnr=65533, i.e. "101.5 %
-         * bad", sitting next to three honest records reading 0.0-0.3 %.
-         *
-         * Two invariants catch it without needing to know why. Bad counts can
-         * never exceed the total, and the module cannot have run more captures
-         * than the interval allows -- 4x the nominal rate is generous headroom
-         * for a period change and still rejects a wrap by three orders. */
-        bool plausible = (dbc <= dn) && (dbs <= dn) &&
-                         (dn <= (uint16_t)(SAMPLE_INTERVAL_S * 4u));
-        if (s_cap_seen && !(u.status & USS_ST_BOOT) && plausible) {
-            r->uss_cap_n       = dn;
-            r->uss_cap_badcode = dbc;
-            r->uss_cap_badsnr  = dbs;
-        } else {
-            r->uss_cap_n = r->uss_cap_badcode = r->uss_cap_badsnr = 0;
-        }
-        r->uss_recov       = (uint8_t)(u.recoveries - s_prev_recov);
-        s_prev_recov       = u.recoveries;
-        r->uss_xt_x10us    = u.xt_applied_x10us;
-
-        /* Link health into the record. Console-only diagnostics are useless
-         * here: the module drops off the bus on a battery-powered node with
-         * light sleep active, and attaching a cable to watch sets
-         * light_sleep_enable = !usb_present, i.e. it stops reproducing the
-         * condition. These two fields are the same evidence, delivered by
-         * telemetry instead. */
-        {
-            uss_health_t h;
-            if (uss_read_health(&h)) {
-                uint16_t ds = (uint16_t)(h.starts - s_prev_lh_starts);
-                r->uss_rst_cause = h.rst_cause;
-                /* Same wrap guard the capture counters need: the module's
-                 * counters restart at zero on its own reset, and BOOT is
-                 * already cleared by then, so a raw subtraction across that
-                 * boundary produces a huge meaningless number. */
-                r->uss_lh_starts = (s_lh_seen && ds <= 4096u) ? ds : 0;
-                s_prev_lh_starts = h.starts;
-                s_lh_seen        = true;
-            } else {
-                /* Unreadable is itself information: either the module predates
-                 * the block, or it did not answer this poll at all. */
-                r->uss_rst_cause = 0;
-                r->uss_lh_starts = 0;
-            }
-        }
-        s_prev_cap_n       = u.cap_n;
-        s_prev_cap_badcode = u.cap_badcode;
-        s_prev_cap_badsnr  = u.cap_badsnr;
-        s_cap_seen         = 1;
-
-        /* Break a stuck abs-ToF lock by power-cycling the module.
-         *
-         * Judged on the COUNTER DELTA, not on uss_code: the single latched
-         * sample we read is biased -- it is whatever capture happened to be
-         * latest, and that is preferentially the first one after a restart, the
-         * one most likely to be bad. r->uss_cap_n is ~300 captures, so
-         * "badcode == n" really does mean every capture failed.
-         *
-         * Three consecutive records is ~15 minutes: far longer than any
-         * transient dropout, short enough that a wedged module is not a lost
-         * deployment. The rail cycle is the same recovery the silent-module path
-         * uses, and it is the only thing measured to clear this state. */
-        if (r->uss_cap_n != 0 && r->uss_cap_n != 0xFFFF &&
-            r->uss_cap_badcode >= r->uss_cap_n) {
-            if (++s_uss_allbad_streak >= USS_ALLBAD_RECOVER) {
-                s_uss_allbad_streak = 0;
-                ESP_LOGW(TAG, "every capture failing -- power-cycling the module");
-                board_sensor_power_cycle(800);
-                (void) uss_start_auto(USS_AUTO_PERIOD_S);
-                uss_ok = uss_sample(&u);
-            }
-        } else {
-            s_uss_allbad_streak = 0;
-        }
         r->uss_tof_ups_q40 = u.tof_ups_q40;
         r->uss_tof_dns_q40 = u.tof_dns_q40;
-        r->sensor_ok |= SOK_USS;
+        r->sensor_ok |= 0x10;
         ESP_LOGI(TAG, "USS ok: code=%u seq=%u dtof=%ld ps tof_ups=%lu tof_dns=%lu q40 "
                       "(%.1f/%.1f us) amp=%u/%u snr=%.1f dB gain=%u vol=%lu mL st=0x%02X",
                  u.code, u.seq, (long) u.dtof_ps,
@@ -367,6 +274,7 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
         r->uss_temp_cC = 0;
         r->uss_amp_ups = r->uss_amp_dns = 0;
         r->uss_code = r->uss_gain = r->uss_snr_db2 = r->uss_status = 0;
+        r->uss_seq = 0;
         r->uss_vol_ml = 0;
         r->uss_tof_ups_q40 = r->uss_tof_dns_q40 = 0;
     }
@@ -376,142 +284,10 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
     if (wf280a_sample(&praw, &traw, &wst)) {
         r->wf_praw = praw;
         r->wf_traw = traw;
-        r->sensor_ok |= SOK_WF280A;
-        ESP_LOGI(TAG, "WF280A: praw=%lu traw=%lu st=0x%02X",
-                 (unsigned long)praw, (unsigned long)traw, wst);
+        r->sensor_ok |= 0x20;
     } else {
         r->wf_praw = r->wf_traw = 0;
     }
-}
-
-/* ===================== power audit ==========================================
- *
- * A direct, automatic measurement of what the ultrasonic board's analog front
- * end costs, in microamps, replacing the multi-day battery-discharge slopes
- * that could not resolve anything smaller than about 10 % of the budget.
- *
- * Method: average the BQ25792's IBAT with the module's rails up, command
- * AUTO_STOP (which drops its 5 V boost and both AFE rails but leaves the
- * MSP430 running), average again, then restore. The difference is the rails.
- *
- * Two design constraints worth recording, because both were nearly got wrong:
- *
- *  - The load step is NOT "cut the SENSOR rail". Making that rail actually fall
- *    needs eco_i2c_hold_low(), because the module's ESD clamps back-feed from an
- *    idle-high bus -- and that call deletes the I2C bus the ammeter itself sits
- *    on. The meter would go blind exactly when the load went away.
- *
- *  - Both halves are taken seconds apart in the same CPU state, so every slow
- *    drift (temperature, pack voltage, sun) cancels. That is what a differential
- *    buys over comparing absolute numbers taken days apart.
- *
- * Only valid on battery: with a charger attached the load step is absorbed by
- * the input and IBAT barely moves. Costs one interval of totalized volume,
- * since AUTO_START zeroes it -- so this runs on a button press, not every wake.
- */
-#define AUDIT_CYCLES       3    /* interleaved up/down pairs */
-#define AUDIT_SAMPLES    160    /* x 50 ms = 8 s per half */
-#define AUDIT_SPACING_MS  50    /* > one ADC conversion cycle, or we average
-                                 * the same register contents 160 times */
-#define AUDIT_SETTLE_MS  700
-
-static int32_t s_audit_rail_ua;   /* AFE rails + boost, uA (mean of the pairs) */
-static int32_t s_audit_se_ua;     /* standard error of that mean */
-static int32_t s_audit_base_ua;   /* node discharge with those rails down, uA */
-static bool    s_audit_valid;
-
-static void power_audit(bool uss_present)
-{
-    s_audit_valid = false;
-    if (!uss_present) return;
-    if (bq_vbus_present()) {
-        ESP_LOGI(TAG, "power audit skipped: charger attached");
-        return;
-    }
-    /* Establish the precondition rather than assuming it. The recovery backoff
-     * can leave AUTO un-asserted for a wake or two after the module reappears,
-     * and uss_stop_auto() succeeds trivially when it was never running -- so
-     * both halves would be measured with the rails already down and the audit
-     * would report a confident, entirely wrong 0 uA. */
-    /* Force a restart so the configured period is actually applied.
-     * uss_start_auto() deliberately returns early when STATUS.AUTO is already
-     * set -- re-issuing AUTO_START would zero the totalizer -- which also means
-     * it never writes AUTO_PERIOD to a module that is already running. Without
-     * this stop first, changing USS_AUTO_PERIOD_S would have no effect on a
-     * module that never rebooted, and the experiment would silently measure the
-     * old rate. */
-    (void) uss_stop_auto();
-    if (!uss_start_auto(USS_AUTO_PERIOD_S)) {
-        ESP_LOGW(TAG, "power audit: autonomous mode unavailable, skipping");
-        return;
-    }
-
-    /* Pin the CPU out of light sleep for the whole audit. Otherwise the ESP's
-     * own draw depends on how tickless idle happened to schedule around our
-     * I2C reads, which is a variable we do not want inside a differential. */
-    esp_pm_lock_handle_t lock = NULL;
-    if (esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "audit", &lock) != ESP_OK)
-        lock = NULL;
-    if (lock) esp_pm_lock_acquire(lock);
-
-    /* Interleaved up/down pairs, not one long A followed by one long B.
-     *
-     * The first attempt (idf-0.12, 2026-09-06) used 40 samples over 2 s per
-     * half and returned +7.5 mA then -1.9 mA on the same hardware minutes
-     * apart -- the second physically impossible, reading rails-down as drawing
-     * MORE than rails-up. All of the scatter was in the rails-up half, because
-     * the module fires a capture burst once a second and 2 s of instantaneous
-     * samples either lands on those bursts or does not. Eight seconds covers
-     * ~8 bursts per half, interleaving cancels any slow drift between halves,
-     * and the spread across pairs is published so the number arrives with its
-     * own error bar instead of an assumption of precision. */
-    int32_t diff[AUDIT_CYCLES];
-    int32_t last_down = 0;
-    for (int c = 0; c < AUDIT_CYCLES; c++) {
-        esp_task_wdt_reset();
-        (void) uss_start_auto(USS_AUTO_PERIOD_S);
-        vTaskDelay(pdMS_TO_TICKS(AUDIT_SETTLE_MS));
-        int32_t up = bq_ibat_avg_ua(AUDIT_SAMPLES, AUDIT_SPACING_MS);
-
-        esp_task_wdt_reset();
-        if (!uss_stop_auto()) {
-            ESP_LOGW(TAG, "power audit: AUTO_STOP refused mid-run, aborting");
-            goto done;
-        }
-        vTaskDelay(pdMS_TO_TICKS(AUDIT_SETTLE_MS));
-        int32_t down = bq_ibat_avg_ua(AUDIT_SAMPLES, AUDIT_SPACING_MS);
-
-        /* IBAT is negative while discharging, so removing a load makes it less
-         * negative and the difference comes out positive. */
-        diff[c] = down - up;
-        last_down = down;
-        ESP_LOGI(TAG, "audit pair %d/%d: up %ld uA, down %ld uA -> %ld uA",
-                 c + 1, AUDIT_CYCLES, (long)up, (long)down, (long)diff[c]);
-    }
-
-    {
-        double mean = 0.0;
-        for (int i = 0; i < AUDIT_CYCLES; i++) mean += diff[i];
-        mean /= AUDIT_CYCLES;
-        double var = 0.0;
-        for (int i = 0; i < AUDIT_CYCLES; i++) {
-            double e = diff[i] - mean;
-            var += e * e;
-        }
-        var /= (AUDIT_CYCLES - 1);                 /* sample variance */
-        double se = sqrt(var / AUDIT_CYCLES);      /* of the mean */
-
-        s_audit_rail_ua = (int32_t) mean;
-        s_audit_se_ua   = (int32_t) se;
-        s_audit_base_ua = last_down;
-        s_audit_valid   = true;
-        ESP_LOGI(TAG, "power audit: USS AFE = %ld +/- %ld uA (n=%d)",
-                 (long)s_audit_rail_ua, (long)s_audit_se_ua, AUDIT_CYCLES);
-    }
-
-done:
-    (void) uss_start_auto(USS_AUTO_PERIOD_S);      /* always restore */
-    if (lock) { esp_pm_lock_release(lock); esp_pm_lock_delete(lock); }
 }
 
 void app_main(void)
@@ -519,9 +295,8 @@ void app_main(void)
     esp_reset_reason_t why = esp_reset_reason();
     bool timer_wake  = board_woke_from_timer();
     bool button_wake = board_woke_from_button();
-    bool motion_wake = board_woke_from_motion();
     bool cold        = (s_rtc_magic != RTC_STATE_MAGIC);
-    bool crashed     = !cold && !timer_wake && !button_wake && !motion_wake;
+    bool crashed     = !cold && !timer_wake && !button_wake;
 
     /* Runtime-enforce the long WDT: sdkconfig regeneration silently reverted
      * TIMEOUT_S to 5 s once (idf-0.5/0.6 boot-looped on the modem's 8 s settle).
@@ -535,42 +310,23 @@ void app_main(void)
         esp_task_wdt_init(&wdt_cfg);
     esp_task_wdt_add(NULL);
 
-    /* MARK THIS IMAGE GOOD, or a single panic silently reverts the board.
+    /* Tell the bootloader this image works, so it stops being a rollback
+     * candidate.
      *
      * partitions.csv has ota_0 and ota_1 and NO factory slot, and
-     * CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y. An app started from a slot in
-     * PENDING_VERIFY that never marks itself valid is rolled back on the next
-     * boot. Nothing here ever called this, so when a watchdog panic loop hit on
-     * 2026-09-11 the bootloader quietly reverted to ota_1 -- a February 2025
-     * Arduino image -- and every serial flash afterwards wrote ota_0, a slot
-     * the bootloader was no longer booting. Hours went into "LTE is broken" and
-     * "the button does not work" before the Arduino-style STA.cpp log lines
-     * gave it away: the firmware under test had not been running at all.
+     * sdkconfig.defaults sets CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y. Without
+     * this call an image that panics before marking itself valid is ROLLED BACK
+     * to the other slot -- and on 2026-09-11 that slot still held a February
+     * 2025 Arduino build, which the board then ran for hours while every
+     * `esptool write_flash 0x10000` reported "Hash of data verified". The write
+     * was fine; it just went to a slot the bootloader had stopped booting.
      *
-     * Called after the watchdog is armed but before any hardware work, so a
-     * hang later still reboots -- it just no longer loses the image. */
-    {
-        const esp_partition_t *run = esp_ota_get_running_partition();
-        esp_ota_img_states_t st;
-        if (run && esp_ota_get_state_partition(run, &st) == ESP_OK &&
-            st == ESP_OTA_IMG_PENDING_VERIFY) {
-            esp_ota_mark_app_valid_cancel_rollback();
-            ESP_LOGI(TAG, "OTA image marked valid (was pending verify)");
-        }
-    }
+     * Placed AFTER the task WDT is armed on purpose: a genuine boot loop that
+     * hangs before this point still gets rolled back, which is the behaviour
+     * rollback exists for. */
+    esp_ota_mark_app_valid_cancel_rollback();
 
     board_init();
-
-
-
-
-
-
-
-
-
-
-
 
     /* Raise the switched SENSOR rail (J404) BEFORE the first I2C transaction.
      *
@@ -584,17 +340,7 @@ void app_main(void)
      * in deep sleep (where nothing is talking anyway). That still leaves the
      * remote-recovery path intact via board_sensor_power_cycle(). */
     board_sensor_power(true);
-    /* Only stamp a fresh bring-up time when the rail was ACTUALLY off, i.e. on
-     * a cold boot. board_deep_sleep() deliberately holds this rail high through
-     * sleep, so on an ordinary timer wake the ultrasonic module never rebooted
-     * and there is nothing to wait for -- yet the wait below was being paid on
-     * every wake: 3 s of awake time, 288 times a day, ~9.6 mAh/day, about 8 %
-     * of the whole node budget, spent waiting for a boot that did not happen.
-     * (The genuine reboot path, board_sensor_power_cycle(), already does its
-     * own BOARD_SENSOR_BOOT_MS wait internally.) */
-    s_sensor_up_us = (cold || crashed)
-                   ? esp_timer_get_time()          /* rail really was off/glitched */
-                   : esp_timer_get_time() - (int64_t)BOARD_SENSOR_BOOT_MS * 1000;
+    s_sensor_up_us = esp_timer_get_time();
 
 #ifdef ECOTRACE_RAIL_BLINK
     /* Bench helper: does GPIO14 actually switch the SENSOR rail? Put an LED
@@ -648,120 +394,43 @@ void app_main(void)
         }
         if (button_wake) ESP_LOGI(TAG, "button wake -- sample + upload now");
     }
-    s_motion_flag = motion_wake;
-    if (motion_wake) {
-        if (s_motion_streak < 0xFF) s_motion_streak++;
-        ESP_LOGI(TAG, "motion wake (%u in a row)", s_motion_streak);
-    } else if (timer_wake || button_wake) {
-        s_motion_streak = 0;
-    }
-
-/* Top of the repeatable measurement cycle. Everything above is one-time init
- * and wake classification; everything below runs once per SAMPLE_INTERVAL_S.
- *
- * A label rather than a for(;;) purely to keep the diff honest -- wrapping the
- * ~200 lines below in a loop would re-indent all of them for a five-line
- * behaviour change. Only USB_STAY_AWAKE jumps back here; on battery the cycle
- * still ends in board_deep_sleep(), which never returns. */
-uss_cycle:
     s_boot_count++;
-    s_force_uss_recovery = button_wake;   /* consumed by read_sample() below */
 
     /* Charger first: park-mode decision needs VBAT before we touch anything. */
     bool bq_ok = bq_begin();
-    if (bq_ok) {
-        /* Order matters: EN_IBAT/SFET_PRESENT before the ADC starts. Enabling
-         * the sense path after bq_adc_enable()'s 150 ms settle left the IBAT
-         * channel un-converted when read_sample() ran a moment later -- the
-         * discharge column read a flat zero for 22 days. */
-        bq_ibat_sense(true);
-        bq_adc_enable(true);
-    }
+    if (bq_ok) bq_adc_enable(true);
     uint16_t vbat = bq_ok ? bq_vbat_mv() : 0;
 
     /* Battery park mode: below PARK_VBAT_MV (and nothing plugged in) do the
      * absolute minimum -- no flash writes, no sensors, long sleeps -- until the
      * pack recovers past the hysteresis threshold. Brownout mid-flash-write is
      * the failure this avoids. */
-    bool usb_present = bq_ok && bq_ac1_present();
+    bool input_present = bq_ok && (bq_ac1_present() || bq_ac2_present());
 
-    /* Power management. Frequency scaling always; automatic LIGHT SLEEP only
-     * when USB is absent.
-     *
-     * Light sleep stops the clock during every vTaskDelay -- sensor
-     * conversions, the ADC settle, the rail cycle -- which is most of a wake,
-     * so it is the single biggest saving available on this side. But the C6's
-     * USB-Serial/JTAG peripheral loses its clock with it, and the console does
-     * not take a PM lock, so the port stops enumerating: no logs, and no
-     * wake-window flashing. On a deployed node nobody is watching and that is
-     * a fine trade; on the bench it makes the board unreachable.
-     *
-     * USB presence is exactly the right discriminator -- if a cable is plugged
-     * in, someone is working on it. */
+    /* Power management: frequency scaling 40-80 MHz, light sleep OFF. */
     esp_pm_config_t pm = {
         .max_freq_mhz = 80,
         .min_freq_mhz = 40,                    /* XTAL */
-        .light_sleep_enable = !usb_present,
+        /* NEVER true. Automatic light sleep is what broke the I2C link to the
+         * module: measured 2026-09-14, 0/11 records failed with it off and 4/8
+         * with it on (p = 0.018), every failure losing exactly the two devices
+         * on the switched sensor rail. It was worth +0.1 uA. Frequency scaling
+         * on its own was clean across all 11 and is kept.
+         *
+         * The sdkconfig also omits CONFIG_FREERTOS_USE_TICKLESS_IDLE, so
+         * esp_pm_configure() would reject light sleep even if this were true.
+         * Two independent guarantees, on purpose. */
+        .light_sleep_enable = false,
     };
     esp_err_t pm_err = esp_pm_configure(&pm);
     if (pm_err != ESP_OK)
         ESP_LOGW(TAG, "esp_pm_configure failed: %s", esp_err_to_name(pm_err));
     else
-        ESP_LOGI(TAG, "PM: 40-80 MHz, light sleep %s",
-                 usb_present ? "OFF (USB attached)" : "on");
-
-#if USS_LINK_TEST_N
-    /* LINK CHARACTERISATION. Diagnostic build only -- see config.h.
-     *
-     * Deliberately overrides the light-sleep policy set immediately above,
-     * because that policy is itself the observer effect: light sleep is
-     * disabled whenever USB is attached, so the only way to watch the console
-     * is to stop reproducing the condition under test. Here the arms set it
-     * explicitly, so the field condition can be observed with a cable in. */
-    {
-        ESP_LOGW(TAG, "=== USS link test: %d transactions x %d interleaved blocks ===",
-                 USS_LINK_TEST_N, USS_LINK_TEST_BLOCKS);
-        ESP_LOGW(TAG, "arm  lightsleep   ok   tx_err  rx_err  crc  id  stale | slave_starts");
-        for (int blk = 0; blk < USS_LINK_TEST_BLOCKS; blk++) {
-            for (int arm = 0; arm < 2; arm++) {
-                uss_linkstat_t s;
-                esp_pm_config_t p = { .max_freq_mhz = 80, .min_freq_mhz = 40,
-                                      .light_sleep_enable = (arm == 1) };
-                esp_pm_configure(&p);
-                vTaskDelay(pdMS_TO_TICKS(300));      /* let the new policy settle */
-                esp_task_wdt_reset();
-                uss_link_probe(USS_LINK_TEST_N, &s);
-                esp_task_wdt_reset();
-                ESP_LOGW(TAG, "%d/%d  %-10s %4lu   %4lu    %4lu  %3lu %3lu  %4lu | %u of %d",
-                         blk + 1, USS_LINK_TEST_BLOCKS, (arm == 1) ? "ON" : "off",
-                         (unsigned long)s.ok, (unsigned long)s.err_tx,
-                         (unsigned long)s.err_rx, (unsigned long)s.err_crc,
-                         (unsigned long)s.err_id, (unsigned long)s.err_stale,
-                         s.slave_starts_delta, USS_LINK_TEST_N);
-            }
-        }
-        {
-            uss_health_t h;
-            if (uss_read_health(&h))
-                ESP_LOGW(TAG, "module health: rst_cause=0x%04X uptime=%us "
-                              "starts=%u stops=%u rx=%u tx=%u cmds=%u lastcmd=0x%02X",
-                         h.rst_cause, h.uptime_s, h.starts, h.stops,
-                         h.rx_bytes, h.tx_bytes, h.cmds, h.last_cmd);
-            else
-                ESP_LOGW(TAG, "module health block unreadable "
-                              "(absent, corrupt, or firmware predates it)");
-        }
-        ESP_LOGW(TAG, "=== USS link test done ===");
-        esp_pm_configure(&pm);                   /* restore the normal policy */
-    }
-#endif
-
-    bool input_present = bq_ok && (usb_present || bq_ac2_present());
+        ESP_LOGI(TAG, "PM: 40-80 MHz DFS, light sleep permanently off");
     if (bq_ok && !input_present) {
         if (s_parked && vbat < PARK_RESUME_VBAT_MV) {
             ESP_LOGW(TAG, "parked (VBAT %u mV) -- sleeping %d s", vbat, PARK_SLEEP_S);
             bq_adc_disable();
-            bq_ibat_sense(false);   /* measured 2026-09-08: 321 uA if left on */
             s_last_sleep_s = PARK_SLEEP_S;
             board_deep_sleep(PARK_SLEEP_S);
         }
@@ -769,7 +438,6 @@ uss_cycle:
             ESP_LOGW(TAG, "entering park mode (VBAT %u mV < %d)", vbat, PARK_VBAT_MV);
             s_parked = 1;
             bq_adc_disable();
-            bq_ibat_sense(false);   /* measured 2026-09-08: 321 uA if left on */
             s_last_sleep_s = PARK_SLEEP_S;
             board_deep_sleep(PARK_SLEEP_S);
         }
@@ -781,6 +449,7 @@ uss_cycle:
 
     solar_status_t sol = { 0 };
     if (bq_ok) {
+        bq_ibat_sense(true);
         bq_configure_charging(CHARGE_CURRENT_MA, 0, 0);
         bq_enable_acdrv1(true);
         bq_enable_acdrv2(true);
@@ -789,9 +458,7 @@ uss_cycle:
         time_t now = time(NULL);
         int32_t day_num = (now >= 1767225600 && now < 2082758400)
                         ? (int32_t)((now + TZ_OFFSET_MIN * 60) / 86400) : -1;
-        /* Cheap bookkeeping every wake; the expensive hill climb every Nth. */
-        bool do_mppt = (s_wake_count % MPPT_EVERY_N_WAKES) == 0;
-        sol = solar_on_wake(SAMPLE_INTERVAL_S, day_num, do_mppt);
+        sol = solar_on_wake(SAMPLE_INTERVAL_S, day_num);
     } else {
         ESP_LOGE(TAG, "BQ25792 not found -- battery data will be zero");
     }
@@ -816,16 +483,9 @@ uss_cycle:
      * identical in the summary above; this line separates them. */
     ESP_LOGI(TAG, "sensor_ok=0x%02X  BQ:%c LTR303:%c SC7A20:%c MS5837:%c USS:%c WF280A:%c",
              r.sensor_ok,
-             (r.sensor_ok & SOK_BQ) ? 'y' : 'N',
-             (r.sensor_ok & SOK_LTR303) ? 'y' : 'N',
+             (r.sensor_ok & 0x01) ? 'y' : 'N', (r.sensor_ok & 0x02) ? 'y' : 'N',
              (r.sensor_ok & 0x04) ? 'y' : 'N', (r.sensor_ok & 0x08) ? 'y' : 'N',
              (r.sensor_ok & 0x10) ? 'y' : 'N', (r.sensor_ok & 0x20) ? 'y' : 'N');
-
-    /* A button press means someone is standing at the board wanting an answer,
-     * which is exactly when spending ~5 s and one totalizer interval on a real
-     * current measurement is worth it. The same press forces an upload below,
-     * so the number reaches ThingsBoard in the same wake. */
-    if (button_wake) power_audit((r.sensor_ok & SOK_USS) != 0);
 
     /* Upload if due (or the button asked). Tempo is bounded: 2 quick retries,
      * then only the 12 h schedule -- an outage costs ~2 short attempts a day
@@ -844,10 +504,10 @@ uss_cycle:
             .sun_hours    = sol.sun_hours,
             .voc_max_mv   = sol.voc_max_mv,
             .uptime_s     = s_uptime_s,
-            .audit_valid  = s_audit_valid,
-            .audit_rail_ua = s_audit_rail_ua,
-            .audit_se_ua  = s_audit_se_ua,
-            .audit_base_ua = s_audit_base_ua,
+            .uss_health_valid = s_uss_health_valid,
+            .uss_rst_cause    = s_uss_rst_cause,
+            .uss_lh_starts    = s_uss_lh_starts,
+            .uss_lh_uptime_s  = s_uss_lh_uptime_s,
         };
         if (ctx.deep_search) s_last_deep_uptime = s_uptime_s;
 
@@ -868,7 +528,6 @@ uss_cycle:
         }
     }
 
-
     if (bq_ok) {
         bq_adc_disable();
         bq_ibat_sense(false);   /* EN_IBAT off across sleep (quiescent) */
@@ -880,16 +539,6 @@ uss_cycle:
         !sol.usb_present && !sol.solar_present)
         sleep_s = SAMPLE_INTERVAL_S * CRITICAL_INTERVAL_MULT;
 
-    /* Clear the latch (or the INT line stays asserted and the next sleep returns
-     * immediately) and re-arm -- unless we are in a motion burst, in which case
-     * leave it disarmed until the next ordinary timer wake. */
-    (void) sc7a20_motion_fired();
-    bool arm_motion = MOTION_WAKE_ENABLE &&
-                      (s_motion_streak < MOTION_WAKE_BURST_MAX);
-    if (arm_motion) arm_motion = sc7a20_arm_motion(MOTION_THRESHOLD_MG);
-    else ESP_LOGW(TAG, "motion wakes suppressed (%u in a row)", s_motion_streak);
-    board_set_motion_wake(arm_motion);
-
     s_crash_count  = 0;   /* wake completed cleanly */
     s_last_sleep_s = sleep_s;
 
@@ -897,145 +546,14 @@ uss_cycle:
      * seconds to enumerate after a wake, so the sampling log at the top of the
      * cycle is unobservable on a console that attaches mid-wake -- this recap
      * always lands. */
-    /* caps/bad/badsnr are the DELTAS since the previous record, i.e. the real
-     * rate over ~300 captures. Without them the recap shows a single sampled
-     * code -- one coin flip out of 300 -- which is exactly what made the
-     * code-135 rate invisible for days. Logged here as well as published so the
-     * console alone is a sufficient instrument while a cable is attached. */
-    ESP_LOGI(TAG, "USS recap: st=0x%02X%s code=%u caps=%u bad=%u badsnr=%u xt=%uus recov=%u "
-                  "vol=%lu mL tof=%.2f/%.2f us dtof=%.4f us",
+    ESP_LOGI(TAG, "USS recap: st=0x%02X%s code=%u vol=%lu mL tof=%.2f/%.2f us dtof=%.4f us",
              r.uss_status, (r.uss_status & 0x08) ? " AUTO" : "", r.uss_code,
-             r.uss_cap_n, r.uss_cap_badcode, r.uss_cap_badsnr,
-             (unsigned)r.uss_xt_x10us * 10u, r.uss_recov,
              (unsigned long)r.uss_vol_ml,
              r.uss_tof_ups_q40 / 1099511.627776,
              r.uss_tof_dns_q40 / 1099511.627776,
              r.uss_dtof_ps / 1e6f);
 
     ESP_LOGI(TAG, "sleeping %lu s", (unsigned long)sleep_s);
-    /* Draining the console costs 200 ms of awake time on EVERY wake -- ~0.6
-     * mAh/day at a 5 min interval, for output nobody can see unless USB is
-     * attached. Pay it only when someone is actually watching. */
-    if (sol.usb_present) vTaskDelay(pdMS_TO_TICKS(200));
-
-    /* USB attached: keep the console alive instead of deep sleeping.
-     *
-     * USB presence is bq_ac1_present(), i.e. the USB port specifically -- solar
-     * arrives on AC2 -- so this cannot keep a field node awake; it only ever
-     * triggers with a bench cable in. Deep sleep kills the USB-Serial/JTAG
-     * peripheral, so every 5 minute cycle dropped the console and made the
-     * board impossible to watch or talk to while plugged in.
-     *
-     * LOOP, DO NOT esp_restart(). The first version restarted, and measured
-     * 2026-09-10 that comes back as "cold boot (reset reason 3)" -- esp_restart()
-     * does NOT preserve RTC memory here. That wiped s_boot_count, s_wake_count,
-     * s_uptime_s, s_parked AND s_prev_cap_* -- the capture-counter baselines the
-     * USS bad-rate telemetry differences against. A cable left plugged in would
-     * have quietly destroyed the very counters the settle experiment reads.
-     *
-     * The WDT is fed each second rather than deleted, so a hang during the wait
-     * is still caught. */
-#if USB_STAY_AWAKE
-    if (sol.usb_present) {
-        /* Print the upload countdown: it is the only way to see that the
-         * scheduler advance below is actually happening. Without it the failure
-         * mode is silent for a full UPLOAD_PERIOD_S. */
-        ESP_LOGI(TAG, "USB attached: staying awake %lu s (no deep sleep), "
-                      "next upload in %ld s",
-                 (unsigned long)sleep_s, (long)s_next_upload_in_s);
-        /* How much of sleep_s was actually spent, and whether the button ended
-         * the wait early. Both are consumed after the #endif. */
-        uint32_t waited  = sleep_s;
-        bool     pressed = false;
-#if USS_POLL_STRESS_S
-        /* ACCELERATED POLL TEST.
-         *
-         * The code-135 trigger is the master's I2C poll -- proven from the
-         * record-boundary statistics (only 1 partial record in 188; latches
-         * only ever begin at a boundary; 3 of 4 episodes preceded by a record
-         * with exactly one bad capture). Polling 60x more often than the normal
-         * 300 s therefore multiplies the event rate by ~60 and turns a two-hour
-         * measurement into ten minutes.
-         *
-         * This is accelerated-life testing, not the field condition: it is only
-         * legitimate BECAUSE the trigger is known. It reports the counter
-         * deltas per poll, so a poll that corrupts a capture shows up directly
-         * as bad>0 rather than waiting for a latch. */
-        {
-            uss_result_t su;
-            uint16_t pn = 0, pb = 0;
-            bool have = false;
-            uint32_t polls = 0, hits = 0;
-            for (uint32_t i = 0; i < sleep_s; i += USS_POLL_STRESS_S) {
-                for (uint32_t j = 0; j < USS_POLL_STRESS_S; j++) {
-                    vTaskDelay(pdMS_TO_TICKS(1000));
-                    esp_task_wdt_reset();
-                }
-                if (!uss_sample(&su)) continue;
-                polls++;
-                if (have) {
-                    uint16_t dn = (uint16_t)(su.cap_n - pn);
-                    uint16_t db = (uint16_t)(su.cap_badcode - pb);
-                    if (dn && dn < 1000) {
-                        if (db) hits++;
-                        ESP_LOGW(TAG, "stress poll %lu: caps=%u bad=%u  (hits %lu/%lu)",
-                                 (unsigned long)polls, dn, db,
-                                 (unsigned long)hits, (unsigned long)polls);
-                    }
-                }
-                pn = su.cap_n; pb = su.cap_badcode; have = true;
-            }
-            ESP_LOGW(TAG, "stress window done: %lu polls, %lu with bad captures",
-                     (unsigned long)polls, (unsigned long)hits);
-        }
-#else
-        /* Poll the button, do not just sleep.
-         *
-         * board_woke_from_button() reads esp_sleep_get_wakeup_cause(), which is
-         * only ever set by a deep sleep -- and this branch exists precisely to
-         * avoid deep sleep. So with a cable attached NO press could ever be
-         * seen, whatever the flag handling below did. The 2026-09-11 fix (clear
-         * the one-shot flags at the end of the lap) repaired a genuine latch
-         * bug but not this: it made a press that was never detected survive
-         * correctly. Hence the level poll.
-         *
-         * 50 ms granularity, not 1 s: at 1 s the button has to be held for up
-         * to a full second to register, which is indistinguishable from
-         * "the button does nothing". */
-        for (waited = 0; waited < sleep_s && !pressed; waited++) {
-            for (int k = 0; k < 20 && !pressed; k++) {
-                vTaskDelay(pdMS_TO_TICKS(50));
-                pressed = board_button_pressed();
-            }
-            esp_task_wdt_reset();
-        }
-        if (pressed)
-            ESP_LOGI(TAG, "button pressed while awake (after %lu s) -- "
-                          "sample + upload now", (unsigned long)waited);
-#endif
-        /* Do what a timer wake would have done to the schedulers. They are
-         * advanced up at the wake-classification block, which `goto uss_cycle`
-         * jumps back PAST -- so without this, s_next_upload_in_s never counts
-         * down and the board stops uploading entirely once the first upload
-         * sets it to UPLOAD_PERIOD_S. That fails only while a cable is
-         * attached, i.e. exactly when someone is watching the console rather
-         * than the telemetry, so it would have gone unnoticed. */
-        s_uptime_s         += waited;
-        s_next_upload_in_s -= (int32_t)waited;
-        s_wake_count++;
-        /* Set the one-shot wake flags HERE, at the end of the lap -- not at the
-         * top of the cycle. They are read further down for power_audit() and
-         * for `s_next_upload_in_s = 0` (upload now), so clearing them early
-         * made a press do nothing even once it WAS detected.
-         *
-         * Two separate bugs, both introduced with USB_STAY_AWAKE and both found
-         * 2026-09-11: this ordering one, and -- the reason a press still did
-         * nothing after it was fixed -- that no press was ever detected in the
-         * first place, because there is no deep sleep here to wake from. */
-        button_wake = pressed;              /* a press ends the wait, not the flag */
-        motion_wake = false;
-        goto uss_cycle;                     /* RTC state intact */
-    }
-#endif
+    vTaskDelay(pdMS_TO_TICKS(200));   /* drain console */
     board_deep_sleep(sleep_s);
 }

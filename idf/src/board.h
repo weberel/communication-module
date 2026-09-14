@@ -13,23 +13,12 @@ extern "C" {
 
 #define ECO_PIN_LED          1
 #define ECO_PIN_QON          2    /* button / BQ QON, external pull-up, EXT1 wake */
-#define ECO_PIN_INT_SHARED   3    /* shared sensor INT (SC7A20 + LTR-303), external
-                                   * pull-up, ACTIVE LOW, EXT1 wake. GPIO0-7 are the
-                                   * LP-capable pins on the C6, so 3 can wake deep sleep. */
 #define ECO_PIN_SENSOR_PWR   14   /* external sensor rail, active HIGH */
 #define ECO_PIN_MODEM_PWRKEY 22   /* via inverter: HIGH = asserted */
 #define ECO_PIN_MODEM_PWR_EN 23   /* HIGH = modem rail on */
-/* Modem UART pads. Both carry a 2.2 kOhm pull-up to the ALWAYS-ON 3V3 (R405 on
- * IO20, R408 on IO21), so a pad left LOW across deep sleep sinks
- * 3.3 V / 2.2 kOhm = 1.50 mA. Must match MODEM_UART_TX/RX in uplink.c. */
-#define ECO_PIN_MODEM_TX     20
-#define ECO_PIN_MODEM_RX     21
 
-/* Safe GPIO state: modem rail off, sensor rail ON, LED off, and PWRKEY driven
- * HIGH -- which through the Q409 inverter means ASSERTED, costing ~0.3 mA (see
- * board_deep_sleep below). Anything that measures a sleep floor after calling
- * this is NOT measuring an untouched board. Releases sleep holds first.
- * Call once at the top of app_main. */
+/* Safe GPIO state: modem rail off, PWRKEY idle-high, sensor rail off, LED off.
+ * Releases sleep holds first. Call once at the top of app_main. */
 void board_init(void);
 
 /* Milliseconds to allow the ultrasonic slave to boot after its rail returns.
@@ -58,13 +47,6 @@ void board_sensor_power(bool on);
  * off. A respin should add ~100k to GND on that node. */
 void board_sensor_power_cycle(uint32_t off_ms);
 
-/* Arm (or disarm) the shared sensor INT as a deep-sleep wake source. Off by
- * default: a board with nothing driving that line must not be woken by it. */
-void board_set_motion_wake(bool enable);
-
-/* Was this wake caused by the shared sensor INT rather than the button/timer? */
-bool board_woke_from_motion(void);
-
 /* Deep sleep with rails held safe. PWRKEY is held LOW (deasserted) through
  * sleep -- holding it asserted burns ~0.3 mA in the Q409 inverter (dl-2.10
  * lesson). Wakes on timer or the QON button (EXT1). Never returns. */
@@ -72,10 +54,6 @@ void board_deep_sleep(uint32_t seconds);
 
 bool board_woke_from_timer(void);
 bool board_woke_from_button(void);
-
-/* Live button level (pressed == QON low). Needed only while the board stays
- * awake, where no EXT1 wake ever happens. */
-bool board_button_pressed(void);
 
 #ifdef __cplusplus
 }
