@@ -5,7 +5,18 @@
  */
 #pragma once
 
-#define FW_VERSION              "idf-0.15"      /* idf-0.14 + uss_seq telemetry */
+#define FW_VERSION              "idf-0.28"      /* + raw totalizer telemetry (module now PROTO 3) */
+
+/* DEBUG ONLY -- pad the flash log up to this many pending records so a drain
+ * can be timed without waiting 12 h for a real backlog. 0 disables.
+ *
+ * 120 is chosen to match the real thing: the 3-day soak showed cycles starting
+ * with 80-128 pending, and the drain cost is what we are measuring, so the
+ * count has to be representative rather than convenient.
+ *
+ * MUST be 0 for any real soak. With it set, every cold boot tops the log back
+ * up to the target and uploads duplicate rows. */
+#define ECO_FAKE_BACKLOG        0
 
 /* ---- Duty cycle ---- */
 #define SAMPLE_INTERVAL_S       300     /* 5 min */

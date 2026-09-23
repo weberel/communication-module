@@ -68,3 +68,17 @@ CONFIG_PM_ENABLE=y
 # reserved segment, which is IDF-internal retain state, not ours to shrink.
 # The prize was a few tens of ms of CPU per wake, so it is not worth the surgery.
 # CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP=y
+
+# ---- MQTT 5 ----
+# Required by uplink.c (.session.protocol_ver = MQTT_PROTOCOL_V_5). Without it
+# esp_mqtt_client_init() refuses outright -- "Please first enable
+# MQTT_PROTOCOL_5 feature in menuconfig" -- and MQTT never comes up at all.
+#
+# Not cosmetic: on 3.1.1 a broker that REFUSES a publish still returns PUBACK,
+# and publish_acked() advances the flash ring cursor on PUBACK, so a refused
+# publish would silently discard records that never arrived. Reason code 0x87
+# makes refusal visible.
+#
+# NOTE this file only SEEDS a fresh config; an existing sdkconfig.datalogger_idf
+# wins, so that file was edited too.
+CONFIG_MQTT_PROTOCOL_5=y

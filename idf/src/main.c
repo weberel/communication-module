@@ -46,6 +46,15 @@ static const char *TAG = "ecotrace";
  * BOARD_SENSOR_BOOT_MS from that point before its I2C slave answers. */
 static int64_t s_sensor_up_us;
 
+/* True only when THIS wake actually powered the module up (cold boot, or a
+ * recovery power cycle). On a timer wake the SENSOR rail was held on through
+ * deep sleep and the module has been running for hours, so there is no boot to
+ * wait out. Gating on the FLAG, not on the timestamp: esp_timer_get_time()
+ * restarts at 0 every boot, so leaving s_sensor_up_us unstamped makes
+ * elapsed_ms ~= the current uptime (~500 ms), which is still < 3000 and waits
+ * anyway. That mistake cost a measurement cycle on 2026-09-15. */
+static bool s_sensor_cold_up;
+
 /* ---- state surviving deep sleep (and crash reboots) ---- */
 #define RTC_STATE_MAGIC 0x8BADF00Du
 static RTC_DATA_ATTR uint32_t s_rtc_magic;
@@ -65,6 +74,23 @@ static bool     s_uss_health_valid;
 static uint16_t s_uss_rst_cause;
 static uint16_t s_uss_lh_starts;
 static uint16_t s_uss_lh_uptime_s;
+
+/* Previous raw-totalizer read, kept across deep sleep so the K cross-check can
+ * diff consecutive wakes. RTC_DATA_ATTR, not NVS: this is a diagnostic, losing
+ * it on a power cycle costs one skipped log line, and it is nowhere near worth
+ * a flash write every 5 minutes. */
+RTC_DATA_ATTR static int64_t  s_uss_tot_prev_s1;
+RTC_DATA_ATTR static int64_t  s_uss_tot_prev_s0;
+RTC_DATA_ATTR static uint32_t s_uss_tot_prev_n;
+RTC_DATA_ATTR static uint32_t s_uss_tot_prev_ml;
+RTC_DATA_ATTR static bool     s_uss_tot_prev_valid;
+
+/* Last uss_seq we published, for stale-frame detection. RTC_DATA_ATTR so the
+ * check survives deep sleep -- the fault it looks for lasted ten hours, i.e.
+ * ~120 wakes, so a check that reset every wake would never have seen it. */
+RTC_DATA_ATTR static uint16_t s_uss_seq_prev;
+RTC_DATA_ATTR static bool     s_uss_seq_valid;
+RTC_DATA_ATTR static uint16_t s_uss_stale_n;
 static RTC_DATA_ATTR uint8_t  s_retries_left;
 static RTC_DATA_ATTR uint32_t s_last_deep_uptime;   /* deep search once/day */
 static RTC_DATA_ATTR uint8_t  s_upload_inflight;
@@ -155,7 +181,7 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
      * booting, then waste a power cycle on it. */
     {
         int64_t elapsed_ms = (esp_timer_get_time() - s_sensor_up_us) / 1000;
-        if (elapsed_ms < BOARD_SENSOR_BOOT_MS)
+        if (s_sensor_cold_up && elapsed_ms < BOARD_SENSOR_BOOT_MS)
             vTaskDelay(pdMS_TO_TICKS(BOARD_SENSOR_BOOT_MS - elapsed_ms));
     }
 
@@ -258,10 +284,73 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
         r->uss_snr_db2   = u.snr_db2;
         r->uss_status    = u.status;
         r->uss_seq       = u.seq;
+        r->uss_recoveries = u.recoveries;
+
+        /* WEDGED READ PATH. uss_code cannot see this: during the 2026-09-22
+         * event every USS field was frozen on one frame for ten hours while the
+         * code byte stayed 122 (valid measurement). uss_seq is the only field
+         * that separates "measured again, same answer" from "handed us the same
+         * answer again" -- the module increments it per capture, so an
+         * unchanged seq means no new measurement was produced at all.
+         *
+         * Counted and reported, deliberately not acted on: the cause is not
+         * understood, and the escalation that suggests itself (uss_soft_reset,
+         * which preserves the FRAM totalizer) would be an unproven remedy for
+         * an unproven diagnosis. */
+        if (s_uss_seq_valid && u.seq == s_uss_seq_prev) {
+            if (s_uss_stale_n != 0xFFFFu) s_uss_stale_n++;
+            ESP_LOGE(TAG, "USS STALE: seq %u unchanged since the last record "
+                          "(code=%u claims valid) -- %u consecutive",
+                     u.seq, u.code, s_uss_stale_n);
+        } else {
+            s_uss_stale_n = 0;
+        }
+        s_uss_seq_prev  = u.seq;
+        s_uss_seq_valid = true;
         r->uss_vol_ml    = u.vol_ml;
         r->uss_tof_ups_q40 = u.tof_ups_q40;
         r->uss_tof_dns_q40 = u.tof_dns_q40;
         r->sensor_ok |= 0x10;
+
+        /* Raw totalizer. A module still on PROTO 2 simply has nothing here, so
+         * this failing is not an error -- uss_vol_ml above stays authoritative
+         * until both sides are flashed. */
+        uss_totals_t tot;
+        if (uss_read_totalizer(&tot)) {
+            r->uss_s1        = tot.s1;
+            r->uss_s0        = tot.s0;
+            r->uss_tot_skip  = tot.skip;
+            r->uss_tot_flags = tot.flags;
+
+            /* Cross-check against the calibrated path while BOTH totalizers
+             * run. The geometry constant K is not known yet -- calibration
+             * against the MFC is what determines it -- so derive it here from
+             * the validated VOL_ML path and let it fall out of the soak
+             * instead of guessing a number and fitting the data to it.
+             *
+             *     K [uL per Q24-count] = d(vol_uL) / (dS1 / 2^24)
+             *
+             * A K that holds steady across records IS the evidence that the raw
+             * path reproduces the calibrated one; a K that drifts with flow or
+             * temperature says the two disagree and the raw path is not yet
+             * trustworthy. This is a diagnostic, not a control path -- nothing
+             * downstream consumes it. */
+            if (s_uss_tot_prev_valid && tot.n != s_uss_tot_prev_n) {
+                int64_t ds1 = tot.s1 - s_uss_tot_prev_s1;
+                int64_t ds0 = tot.s0 - s_uss_tot_prev_s0;
+                double  dml = (double) u.vol_ml - (double) s_uss_tot_prev_ml;
+                double  q24 = (double) ds1 / 16777216.0;
+                ESP_LOGI(TAG, "USS raw: dS1=%lld dS0=%lld skip=%u  "
+                              "K_est=%.6g uL/count (dVOL=%.0f mL)",
+                         (long long) ds1, (long long) ds0, tot.skip,
+                         (q24 != 0.0) ? (dml * 1000.0 / q24) : 0.0, dml);
+            }
+            s_uss_tot_prev_s1 = tot.s1;
+            s_uss_tot_prev_s0 = tot.s0;
+            s_uss_tot_prev_n  = tot.n;
+            s_uss_tot_prev_ml = u.vol_ml;
+            s_uss_tot_prev_valid = true;
+        }
         ESP_LOGI(TAG, "USS ok: code=%u seq=%u dtof=%ld ps tof_ups=%lu tof_dns=%lu q40 "
                       "(%.1f/%.1f us) amp=%u/%u snr=%.1f dB gain=%u vol=%lu mL st=0x%02X",
                  u.code, u.seq, (long) u.dtof_ps,
@@ -275,8 +364,12 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
         r->uss_amp_ups = r->uss_amp_dns = 0;
         r->uss_code = r->uss_gain = r->uss_snr_db2 = r->uss_status = 0;
         r->uss_seq = 0;
+        r->uss_recoveries = 0;
         r->uss_vol_ml = 0;
         r->uss_tof_ups_q40 = r->uss_tof_dns_q40 = 0;
+        r->uss_s1 = r->uss_s0 = 0;
+        r->uss_tot_skip = 0;
+        r->uss_tot_flags = 0;
     }
 
     uint32_t praw, traw;
@@ -340,7 +433,27 @@ void app_main(void)
      * in deep sleep (where nothing is talking anyway). That still leaves the
      * remote-recovery path intact via board_sensor_power_cycle(). */
     board_sensor_power(true);
-    s_sensor_up_us = esp_timer_get_time();
+    /* Stamp this ONLY on a cold boot.
+     *
+     * read_sample() waits out BOARD_SENSOR_BOOT_MS (3 s) from this timestamp
+     * before the first USS transaction, to avoid NACKing a module that is still
+     * booting. But the module only boots when the rail actually comes up, and
+     * board_deep_sleep() deliberately leaves the SENSOR rail ON ("dropping it
+     * does not save power, it costs power" -- the 4k7 pull-ups back-feed the
+     * sleeping board). So on a timer wake the module has been running for hours:
+     * measured lh_uptime of 9.8 h across many wakes.
+     *
+     * Stamping unconditionally therefore made EVERY wake wait 3 s for a boot
+     * that never happened. Measured 2026-09-15 on a JS220: 2820 ms of a ~3500 ms
+     * wake, at ~16 mA, 288 times a day -- 45 of the 59 mA*s per wake, i.e. ~76 %
+     * of the wake energy and ~3.6 mAh/day on a 20 mAh/day node.
+     *
+     * s_sensor_up_us is a plain static (not RTC_DATA_ATTR), so on a warm wake it
+     * stays 0 and the elapsed check trivially passes -- no wait. The recovery
+     * path is unaffected: board_sensor_power_cycle() does its own
+     * vTaskDelay(BOARD_SENSOR_BOOT_MS) after raising the rail. */
+    s_sensor_up_us   = esp_timer_get_time();
+    s_sensor_cold_up = cold;
 
 #ifdef ECOTRACE_RAIL_BLINK
     /* Bench helper: does GPIO14 actually switch the SENSOR rail? Put an LED
@@ -466,6 +579,28 @@ void app_main(void)
     LogRecord r;
     read_sample(&r, &sol, bq_ok);
     flashlog_append(&r);
+
+#if ECO_FAKE_BACKLOG > 0
+    /* ---- DEBUG: synthetic backlog (config.h ECO_FAKE_BACKLOG) -------------
+     * Re-append the record we just built until the log holds the target depth.
+     * Same record size and same JSON length as the real thing, which is what
+     * the drain actually costs; only the timestamps differ, back-dated one
+     * sample interval apart so the server sees distinct samples instead of
+     * collapsing them onto one.
+     *
+     * Bounded rather than while(pending<target): if an append ever fails this
+     * must not spin with the watchdog running. */
+    {
+        uint32_t want = ECO_FAKE_BACKLOG;
+        for (uint32_t i = 1; i <= want && flashlog_pending() < want; i++) {
+            LogRecord f = r;
+            if (r.ts_s) f.ts_s = r.ts_s - i * SAMPLE_INTERVAL_S;
+            if (!flashlog_append(&f)) break;
+        }
+        ESP_LOGW(TAG, "DEBUG fake backlog: %lu pending",
+                 (unsigned long)flashlog_pending());
+    }
+#endif
     ESP_LOGI(TAG,
         "seq %lu: VBAT=%umV IBAT=%+dmA SOC=%u%% | in:%s%s VINDPM=%umV IBUS=%dmA | "
         "harvest %umAh (prev %u) weather=%s target=%umV | lux0=%u acc=[%d,%d,%d] "

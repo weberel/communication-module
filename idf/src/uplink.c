@@ -11,6 +11,8 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "driver/uart.h"
+#include "bq25792.h"
 #include "nvs_flash.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -31,6 +33,15 @@
 
 static const char *TAG = "uplink";
 
+/* Session stopwatch. Zeroed when the modem rail comes up, so every phase
+ * number below is directly comparable across sessions and across firmware
+ * versions -- and reads as elapsed modem-on time, which is what costs. */
+static int64_t s_sess_t0;
+static uint32_t sess_ms(void)
+{
+    return (uint32_t)((esp_timer_get_time() - s_sess_t0) / 1000);
+}
+
 /* ISRG Root X1 CA, compiled in from isrg_cert.c (generated from the PEM). */
 extern const char isrg_root_pem[];
 #define isrg_root_pem_start isrg_root_pem
@@ -38,6 +49,40 @@ extern const char isrg_root_pem[];
 /* ---- timeouts / policy ---- */
 #define MODEM_UART_TX        20
 #define MODEM_UART_RX        21
+
+/* Link speed to the A7672.
+ *
+ * START is what the modem is guaranteed to answer on after a power cycle;
+ * AT+IPR is volatile on SIMCom, so every session begins here.
+ * FAST is the target once we are talking. 921600 needs R405-R408 at 2.2 k --
+ * with the stock 10 k level-shifter pull-ups 230400 is the ceiling and 460800
+ * is dead (testing-status.md). Lower FAST to 230400 on an un-reworked board. */
+/* Upper bound on how long we wait for the modem to answer AT after PWRKEY.
+ * Generous on purpose -- this is a ceiling, not a delay: the poll exits as soon
+ * as the modem replies, so a slow boot costs only what it actually costs. */
+#define MODEM_READY_TO_MS    15000
+
+#define MODEM_BAUD_START     115200
+/* DISABLED (set equal to START) after a measured failure, 2026-09-21.
+ *
+ * TRIED: 921600, which testing-status.md says this unit's reworked 2.2 k
+ * level-shifter pull-ups support. RESULT: "did not stick", and the session then
+ * failed at REGISTRATION (reg=0) having burned 37.6 s.
+ *
+ * WHY THE FALLBACK BELOW CANNOT WORK. AT+IPR SUCCEEDS -- the modem moves to the
+ * new rate. If our own re-sync then fails, dropping our UART back to 115200
+ * leaves the modem at 921600, i.e. mismatched in the one direction that cannot
+ * be talked out of: commanding it back needs the link that is broken. Only a
+ * rail power-cycle recovers it, which is why the whole session was lost.
+ *
+ * AND IT WAS NEVER THE BOTTLENECK. One batch is 8 records ~7 KB = 0.6 s at
+ * 115200, yet the measured failure was n_batch=0 with an 18.4 s drain: the
+ * first publish transmitted fine and then waited for an ACK that never came.
+ * The session's cost is TIMEOUTS (publish 20 s, reconnect 15 s, teardown 18.5 s,
+ * modem boot 8.9 s), not throughput. Raise this only with a re-sync that is
+ * retried at BOTH rates before giving up, and only if throughput is ever shown
+ * to bind. */
+#define MODEM_BAUD_FAST      115200
 #define ATTACH_TIMEOUT_S     45      /* normal attach budget */
 #define ATTACH_DEEP_S        180     /* once-a-day deep search */
 #define NO_SIGNAL_FAILFAST_S 25      /* CSQ still 99 after this -> abort attempt */
@@ -87,9 +132,23 @@ static void mqtt_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 static bool mqtt_up(void)
 {
     esp_mqtt_client_config_t cfg = {
-        .broker.address.uri = TB_MQTT_URI,
+        .broker.address.uri = MQTT_URI,
+        /* PINNED, do not touch. Let's Encrypt moved to the Generation Y root in
+         * Jan 2026, so certs now chain to ISRG Root YR -- the SERVER is
+         * configured to serve the chain cross-signed by X1 precisely so this
+         * file keeps working. X1 is being retired eventually; pin Root YR (or
+         * both) then, not now. */
         .broker.verification.certificate = isrg_root_pem_start,
-        .credentials.username = TB_ACCESS_TOKEN,
+        .credentials.username = MQTT_USERNAME,
+        /* The secret goes in the PASSWORD field, not the username: brokers log
+         * usernames on every connect. */
+        .credentials.authentication.password = MQTT_PASSWORD,
+        /* MQTT 5, and this is not cosmetic. On 3.1.1 a broker that REFUSES a
+         * publish still returns PUBACK -- there is no not-authorised code --
+         * and publish_acked() advances the flash ring cursor on PUBACK. A
+         * refused publish would therefore discard records that never arrived.
+         * MQTT 5 returns reason code 0x87 and the refusal becomes visible. */
+        .session.protocol_ver = MQTT_PROTOCOL_V_5,
         .network.timeout_ms = 15000,
         .session.keepalive = 60,
     };
@@ -117,8 +176,10 @@ static bool publish_acked(const char *json)
 {
     if (!s_mqtt) return false;
     xEventGroupClearBits(s_ev, EV_PUBACK | EV_MQTT_FAIL);
-    int id = esp_mqtt_client_publish(s_mqtt, "v1/devices/me/telemetry",
-                                     json, 0, 1, 0);
+    /* Per-device topic. The broker ACL is `pattern write ecotrace/%u/telemetry`,
+     * so this must match the authenticated username or the publish is refused
+     * -- visibly, now that we speak MQTT 5. */
+    int id = esp_mqtt_client_publish(s_mqtt, MQTT_TOPIC, json, 0, 1, 0);
     if (id < 0) return false;
     s_pending_msg_id = id;
     EventBits_t b = xEventGroupWaitBits(s_ev, EV_PUBACK | EV_MQTT_FAIL,
@@ -180,6 +241,16 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
         r->acc_mg[0], r->acc_mg[1], r->acc_mg[2],
         r->temp_cC / 100.0f, r->sensor_ok);
 
+    /* Supply and charger faults. Restored to telemetry 2026-09-22: these are
+     * read into every record already, but the 2026-08-15 trim dropped them to
+     * fit a ThingsBoard datapoint limit we no longer have. VSYS is the rail the
+     * ESP32 and the module actually brown out on -- without it every reset
+     * analysis is inferred from VBAT, which is the wrong node. */
+    if (n > 0 && (size_t)n < cap)
+        n += snprintf(out + n, cap - n,
+            ",\"vsys_mv\":%u,\"fault0\":%u,\"fault1\":%u",
+            r->vsys_mv, r->fault0, r->fault1);
+
     /* Ultrasonic: four core values plus SNR as the health indicator. Only when
      * the module answered, so boards without a gas cell burn no quota. */
     if ((r->sensor_ok & 0x10) && n > 0 && (size_t)n < cap) {
@@ -187,12 +258,27 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
                          r->uss_tof_dns_q40 / 1099511.627776) / 2.0;
         n += snprintf(out + n, cap - n,
             ",\"uss_tof_us\":%.4f,\"uss_dtof_us\":%.6f,"
-            "\"uss_code\":%u,\"uss_snr_db\":%.1f,\"uss_vol_ml\":%lu,\"uss_seq\":%d",
+            "\"uss_code\":%u,\"uss_snr_db\":%.1f,\"uss_vol_ml\":%lu,\"uss_seq\":%d,\"uss_recov\":%u"
+            /* RAW TOTALIZER, restored 2026-09-22 now that the module runs
+             * PROTO 3 (before that these were identically zero, and the link
+             * was hitting a ThingsBoard datapoint throttle that no longer
+             * exists).
+             *
+             * ABSOLUTE running sums, not per-record deltas: diff them
+             * server-side to get a window, which is what makes a dropped
+             * uplink cost nothing. These are the numbers calibration is fitted
+             * against, and the only ones that stay correct when K or the zero
+             * offset is changed later -- see the derivation in uss_link.h.
+             * Both stay well inside 2^53, so JSON carries them exactly; S0 is
+             * the faster of the two at ~3.5e12 per year. */
+            ",\"uss_s1\":%lld,\"uss_s0\":%lld,\"uss_skip\":%u",
             tof_us, r->uss_dtof_ps / 1e6f,
             r->uss_code, r->uss_snr_db2 / 2.0f,
             (unsigned long)r->uss_vol_ml,
             /* 0xFFFF = logged before this field existed */
-            r->uss_seq == 0xFFFFu ? -1 : (int) r->uss_seq);
+            r->uss_seq == 0xFFFFu ? -1 : (int) r->uss_seq,
+            r->uss_recoveries,
+            (long long) r->uss_s1, (long long) r->uss_s0, r->uss_tot_skip);
     }
 
     /* Gas pressure from the MS5837 (it sits in the LINE, not ambient), and the
@@ -246,6 +332,25 @@ static uint32_t drain(uplink_result_t *res)
 {
     uint32_t sent = 0;
     while (flashlog_pending() > 0) {
+        int64_t t_batch = esp_timer_get_time();
+
+        /* Power doc B2: sample the supply WHILE the modem is transmitting.
+         *
+         * Taken on the second batch, not the first: by then the link is warm
+         * and we are actually pushing data, whereas the first publish can
+         * complete before the radio has drawn anything worth measuring. One
+         * sample only -- this is a diagnostic, and the I2C read itself costs
+         * session time we just spent effort removing. */
+        if (res->n_batches == 1 && res->vsys_load_mv == 0) {
+            res->vbat_load_mv = bq_vbat_mv();
+            res->vsys_load_mv = bq_vsys_mv();
+            bq_faults(&res->fault0, &res->fault1);
+            ESP_LOGW(TAG, "under load: vbat %u mV, vsys %u mV (idle vbat %u) "
+                          "| drop %d mV, fault %02x/%02x",
+                     res->vbat_load_mv, res->vsys_load_mv, res->vbat_pre_mv,
+                     (int) res->vbat_pre_mv - (int) res->vbat_load_mv,
+                     res->fault0, res->fault1);
+        }
         esp_task_wdt_reset();
         int64_t now_ms = clock_valid() ? (int64_t)time(NULL) * 1000 : 0;
         uint32_t n = flashlog_pending();
@@ -300,13 +405,21 @@ static uint32_t drain(uplink_result_t *res)
                                 pdMS_TO_TICKS(15000));
             esp_task_wdt_reset();
             if (!publish_acked(s_json)) {
-                ESP_LOGW(TAG, "drain stopped, %lu pending",
-                         (unsigned long)flashlog_pending());
+                ESP_LOGW(TAG, "drain stopped at batch %u, %lu pending, "
+                              "%lu ms into the session",
+                         res->n_batches, (unsigned long)flashlog_pending(),
+                         (unsigned long)sess_ms());
+                res->drain_broke = true;
                 break;
             }
         }
         flashlog_advance(n);
         sent += included;
+        {
+            uint32_t dt = (uint32_t)((esp_timer_get_time() - t_batch) / 1000);
+            if (dt > res->t_pub_max_ms) res->t_pub_max_ms = dt;
+            res->n_batches++;
+        }
         if (flashlog_pending() > 0) vTaskDelay(pdMS_TO_TICKS(BATCH_GAP_MS));
     }
     return sent;
@@ -336,7 +449,16 @@ static void send_status(const uplink_ctx_t *ctx, const uplink_result_t *res)
              "\"reset_reason\":%u,\"boot_count\":%u,\"wake_count\":%u,"
              "\"crash_count\":%u,\"vbat_mv\":%u,"
              "\"sun_h\":%u,\"voc_max_mv\":%u,\"fw\":\"" FW_VERSION "\","
-             "\"uss_rst_cause\":%d,\"uss_lh_starts\":%d,\"uss_lh_uptime\":%d",
+             "\"uss_rst_cause\":%d,\"uss_lh_starts\":%d,\"uss_lh_uptime\":%d,"
+             /* Session phase timing. Cumulative ms of modem-on time; a phase's
+              * own cost is the difference from the previous column. */
+             "\"t_modem\":%lu,\"t_reg\":%lu,\"t_ppp\":%lu,\"t_sntp\":%lu,"
+             "\"t_mqtt\":%lu,\"t_drain\":%lu,\"t_pubmax\":%lu,"
+             "\"n_batch\":%u,\"n_sent\":%lu,\"drain_broke\":%u,"
+             /* Supply under load -- see power doc B2. vbat_pre is with the
+              * modem off; the difference is the sag that sets battery sizing. */
+             "\"vbat_pre\":%u,\"vbat_load\":%u,\"vsys_load\":%u,"
+             "\"bq_fault0\":%u,\"bq_fault1\":%u",
              res->cell_rssi_dbm, res->wifi_rssi_dbm, transport,
              res->cell_reg_stat, (unsigned long)flashlog_pending(), ctx->boot_id,
              ctx->reset_reason, ctx->boot_count, ctx->wake_count,
@@ -347,7 +469,14 @@ static void send_status(const uplink_ctx_t *ctx, const uplink_result_t *res)
               * reached the module at all". */
              ctx->uss_health_valid ? (int) ctx->uss_rst_cause   : -1,
              ctx->uss_health_valid ? (int) ctx->uss_lh_starts   : -1,
-             ctx->uss_health_valid ? (int) ctx->uss_lh_uptime_s : -1);
+             ctx->uss_health_valid ? (int) ctx->uss_lh_uptime_s : -1,
+             (unsigned long)res->t_modem_ms, (unsigned long)res->t_reg_ms,
+             (unsigned long)res->t_ppp_ms,   (unsigned long)res->t_sntp_ms,
+             (unsigned long)res->t_mqtt_ms,  (unsigned long)res->t_drain_ms,
+             (unsigned long)res->t_pub_max_ms, res->n_batches,
+             (unsigned long)res->sent, res->drain_broke ? 1u : 0u,
+             res->vbat_pre_mv, res->vbat_load_mv, res->vsys_load_mv,
+             res->fault0, res->fault1);
     if (now_ms > 0)
         snprintf(s_json, sizeof(s_json), "{\"ts\":%lld,\"values\":{%s}}",
                  (long long)now_ms, vals);
@@ -406,6 +535,33 @@ static time_t https_trusted_time(void)
     esp_http_client_perform(c);   /* any status is fine; we want the header */
     esp_http_client_cleanup(c);
     return s_date_hdr[0] ? parse_http_date(s_date_hdr) : 0;
+}
+
+/* Re-sync the clock only when it is actually stale.
+ *
+ * sntp_sync() costs 5-7 s with the modem powered, and it ran on EVERY session
+ * -- including a retry 30 minutes after the last successful sync, and the
+ * second and third sessions of the same upload cycle. The RTC keeps time
+ * across deep sleep, so the useful rate is daily, not hourly.
+ *
+ * Still forced whenever the clock is INVALID: record timestamps depend on it,
+ * and record_ts_ms() falls back to reconstructing them from uptime, which is
+ * exactly the case the cross-check in sntp_sync() exists to catch. */
+#define CLOCK_RESYNC_S  (12 * 3600)
+RTC_DATA_ATTR static int64_t s_last_clock_sync;
+
+static void sntp_sync(void);
+
+static void maybe_sntp_sync(void)
+{
+    if (clock_valid() && s_last_clock_sync &&
+        llabs((long long)(time(NULL) - s_last_clock_sync)) < CLOCK_RESYNC_S) {
+        ESP_LOGI(TAG, "clock fresh (%lld s old) -- skipping sync",
+                 (long long)(time(NULL) - s_last_clock_sync));
+        return;
+    }
+    sntp_sync();
+    if (clock_valid()) s_last_clock_sync = time(NULL);
 }
 
 static void sntp_sync(void)
@@ -500,20 +656,21 @@ static uint8_t wait_registration(esp_modem_dce_t *dce, uint32_t timeout_s,
 
 static bool cell_session(const uplink_ctx_t *ctx, uplink_result_t *res)
 {
+    /* Baseline with the modem still OFF, so the mid-drain sample has something
+     * to be a drop FROM. */
+    res->vbat_pre_mv = bq_vbat_mv();
+
     /* Power sequencing per the proven Arduino driver: rail, settle, PWRKEY. */
+    s_sess_t0 = esp_timer_get_time();
     modem_rail(true);
     vTaskDelay(pdMS_TO_TICKS(200));
     pwrkey_pulse(600);
-    for (int i = 0; i < 8; i++) {      /* A7672 UART ready ~8 s after PWRKEY */
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        esp_task_wdt_reset();          /* feed through the settle */
-    }
 
     esp_modem_dce_config_t dce_cfg = ESP_MODEM_DCE_DEFAULT_CONFIG(SIM_APN);
     esp_modem_dte_config_t dte_cfg = ESP_MODEM_DTE_DEFAULT_CONFIG();
     dte_cfg.uart_config.tx_io_num = MODEM_UART_TX;
     dte_cfg.uart_config.rx_io_num = MODEM_UART_RX;
-    dte_cfg.uart_config.baud_rate = 115200;
+    dte_cfg.uart_config.baud_rate = MODEM_BAUD_START;
 
     esp_netif_config_t ppp_cfg = ESP_NETIF_DEFAULT_PPP();
     esp_netif_t *netif = esp_netif_new(&ppp_cfg);
@@ -522,9 +679,49 @@ static bool cell_session(const uplink_ctx_t *ctx, uplink_result_t *res)
     bool ok = false;
     if (!dce) { ESP_LOGE(TAG, "esp_modem init failed"); goto out_netif; }
 
-    if (esp_modem_sync(dce) != ESP_OK) {
-        ESP_LOGW(TAG, "modem does not answer AT");
+    /* POLL for the modem instead of sleeping a flat 8 s.
+     *
+     * The old code waited 8 x 1000 ms unconditionally because "A7672 UART ready
+     * ~8 s after PWRKEY", then synced once. Measured 2026-09-21: that sleep was
+     * 8.9 s of a ~60 s session -- the single largest fixed cost, and the modem
+     * is powered for every millisecond of it. Polling returns as soon as it
+     * actually answers and keeps the same worst case.
+     *
+     * Creating the DCE first is safe: esp_modem_new_dev only brings up our UART
+     * and the PPP netif, it does not talk to the modem. An AT sent too early
+     * just fails and we try again. */
+    bool synced = false;
+    for (uint32_t waited = 0; waited < MODEM_READY_TO_MS; waited += 250) {
+        esp_task_wdt_reset();
+        if (esp_modem_sync(dce) == ESP_OK) { synced = true; break; }
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+    if (!synced) {
+        ESP_LOGW(TAG, "modem does not answer AT after %d ms", MODEM_READY_TO_MS);
         goto out;
+    }
+    res->t_modem_ms = sess_ms();
+    ESP_LOGI(TAG, "modem answered AT at %lu ms", (unsigned long)res->t_modem_ms);
+
+    /* Step the link up. Both ends have to move and the modem goes first: once
+     * AT+IPR lands, the modem is no longer listening at the old rate, so our
+     * UART must follow immediately. The re-sync afterwards is the proof -- if
+     * it fails we back out to MODEM_BAUD_START rather than spending the rest of
+     * the session talking into a mismatched link. */
+    if (MODEM_BAUD_FAST != MODEM_BAUD_START &&
+        esp_modem_set_baud(dce, MODEM_BAUD_FAST) == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        uart_set_baudrate(UART_NUM_1, MODEM_BAUD_FAST);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        if (esp_modem_sync(dce) == ESP_OK) {
+            ESP_LOGI(TAG, "link at %d baud", MODEM_BAUD_FAST);
+        } else {
+            ESP_LOGW(TAG, "%d baud did not stick -- back to %d",
+                     MODEM_BAUD_FAST, MODEM_BAUD_START);
+            uart_set_baudrate(UART_NUM_1, MODEM_BAUD_START);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            (void) esp_modem_sync(dce);
+        }
     }
 
     res->cell_reg_stat = wait_registration(
@@ -535,8 +732,10 @@ static bool cell_session(const uplink_ctx_t *ctx, uplink_result_t *res)
                  res->cell_reg_stat, res->cell_rssi_dbm);
         goto out;
     }
-    ESP_LOGI(TAG, "registered (stat %u, %d dBm)",
-             res->cell_reg_stat, res->cell_rssi_dbm);
+    res->t_reg_ms = sess_ms();
+    ESP_LOGI(TAG, "registered (stat %u, %d dBm) at %lu ms",
+             res->cell_reg_stat, res->cell_rssi_dbm,
+             (unsigned long)res->t_reg_ms);
 
     xEventGroupClearBits(s_ev, EV_IP_UP);
     if (esp_modem_set_mode(dce, ESP_MODEM_MODE_DATA) != ESP_OK) {
@@ -548,27 +747,58 @@ static bool cell_session(const uplink_ctx_t *ctx, uplink_result_t *res)
         ESP_LOGW(TAG, "PPP: no IP within 30 s");
         goto out;
     }
-    ESP_LOGI(TAG, "PPP up");
+    res->t_ppp_ms = sess_ms();
+    ESP_LOGI(TAG, "PPP up at %lu ms", (unsigned long)res->t_ppp_ms);
 
-    sntp_sync();   /* every session: re-sync AND cross-check (clock can be
-                    * "valid" yet wrong -- that is exactly the observed bug) */
+    maybe_sntp_sync();
+    res->t_sntp_ms = sess_ms();
 
     if (mqtt_up()) {
+        res->t_mqtt_ms = sess_ms();
         uint32_t sent = drain(res);
+        res->t_drain_ms = sess_ms();
         res->sent += sent;
         res->sent ? (res->any_success = true) : 0;
-        send_status(ctx, res);   /* always: health must not depend on the drain */
+        /* AFTER the drain timing is captured, so the status record carries this
+         * session's own numbers rather than the previous one's. */
+        send_status(ctx, res);
         ok = sent > 0 || flashlog_pending() == 0;
     }
     mqtt_down();
 
 out:
-    if (dce) esp_modem_destroy(dce);
+    /* Teardown measured 18.5 s on 2026-09-21 -- as expensive as a failed drain,
+     * on a session that sent nothing, and nobody knows which call it is. Stamp
+     * each one rather than guess. */
+    {
+        uint32_t t_a = sess_ms();
+        if (dce) esp_modem_destroy(dce);
+        uint32_t t_b = sess_ms();
+        if (netif) esp_netif_destroy(netif);
+        uint32_t t_c = sess_ms();
+        ESP_LOGW(TAG, "teardown: mqtt_down->%lu, modem_destroy %lu ms, "
+                      "netif_destroy %lu ms",
+                 (unsigned long)t_a, (unsigned long)(t_b - t_a),
+                 (unsigned long)(t_c - t_b));
+        goto rail_off;
+    }
 out_netif:
     if (netif) esp_netif_destroy(netif);
+rail_off:;
     /* Rail hard-off is the recovery guarantee -- a wedged modem never survives
      * to the next attempt (the bucket fleet's dead-end, solved in hardware). */
     modem_rail(false);
+    res->t_total_ms = sess_ms();
+    /* One line that accounts for the whole session. Phase cost is the gap
+     * between consecutive columns; the modem is powered for all of it. */
+    ESP_LOGW(TAG, "session: at=%lu reg=%lu ppp=%lu sntp=%lu mqtt=%lu drain=%lu "
+                  "total=%lu ms | %u batches, slowest %lu ms, %lu sent%s",
+             (unsigned long)res->t_modem_ms, (unsigned long)res->t_reg_ms,
+             (unsigned long)res->t_ppp_ms,   (unsigned long)res->t_sntp_ms,
+             (unsigned long)res->t_mqtt_ms,  (unsigned long)res->t_drain_ms,
+             (unsigned long)res->t_total_ms, res->n_batches,
+             (unsigned long)res->t_pub_max_ms, (unsigned long)res->sent,
+             res->drain_broke ? ", DRAIN BROKE" : "");
     return ok;
 }
 
@@ -602,7 +832,7 @@ static bool wifi_session(const uplink_ctx_t *ctx, uplink_result_t *res)
     if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) res->wifi_rssi_dbm = ap.rssi;
     ESP_LOGI(TAG, "wifi up (%d dBm)", res->wifi_rssi_dbm);
 
-    sntp_sync();   /* every session, same reasoning as the cellular path */
+    maybe_sntp_sync();
 
     if (mqtt_up()) {
         res->used_wifi = true;

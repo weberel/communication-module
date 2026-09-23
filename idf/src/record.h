@@ -16,12 +16,15 @@
 #include <stdbool.h>
 #include <assert.h>   /* static_assert in C11+ */
 
-#define REC_MAGIC 0x45434C35u   /* "ECL5" -- bumped when the layout changed
+#define REC_MAGIC 0x45434C36u   /* "ECL6" -- bumped when the layout changed
+                                 * (v6: +raw totalizer S1/S0, taken from rsvd[],
+                                 * 2026-09-18. Same reason as v5: old records
+                                 * carry 0xFF there and 0xFFFFFFFFFFFFFFFF would
+                                 * read back as a colossal negative volume, so
+                                 * the magic REJECTS them rather than let that
+                                 * into the totals.)
                                  * (v5: +raw absolute ToF, taken from rsvd[],
-                                 * 2026-08-15. The size is unchanged, but old
-                                 * records carry 0xFF there, so the magic is
-                                 * bumped to REJECT them rather than let
-                                 * 0xFFFFFFFF be read back as a ToF.)
+                                 * 2026-08-15.)
                                  * (v4: 64 -> 128 B, +ultrasonic flow module
                                  * and WF280A raw pressure, 2026-08-13; v3
                                  * added the charger thermal diagnostics).
@@ -105,7 +108,34 @@ typedef struct __attribute__((packed)) {
      * Taken from rsvd so sizeof(LogRecord) stays 128: records already in flash
      * remain valid and simply read 0xFFFF here, which telemetry reports as -1. */
     uint16_t uss_seq;      /* module measurement counter (wraps at 65535) */
-    uint8_t  rsvd[26];     /* spare for future fields (0xFF) */
+    uint8_t  uss_recoveries; /* abs-ToF re-searches forced by the module */
+
+    /* --- v6: the RAW totalizer (module PROTO 3, uss_link.h 0x50) -----------
+     *
+     * These carry NO calibration constants. The module integrates them at its
+     * capture rate; every constant (geometry K, zero offset, linearisation, the
+     * P/T correction to 20 C / 1 atm) is applied downstream of here, so a
+     * recalibration is a server-side recompute rather than an MSP430 reflash --
+     * and it applies RETROACTIVELY to every record ever logged:
+     *
+     *     V_actual = K * ( dS1/2^24  -  offset_ps * dS0/2^40 )
+     *     V_std    = V_actual * (press_dmbar/10131.0) * (293.15/T_kelvin)
+     *
+     * ABSOLUTE running sums, not per-record deltas, and deliberately so: a
+     * dropped or corrupted record then costs only its own resolution, not the
+     * volume it carried. Diff consecutive records to get a window. They reset
+     * only on USS_CMD_VOL_RESET, and a module reboot does NOT clear them (FRAM).
+     *
+     * uss_tot_skip is the count of captures that produced no usable ToF. It is
+     * what distinguishes a genuinely low-flow window from one where the meter
+     * was blind -- without it the two are identical. The count of GOOD captures
+     * is delta(uss_seq) - delta(uss_tot_skip); it is not stored separately
+     * because that would be the same number twice. */
+    int64_t  uss_s1;       /* flow integral, Q24, absolute (0 if pre-PROTO 3) */
+    int64_t  uss_s0;       /* offset sensitivity, Q40, absolute */
+    uint16_t uss_tot_skip; /* captures with no usable ToF (absolute, wraps) */
+    uint8_t  uss_tot_flags;/* USS_TOT_FLAG_SAT: a sum saturated, total is lost */
+    uint8_t  rsvd[6];      /* spare for future fields (0xFF) */
     uint16_t crc;          /* CRC16-CCITT over bytes [0 .. offsetof(crc)-1] */
 } LogRecord;
 

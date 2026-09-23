@@ -50,7 +50,15 @@
  * time-of-flight. The CRC moved 0x1F -> 0x2F, so a v1 master reading a v2 slave
  * would checksum the wrong offset and fail every sample -- which is the point of
  * the version byte. Reflash BOTH sides together. */
-#define USS_LINK_PROTO      2
+/* PROTO 3 (2026-09-18): added the RAW TOTALIZER block at 0x50 and grew the
+ * readable window 0x40 -> 0x80. Purely ADDITIVE: the result block (0x04..0x2F)
+ * and the link-health block (0x30..0x3F) are byte-for-byte unchanged and keep
+ * their own CRCs, so a PROTO 2 master reading a PROTO 3 slave still works
+ * exactly as before -- it simply never reads above 0x3F. A PROTO 3 master
+ * reading a PROTO 2 slave gets zeros and a failing CRC at 0x50, which is why
+ * the master must gate the raw path on PROTO_VER >= 3 and fall back to
+ * VOL_ML. */
+#define USS_LINK_PROTO      3
 
 /* ---- register map ---- */
 #define USS_REG_WHO_AM_I    0x00    /* u8  = USS_LINK_WHOAMI                  */
@@ -113,6 +121,8 @@
 #define USS_REG_CAP_N       0x28    /* u16 total captures (wraps)             */
 #define USS_REG_CAP_BADCODE 0x2A    /* u16 captures whose code != 122 (wraps) */
 #define USS_REG_CAP_BADSNR  0x2C    /* u16 code==122 but SNR below threshold  */
+#define USS_REG_RECOVERIES  0x2E    /* u8  abs-ToF re-searches forced by the
+                                 * module (wraps; 0 means never fired)       */
 #define USS_REG_CRC8        0x2F    /* u8  CRC8 over regs 0x04..0x2E          */
 /* -- LINK HEALTH block. Additive, no PROTO bump, and guarded by its OWN CRC so
  * it can be read without disturbing the latched result block.
@@ -138,6 +148,63 @@
 #define USS_LH_OFF          0x30
 #define USS_LH_LEN          0x10
 
+/* -- RAW TOTALIZER block (PROTO 3). Own CRC; read independently of the result
+ * block, so a master can poll the total without disturbing the latched sample.
+ *
+ * WHY THIS EXISTS. The module integrates at 1 Hz; the master wakes every ~5
+ * minutes. Anything the master totalizes from its own snapshots samples flow at
+ * 1/300 the rate and aliases. So integration MUST happen here -- but every
+ * calibration constant then gets baked into MSP430 firmware, which needs a
+ * physical MSP-FET to change. The ESP32 has OTA; the MSP430 does not.
+ *
+ * The way out: accumulate sums that contain NO calibration constants at all.
+ * For a diagonal-path transit-time meter the flow is a pure geometric identity,
+ * with no sound-speed and no gas-property term:
+ *
+ *     t_up = L/(c - v cos@),  t_dn = L/(c + v cos@)
+ *     dtof / (t_up * t_dn)  =  2 v cos@ / L
+ *     Q = A*v = [ A*L / (2 cos@) ] * dtof / (t_up * t_dn)
+ *              \________________/
+ *                  K, geometry only -- lives on the MASTER
+ *
+ * So the slave accumulates the integrand and the master owns K. It also
+ * accumulates S0, the same integrand with dtof replaced by 1, which is what a
+ * zero-flow dTOF offset WOULD have subtracted at full 1 Hz fidelity:
+ *
+ *     V_actual = K * ( dS1/2^24  -  offset_ps * dS0/2^40 )
+ *     V_std    = V_actual * (P_mbar/1013.25) * (293.15/T_kelvin)
+ *
+ * Both K and offset_ps live on the master, are OTA-updatable, and can be
+ * applied RETROACTIVELY -- re-zero a deployed unit months later and every past
+ * window recomputes correctly, because S0 preserved the sensitivity. That is
+ * why USS_CMD_ZEROCAL is no longer the only zeroing path, and why the master
+ * should prefer deferred zeroing over burning an offset into FRAM.
+ *
+ * Both sums are SIGNED and LINEAR, so zero-flow noise cancels instead of
+ * rectifying. (The VOL_ML path had to floor its accumulator at zero to stop
+ * noise integrating into ~13 L/h of phantom flow; that hack is unnecessary
+ * here.) Apply any low-flow cutoff on the master, per window, where it can be
+ * retuned without a FET.
+ *
+ * S1 and S0 share one division, so their denominator rounding is IDENTICAL and
+ * the offset subtraction cancels exactly at true zero flow. Do not recompute
+ * either one independently. */
+#define USS_REG_TOT_S1      0x50    /* i64 sum dtof_ps*dt_ms/(tu_ns*td_ns), Q24 */
+#define USS_REG_TOT_S0      0x58    /* i64 sum      dt_ms/(tu_ns*td_ns), Q40    */
+#define USS_REG_TOT_N       0x60    /* u32 valid samples accumulated            */
+#define USS_REG_TOT_SKIP    0x64    /* u16 samples skipped (invalid) since reset*/
+#define USS_REG_TOT_FLAGS   0x66    /* u8  bit0 = an accumulation saturated     */
+#define USS_REG_TOT_CRC8    0x67    /* u8  CRC8 over 0x50..0x66                 */
+#define USS_TOT_OFF         0x50
+#define USS_TOT_LEN         0x18    /* 0x50..0x67 inclusive, CRC included       */
+/* Fixed-point scaling. Defined HERE so both sides use one constant -- getting
+ * these apart is the same class of trap as the Q40/Q20 ToF exponent. */
+#define USS_TOT_S1_SHIFT    24
+#define USS_TOT_S0_SHIFT    40      /* S0's integrand is ~1e5x smaller than S1's
+                                     * at real flows, so it needs the extra 16
+                                     * bits to avoid truncating to zero.       */
+#define USS_TOT_FLAG_SAT    0x01
+
 /* -- control -- */
 #define USS_REG_CMD         0x40    /* u8  write-only, USS_CMD_*              */
 #define USS_REG_AUTO_PERIOD 0x42    /* u16 autonomous measurement period, s
@@ -145,12 +212,28 @@
 
 #define USS_LINK_RESULT_OFF 0x04
 #define USS_LINK_RESULT_LEN 44      /* 0x04..0x2F inclusive, CRC included     */
-#define USS_LINK_REGFILE_SIZE 0x40  /* readable window 0x00..0x3F; MUST stay a
-                                     * power of two (the slave masks the
-                                     * auto-increment pointer with SIZE-1 so an
-                                     * over-long read can never walk RAM).
-                                     * USS_REG_CMD (0x40) sits just outside it,
-                                     * which is fine: it is write-only.        */
+#define USS_LINK_REGFILE_SIZE 0x40  /* the RAM-backed register file, 0x00..0x3F.
+                                     * DELIBERATELY NOT GROWN for PROTO 3.
+                                     * The MSP430FR6043 has 4 KB of RAM and the
+                                     * build leaves ~150 bytes spare next to a
+                                     * 512-byte stack that TI's capture code
+                                     * runs on; doubling this array to carry the
+                                     * totalizer would have eaten 64 of them.
+                                     * The totalizer block is latched in FRAM
+                                     * instead (8 KB spare, written at 1 Hz
+                                     * against ~1e15-cycle endurance) and the
+                                     * slave dispatches on the pointer. */
+#define USS_LINK_ADDR_MASK    0x7F  /* the ADDRESS space the pointer wraps in,
+                                     * which is wider than the register file
+                                     * above. Anything inside the mask but
+                                     * mapped to neither block reads 0, so an
+                                     * over-long read still cannot walk RAM --
+                                     * that guarantee now comes from the explicit
+                                     * range checks in reg_read(), not from the
+                                     * array size. USS_REG_CMD (0x40) and
+                                     * USS_REG_AUTO_PERIOD (0x42) stay outside
+                                     * the register file and so stay unreadable,
+                                     * exactly as in PROTO 2.                  */
 
 /* STATUS bits */
 #define USS_ST_READY        0x01    /* result block valid & CRC'd             */

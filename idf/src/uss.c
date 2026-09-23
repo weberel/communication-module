@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_timer.h"
 
 static const char *TAG = "uss";
 
@@ -69,11 +70,21 @@ static bool read_result(uint8_t *blk)
     return false;
 }
 
+/* PROTO version the module last identified as; 0 until first contact. */
+static uint8_t s_proto;
+
 static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static uint32_t le32(const uint8_t *p)
 {
     return (uint32_t)p[0] | (uint32_t)p[1] << 8 |
            (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static uint64_t le64(const uint8_t *p)
+{
+    uint64_t v = 0;
+    for (int i = 7; i >= 0; i--) v = (v << 8) | p[i];
+    return v;
 }
 
 /* Read the link-health block (0x30..0x3F, its own CRC).
@@ -109,6 +120,45 @@ bool uss_read_health(uss_health_t *out)
     out->cmds      = le16(&blk[USS_REG_LH_CMDS     - USS_LH_OFF]);
     out->uptime_s  = le16(&blk[USS_REG_LH_UPTIME_S - USS_LH_OFF]);
     out->last_cmd  = blk[USS_REG_LH_LASTCMD - USS_LH_OFF];
+    return true;
+}
+
+uint8_t uss_proto(void) { return s_proto; }
+
+bool uss_read_totalizer(uss_totals_t *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    /* A PROTO 2 module has nothing at 0x50 -- it would read back as zeros with
+     * a CRC that cannot match, which is a confusing way to say "too old". Say
+     * it directly and let the caller fall back to VOL_ML. */
+    if (s_proto != 0 && s_proto < 3) return false;
+
+    if (!s_dev) {
+        eco_i2c_add_tracked(&s_dev, USS_LINK_ADDR7);
+        if (!s_dev) return false;
+    }
+
+    uint8_t blk[USS_TOT_LEN];
+    if (!rd(USS_TOT_OFF, blk, sizeof(blk))) return false;
+    if (uss_link_crc8(blk, USS_TOT_LEN - 1) != blk[USS_TOT_LEN - 1]) {
+        ESP_LOGW(TAG, "totalizer CRC mismatch");
+        return false;
+    }
+
+    out->s1    = (int64_t) le64(&blk[USS_REG_TOT_S1    - USS_TOT_OFF]);
+    out->s0    = (int64_t) le64(&blk[USS_REG_TOT_S0    - USS_TOT_OFF]);
+    out->n     =           le32(&blk[USS_REG_TOT_N     - USS_TOT_OFF]);
+    out->skip  =           le16(&blk[USS_REG_TOT_SKIP  - USS_TOT_OFF]);
+    out->flags =                blk[USS_REG_TOT_FLAGS  - USS_TOT_OFF];
+
+    /* Sticky, and it means an accumulator stopped advancing -- the total is
+     * understated from here on and no amount of recalibration recovers it.
+     * Loud on purpose: this is the failure mode the old u32 VOL_ML had, where
+     * a silent wrap looked like a module reset for weeks. */
+    if (out->flags & USS_TOT_FLAG_SAT)
+        ESP_LOGE(TAG, "totalizer SATURATED -- sums are no longer trustworthy");
+
     return true;
 }
 
@@ -207,13 +257,39 @@ bool uss_sample(uss_result_t *out)
     /* Identify -- doubles as the absence probe (absent module = one NACK). */
     uint8_t id[2];
     if (!rd(USS_REG_WHO_AM_I, id, 2)) return false;
-    if (id[0] != USS_LINK_WHOAMI || id[1] != USS_LINK_PROTO) {
+    /* Accept any PROTO we understand rather than demanding an exact match.
+     *
+     * PROTO 3 is purely ADDITIVE -- the result block at 0x04..0x2F and the
+     * health block at 0x30..0x3F are byte-identical to PROTO 2 and keep their
+     * own CRCs. Insisting on equality would mean that flashing one side of the
+     * link turned a fully working module into a dead one, and these two images
+     * are flashed by completely different tools (esptool over USB here, WSL +
+     * MSP430Flasher there), so they WILL be out of step at times. Record what
+     * the module speaks and let uss_read_totalizer() gate on it. */
+    if (id[0] != USS_LINK_WHOAMI || id[1] < 2 || id[1] > USS_LINK_PROTO) {
         ESP_LOGW(TAG, "bad identity 0x%02x proto %u", id[0], id[1]);
         return false;
     }
+    if (s_proto != id[1]) {
+        ESP_LOGI(TAG, "module speaks PROTO %u (raw totalizer %s)",
+                 id[1], id[1] >= 3 ? "available" : "NOT available, using VOL_ML");
+        s_proto = id[1];
+    }
+
+    /* INSTRUMENTATION ONLY (2026-09-15). A wake spends 2820 ms between the I2C
+     * scan and "USS ok", and that is ~3 s of the ~3.5 s the ESP32 burns at
+     * 16 mA every 5 minutes. Transaction timeouts are already RULED OUT: the
+     * retry path logs a warning whenever an attempt >1 succeeds and no such
+     * line appears, so every transfer completes first try. This times each
+     * stage so the remaining 2.8 s is attributed by measurement, not guess.
+     * Remove once the answer is known -- it costs a log line per wake. */
+    int64_t t_entry = esp_timer_get_time();
 
     uint8_t st = 0;
     if (!rd(USS_REG_STATUS, &st, 1)) return false;
+    int64_t t_status = esp_timer_get_time();
+    uint8_t st_first = st;
+    int ready_polls = 0;
 
     /* If the module is running autonomously, do NOT command a measurement --
      * just take whatever it last latched. Interleaving our own MEASURE with its
@@ -232,6 +308,7 @@ bool uss_sample(uss_result_t *out)
             }
             vTaskDelay(pdMS_TO_TICKS(USS_POLL_MS));
             waited += USS_POLL_MS;
+            ready_polls++;
             if (!rd(USS_REG_STATUS, &st, 1)) return false;
         }
     } else {
@@ -253,13 +330,21 @@ bool uss_sample(uss_result_t *out)
         }
     }
 
+    int64_t t_ready = esp_timer_get_time();
+
     uint8_t blk[USS_LINK_RESULT_LEN];
     if (!read_result(blk)) return false;
+    ESP_LOGW(TAG, "timing: id+status %lld ms, ready-wait %lld ms (%d polls, st0=0x%02x), "
+                  "result %lld ms, total %lld ms",
+             (t_status - t_entry) / 1000, (t_ready - t_status) / 1000, ready_polls, st_first,
+             (esp_timer_get_time() - t_ready) / 1000,
+             (esp_timer_get_time() - t_entry) / 1000);
 
     /* blk[] is the register window starting at USS_REG_STATUS (0x04). */
     out->status    = blk[USS_REG_STATUS    - USS_LINK_RESULT_OFF];
     out->code      = blk[USS_REG_CODE      - USS_LINK_RESULT_OFF];
     out->seq       = le16(&blk[USS_REG_SEQ - USS_LINK_RESULT_OFF]);
+    out->recoveries = blk[USS_REG_RECOVERIES - USS_LINK_RESULT_OFF];
     out->flow_ulpm = (int32_t)le32(&blk[USS_REG_FLOW_ULPM - USS_LINK_RESULT_OFF]);
     out->dtof_ps   = (int32_t)le32(&blk[USS_REG_DTOF_PS   - USS_LINK_RESULT_OFF]);
     out->temp_cC   = (int16_t)le16(&blk[USS_REG_TEMP_CC   - USS_LINK_RESULT_OFF]);

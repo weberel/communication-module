@@ -29,6 +29,43 @@ typedef struct {
     int      cell_rssi_dbm;    /* 0 if modem never attached */
     int      wifi_rssi_dbm;    /* 0 if WiFi unused */
     uint8_t  cell_reg_stat;    /* last +CEREG stat seen (registration diagnostics) */
+
+    /* ---- session phase timing, ms since the modem rail came up ------------
+     * CUMULATIVE, not per-phase: each is the stopwatch reading when that phase
+     * completed, so a phase's own cost is the difference from the one before
+     * and a phase that never ran reads 0. Publishing cumulative values means a
+     * truncated session still says how far it got.
+     *
+     * t_pub_max_ms is the decisive one when the drain is slow: a large total
+     * with a small max is the broker throttling every publish evenly, while a
+     * large max is ONE stall -- those have completely different fixes, and the
+     * average hides both. */
+    uint32_t t_modem_ms;       /* rail on -> modem answers AT                 */
+    uint32_t t_reg_ms;         /* -> EPS registered (+CEREG 1/5)              */
+    uint32_t t_ppp_ms;         /* -> PPP has an IP                            */
+    uint32_t t_sntp_ms;        /* -> SNTP done (or gave up)                   */
+    uint32_t t_mqtt_ms;        /* -> broker connected                         */
+    uint32_t t_drain_ms;       /* -> backlog drained (or the drain broke)     */
+    uint32_t t_total_ms;       /* -> rail off                                 */
+    uint32_t t_pub_max_ms;     /* slowest single publish in the drain         */
+    uint16_t n_batches;        /* publishes issued during the drain           */
+    bool     drain_broke;      /* a publish went unacked and stopped the drain */
+
+    /* ---- supply UNDER LOAD (power doc B2) --------------------------------
+     * Sampled mid-drain, with the modem registered and transmitting. Every
+     * other VBAT/VSYS reading on this board is taken with the modem off, so
+     * the sag under the A7672's ~2 A burst has never been measured -- and that
+     * sag, not energy, is what sets the minimum battery size.
+     *
+     * VBAT is the cell terminal, VSYS is what the ESP32 and the ultrasonic
+     * module actually run on. Reporting BOTH is the point: the difference
+     * between them under load is series resistance between cell and board,
+     * which is precisely the failure we cannot otherwise distinguish from a
+     * tired cell. */
+    uint16_t vbat_load_mv;     /* VBAT during the drain, 0 if never sampled   */
+    uint16_t vsys_load_mv;     /* VSYS during the drain                       */
+    uint16_t vbat_pre_mv;      /* VBAT just before the modem rail came up     */
+    uint8_t  fault0, fault1;   /* BQ25792 REG20/21 latched during the session */
 } uplink_result_t;
 
 typedef struct {
