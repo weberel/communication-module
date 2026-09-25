@@ -37,7 +37,7 @@ extern "C" {
 
 /* Which constant set produced a derived number. Published with every derived
  * value so the server knows what to recompute. Bump on EVERY refit. */
-#define GF_DERIVE_VER   1
+#define GF_DERIVE_VER   2               /* 2: per-cell profiles (44 mm added) */
 
 /* Gate on c, as a fraction beyond the pure-component limits (binary) or around
  * c(T) (single gas). A multitone lock one pattern period off moves c by 4-6 %,
@@ -51,6 +51,15 @@ typedef enum {
     GF_GAS_N2,              /* nitrogen                  NOT validated        */
     GF_GAS_COUNT
 } gf_gas_t;
+
+/* The measuring cell. The module no longer knows it (one image for every cell,
+ * 2026-09-25): the ESP32 pushes the cell's capture window and ToF gate at every
+ * module boot, and the derivation needs the cell's path and K scale. */
+typedef enum {
+    GF_CELL_75 = 0,         /* 75 mm cell, 72.2 mm path  validated 2026-09-25 */
+    GF_CELL_44,             /* 44 mm cell               NOT calibrated        */
+    GF_CELL_COUNT
+} gf_cell_t;
 
 /* One component. Cp(T) = cp_a + cp_b (T - 298.15) J/(mol K);
  * mu(T) = mu_ref (T/298.15)^mu_exp Pa s. */
@@ -67,10 +76,13 @@ typedef struct {
     int32_t gain;           /* PGA index                                    */
     int32_t pulses;         /* trill cycles (2 pulses each)                 */
     int32_t f1_hz, f2_hz;
+    int32_t tofg_min_ns;    /* abs-ToF gate: the module rejects a capture     */
+    int32_t tofg_max_ns;    /* outside it as 0xE1. Per CELL.                  */
 } gf_module_t;
 
 typedef struct {
     gf_gas_t kind;
+    gf_cell_t cell;
     bool     validated;
     const gf_comp_t *a;     /* x is the fraction of this one   */
     const gf_comp_t *b;     /* NULL for a single-component gas */
@@ -90,8 +102,10 @@ typedef struct {
     double  amp_ratio_max;
 } gf_cfg_t;
 
-bool        gf_profile(gf_cfg_t *c, gf_gas_t kind);   /* false: unknown kind */
+/* Gas profile on a cell. False for an unknown gas or cell. */
+bool        gf_profile(gf_cfg_t *c, gf_gas_t kind, gf_cell_t cell);
 const char *gf_gas_name(gf_gas_t kind);
+int         gf_cell_mm(gf_cell_t cell);       /* 75, 44; 0 if unknown */
 
 /* The raw inputs, exactly as they sit in a LogRecord. */
 typedef struct {

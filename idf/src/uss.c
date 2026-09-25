@@ -395,12 +395,12 @@ static bool param_cmd(uint8_t cmd, uint8_t id, int32_t value,
 
     uint8_t blk[USS_PRM_LEN];
     if (!rd(USS_PRM_OFF, blk, sizeof(blk))) return false;
-    /* A torn first read would give a garbage seq0 and could make an old answer
-     * look new. Its CRC says whether seq0 can be trusted. */
-    if (uss_link_crc8(blk, USS_PRM_LEN - 1) != blk[USS_PRM_LEN - 1]) {
-        ESP_LOGW(TAG, "param 0x%02X: PARAM block CRC mismatch before command", id);
-        return false;
-    }
+    /* seq0 lets us tell OUR answer from the previous one. A block without a
+     * valid CRC holds no previous answer at all -- that is the normal state of
+     * a module that has not run a PARAM command since it booted (seen on
+     * eco-field-02, 2026-09-25) -- so then the first valid block with our id is
+     * ours, whatever its seq. */
+    bool have_seq0 = uss_link_crc8(blk, USS_PRM_LEN - 1) == blk[USS_PRM_LEN - 1];
     uint8_t seq0 = blk[USS_REG_PRM_SEQ - USS_PRM_OFF];
 
     uint32_t v = (uint32_t) value;
@@ -418,7 +418,7 @@ static bool param_cmd(uint8_t cmd, uint8_t id, int32_t value,
         vTaskDelay(pdMS_TO_TICKS(USS_POLL_MS));
         if (!rd(USS_PRM_OFF, blk, sizeof(blk))) continue;
         if (uss_link_crc8(blk, USS_PRM_LEN - 1) != blk[USS_PRM_LEN - 1]) continue;
-        if (blk[USS_REG_PRM_SEQ - USS_PRM_OFF] == seq0) continue;
+        if (have_seq0 && blk[USS_REG_PRM_SEQ - USS_PRM_OFF] == seq0) continue;
         if (blk[USS_REG_PRM_ID  - USS_PRM_OFF] != id)   continue;
         *status    = blk[USS_REG_PRM_STAT - USS_PRM_OFF];
         *in_effect = (int32_t) le32(&blk[USS_REG_PRM_VAL - USS_PRM_OFF]);

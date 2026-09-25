@@ -12,6 +12,7 @@
  */
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "uss_derive.h"
@@ -61,21 +62,31 @@ int main(void)
     static const int    AMPS[]  = { 150, 400, 1100 };
     static const uint32_t DTMS[] = { 60000, 300000, 1800000 };
 
+    for (int cell = 0; cell < GF_CELL_COUNT; cell++)
     for (int g = 0; g < GF_GAS_COUNT; g++) {
         gf_cfg_t  mine;
         uss_derive_cfg_t ref;
-        if (!gf_profile(&mine, (gf_gas_t) g) ||
-            !uss_derive_profile(&ref, (uss_gas_kind_t) g)) {
-            printf("profile %d missing\n", g);
+        if (!gf_profile(&mine, (gf_gas_t) g, (gf_cell_t) cell) ||
+            !uss_derive_profile_cell(&ref, (uss_gas_kind_t) g, (uss_cell_t) cell)) {
+            printf("profile %d cell %d missing\n", g, cell);
             return 1;
         }
         if (strcmp(gf_gas_name((gf_gas_t) g), uss_gas_name((uss_gas_kind_t) g)))
             { printf("name mismatch %d\n", g); return 1; }
+        if (gf_cell_mm((gf_cell_t) cell) != atoi(uss_cell_name((uss_cell_t) cell)))
+            { printf("cell mismatch %d\n", cell); return 1; }
+        cmp("path_m", mine.path_m, ref.path_m);
+        cmp("k_a", mine.k_a, ref.k_a);
+        cmp("k_b", mine.k_b, ref.k_b);
+        cmp("k_c", mine.k_c, ref.k_c);
+        cmp("amp_n", mine.amp_n, ref.amp_ref_n);
         cmp("module.gap", mine.module.gap_adcsmp, ref.module.gap_adcsmp);
         cmp("module.gain", mine.module.gain, ref.module.gain);
         cmp("module.pulses", mine.module.pulses, ref.module.pulses);
         cmp("module.f1", mine.module.f1_hz, ref.module.f1_hz);
         cmp("module.f2", mine.module.f2_hz, ref.module.f2_hz);
+        cmp("module.tofg_min", mine.module.tofg_min_ns, ref.module.tofg_min_ns);
+        cmp("module.tofg_max", mine.module.tofg_max_ns, ref.module.tofg_max_ns);
         flag("validated", mine.validated, ref.validated);
 
         for (unsigned ix = 0; ix < sizeof XS / sizeof *XS; ix++)

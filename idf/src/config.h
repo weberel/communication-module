@@ -5,7 +5,7 @@
  */
 #pragma once
 
-#define FW_VERSION              "idf-0.29"      /* + derived gas/flow telemetry, module preset sync */
+#define FW_VERSION              "idf-0.30"      /* + per-cell profile, ToF gate in preset sync */
 
 /* DEBUG ONLY -- pad the flash log up to this many pending records so a drain
  * can be timed without waiting 12 h for a real backlog. 0 disables.
@@ -117,6 +117,16 @@
  * validated (2026-09-25); GF_GAS_AIR_CO2 / GF_GAS_N2 are estimates.
  * Compile-time until the board has a downlink to set it remotely. */
 #define USS_GAS_PROFILE         GF_GAS_BIOGAS
+
+/* Measuring cell. PER UNIT -- set it before flashing. It selects the capture
+ * window and ToF gate pushed into the module (one module image serves every
+ * cell) and the path/K used by the derivation. The wrong cell does not just
+ * give wrong numbers: the 75 mm window (140 us) opens AFTER the 44 mm cell's
+ * echo (~133 us), so the module sees nothing.
+ *   GF_CELL_75  75 mm cell, validated 2026-09-25
+ *   GF_CELL_44  44 mm cell, NOT calibrated (eco-field-02 / device 4)
+ * Compile-time until the board has a downlink; later an NVS key. */
+#define USS_CELL                GF_CELL_44
 
 /* Derived-window sanity limits (uplink.c).
  * COVERAGE: S0 integrates dt_ms / (tu*td), so with the window's ToF it says how

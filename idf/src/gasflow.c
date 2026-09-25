@@ -92,7 +92,46 @@ const char *gf_gas_name(gf_gas_t kind)
     return ((unsigned) kind < GF_GAS_COUNT) ? NAMES[kind] : "?";
 }
 
-bool gf_profile(gf_cfg_t *c, gf_gas_t kind)
+int gf_cell_mm(gf_cell_t cell)
+{
+    return cell == GF_CELL_75 ? 75 : cell == GF_CELL_44 ? 44 : 0;
+}
+
+/* The 44 mm cell on top of a 75 mm gas profile. NOTHING HERE IS MEASURED on
+ * this cell with the current firmware -- a starting point, not a calibration:
+ *   - path nominal 44 mm; the old 131.3 us air reading implies ~1.7 % longer.
+ *     One air point fixes it (acoustic T against the MS5837).
+ *   - K scales with A*L at equal bore: x 44/72.2, IF the bore is 15.5 mm too.
+ *   - window 110 us after excitation (gap 1550), as shipped on this cell; the
+ *     echo sits in the transmit tail, so expect a composition-dependent zero.
+ *   - no amplitude check: a shorter path gives a stronger echo, and the 75 mm
+ *     table would flag real biogas as "not gas". */
+static void apply_cell_44(gf_cfg_t *c)
+{
+    double s = 0.0440 / 0.07220;
+    c->path_m = 0.0440;
+    c->t0_us  = 1.2;
+    c->k_a *= s; c->k_b *= s; c->k_c *= s;
+    c->module.gap_adcsmp  = 1550;
+    c->module.tofg_min_ns = 80000;      /* ~95 us (CH4, hot) .. ~180 us (CO2, cold) */
+    c->module.tofg_max_ns = 200000;
+    c->amp_n     = 0;
+    c->validated = false;
+}
+
+static bool profile_gas(gf_cfg_t *c, gf_gas_t kind);
+
+bool gf_profile(gf_cfg_t *c, gf_gas_t kind, gf_cell_t cell)
+{
+    if ((unsigned) cell >= GF_CELL_COUNT) return false;
+    bool ok = profile_gas(c, kind);
+    c->cell = cell;
+    if (ok && cell == GF_CELL_44) apply_cell_44(c);
+    return ok;
+}
+
+/* The gas part of a profile, on the 75 mm cell. */
+static bool profile_gas(gf_cfg_t *c, gf_gas_t kind)
 {
     memset(c, 0, sizeof(*c));
     c->kind = kind;
@@ -129,6 +168,10 @@ bool gf_profile(gf_cfg_t *c, gf_gas_t kind)
     c->module.pulses     = 6;
     c->module.f1_hz      = 170000;
     c->module.f2_hz      = 240000;
+    /* abs-ToF gate, 75 mm cell: CH4 at +60 C ~153 us .. CO2 at -20 C ~292 us,
+     * with margin. The module's own default (80..320 us) covers every cell. */
+    c->module.tofg_min_ns = 140000;
+    c->module.tofg_max_ns = 320000;
 
     /* K, biogas, 2026-09-25: 11 points, 10/50/90 % CH4 x 2..14 SL/min,
      * Re 180..1730, 1.5 % rms. */

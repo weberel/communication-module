@@ -267,6 +267,10 @@
 #define USS_PARAM_TOF_POS     0x0D
 #define USS_PARAM_DTOF_SHIFT  0x0E  /* maxSampleShift gate, samples           */
 #define USS_PARAM_PULSES      0x0F  /* trill cycles (2 pulses each)           */
+#define USS_PARAM_TOFG_MIN_NS 0x41  /* abs-ToF gate lower limit, ns (per CELL:
+                                     * the master sets it; default 80000)     */
+#define USS_PARAM_TOFG_MAX_NS 0x42  /* abs-ToF gate upper limit, ns (default
+                                     * 320000). One image serves every cell.  */
 #define USS_PARAM_DTOF_OFF_PS 0x40  /* zero-flow dTOF offset the library
                                      * subtracts, ps, +-1000000               */
 

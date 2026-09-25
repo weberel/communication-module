@@ -81,10 +81,20 @@ static uint16_t s_uss_lh_uptime_s;
  * MODULE boot. The settings persist in module FRAM, so checking them every wake
  * would only burn awake time; they can only change when the module restarts
  * (a reflash resets them to compiled defaults) or when this board has lost its
- * RTC state. -1 not yet tried, 0 failed, 1 in place. Tried ONCE per module boot
- * either way: a module firmware without PARAM support never answers, and a
- * retry every wake would cost a 3 s timeout at 16 mA 288 times a day. */
+ * RTC state. -1 not yet tried, 0 failed, 1 in place. A failure is retried on
+ * the next wakes, but at most PRESET_TRIES times per module boot: a module
+ * firmware without PARAM support never answers, and a retry every wake would
+ * cost a 3 s timeout at 16 mA 288 times a day. */
+#define PRESET_TRIES 3
 RTC_DATA_ATTR static int8_t   s_uss_preset = -1;
+RTC_DATA_ATTR static uint8_t  s_uss_preset_tries;
+
+/* Which preset the last sync was for. A reflash with a different cell, gas or
+ * constant set must re-sync even when RTC state survived the reset: otherwise a
+ * board moved from the 75 mm to the 44 mm profile keeps the 75 mm capture
+ * window (140 us), which opens after the 44 mm echo and blinds the module. */
+#define PRESET_KEY ((uint32_t) USS_CELL << 16 | (uint32_t) USS_GAS_PROFILE << 8 | GF_DERIVE_VER)
+RTC_DATA_ATTR static uint32_t s_uss_preset_key;
 
 /* Last uss_seq we published, for stale-frame detection. RTC_DATA_ATTR so the
  * check survives deep sleep -- the fault it looks for lasted ten hours, i.e.
@@ -115,6 +125,30 @@ static uint8_t soc_from_voltage(uint16_t vbat_mv)
  * writes nothing, so FRAM is untouched and bench tuning is not silently
  * overwritten by a board that merely rebooted. Every SET is verified by the
  * value the module reports back as in effect. */
+static bool preset_get(uint8_t id, const char *name, int32_t *have)
+{
+    uint8_t st = 0xFF;
+    if (!uss_param_get(id, have, &st) || st != USS_PRM_ST_OK) {
+        ESP_LOGW(TAG, "USS preset: cannot read %s (status %u)", name, st);
+        return false;
+    }
+    return true;
+}
+
+static bool preset_set(uint8_t id, const char *name, int32_t want)
+{
+    int32_t have = 0;
+    uint8_t st = 0xFF;
+    esp_task_wdt_reset();
+    if (!uss_param_set(id, want, &have, &st) || st != USS_PRM_ST_OK || have != want) {
+        ESP_LOGE(TAG, "USS preset: %s -> %ld refused (status %u, in effect %ld)",
+                 name, (long) want, st, (long) have);
+        return false;
+    }
+    ESP_LOGW(TAG, "USS preset: %s set to %ld", name, (long) want);
+    return true;
+}
+
 static bool uss_sync_preset(const gf_module_t *m)
 {
     static const struct { uint8_t id; const char *name; } P[] = {
@@ -125,20 +159,24 @@ static bool uss_sync_preset(const gf_module_t *m)
 
     for (unsigned i = 0; i < sizeof(P) / sizeof(P[0]); i++) {
         int32_t have = 0;
-        uint8_t st = 0xFF;
-        if (!uss_param_get(P[i].id, &have, &st) || st != USS_PRM_ST_OK) {
-            ESP_LOGW(TAG, "USS preset: cannot read %s (status %u)", P[i].name, st);
+        if (!preset_get(P[i].id, P[i].name, &have)) return false;
+        if (have != want[i] && !preset_set(P[i].id, P[i].name, want[i])) return false;
+    }
+
+    /* ToF gate, per cell. The module refuses a min >= the CURRENT max (and a
+     * max <= the current min), so moving between cells in one step can fail
+     * either way round. Widen first: max to the top of the SET range, then
+     * min, then the real max -- the same order uss-link uses. Only when the
+     * gate actually differs, so a matching module still sees no writes. */
+    int32_t gmin = 0, gmax = 0;
+    if (!preset_get(USS_PARAM_TOFG_MIN_NS, "tofg_min", &gmin) ||
+        !preset_get(USS_PARAM_TOFG_MAX_NS, "tofg_max", &gmax))
+        return false;
+    if (gmin != m->tofg_min_ns || gmax != m->tofg_max_ns) {
+        if (!preset_set(USS_PARAM_TOFG_MAX_NS, "tofg_max", 2000000) ||
+            !preset_set(USS_PARAM_TOFG_MIN_NS, "tofg_min", m->tofg_min_ns) ||
+            !preset_set(USS_PARAM_TOFG_MAX_NS, "tofg_max", m->tofg_max_ns))
             return false;
-        }
-        if (have == want[i]) continue;
-        esp_task_wdt_reset();
-        if (!uss_param_set(P[i].id, want[i], &have, &st) ||
-            st != USS_PRM_ST_OK || have != want[i]) {
-            ESP_LOGE(TAG, "USS preset: %s -> %ld refused (status %u, in effect %ld)",
-                     P[i].name, (long) want[i], st, (long) have);
-            return false;
-        }
-        ESP_LOGW(TAG, "USS preset: %s set to %ld", P[i].name, (long) want[i]);
     }
     return true;
 }
@@ -382,12 +420,20 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
 
     /* Module preset, once per module boot. AFTER the sample is stored, so a
      * slow or failing PARAM exchange can never cost the measurement. */
-    if (uss_ok && (s_uss_preset < 0 || uss_saw_boot())) {
+    uint32_t key = PRESET_KEY;
+    if (uss_saw_boot() || s_uss_preset_key != key) {
+        s_uss_preset       = -1;        /* new module boot or new preset: start over */
+        s_uss_preset_tries = 0;
+        s_uss_preset_key   = key;
+    }
+    if (uss_ok && s_uss_preset != 1 && s_uss_preset_tries < PRESET_TRIES) {
         gf_cfg_t gas;
-        gf_profile(&gas, USS_GAS_PROFILE);
+        gf_profile(&gas, USS_GAS_PROFILE, USS_CELL);
+        s_uss_preset_tries++;
         s_uss_preset = uss_sync_preset(&gas.module) ? 1 : 0;
-        ESP_LOGI(TAG, "USS preset (%s): %s", gf_gas_name(USS_GAS_PROFILE),
-                 s_uss_preset ? "in place" : "FAILED");
+        ESP_LOGI(TAG, "USS preset (%s, %d mm cell): %s (try %u/%d)",
+                 gf_gas_name(USS_GAS_PROFILE), gf_cell_mm(USS_CELL),
+                 s_uss_preset ? "in place" : "FAILED", s_uss_preset_tries, PRESET_TRIES);
     }
 
     uint32_t praw, traw;
@@ -513,6 +559,7 @@ void app_main(void)
         s_upload_inflight  = 0;
         s_upload_crashed   = 0;
         s_uss_preset       = -1;
+        s_uss_preset_tries = 0;
         solar_reset();
         ESP_LOGI(TAG, "cold boot (id %u, reset reason %d)", s_boot_id, (int)why);
     } else if (crashed) {

@@ -278,16 +278,16 @@ static const char *window_of(const gf_cfg_t *cfg, const LogRecord *prev,
 static int derived_values(const LogRecord *r, char *out, size_t cap)
 {
     gf_cfg_t cfg;
-    gf_profile(&cfg, USS_GAS_PROFILE);
+    gf_profile(&cfg, USS_GAS_PROFILE, USS_CELL);
 
     gf_sample_t s;
     sample_of(&cfg, r, &s);
 
     int n = snprintf(out, cap,
-        ",\"uss_gas\":\"%s\",\"uss_validated\":%u,\"uss_derive_ver\":%d,"
+        ",\"uss_gas\":\"%s\",\"uss_cell\":%d,\"uss_validated\":%u,\"uss_derive_ver\":%d,"
         "\"uss_tof_bad\":%u",
-        gf_gas_name(cfg.kind), cfg.validated ? 1u : 0u, GF_DERIVE_VER,
-        s.tof_bad ? 1u : 0u);
+        gf_gas_name(cfg.kind), gf_cell_mm(cfg.cell), cfg.validated ? 1u : 0u,
+        GF_DERIVE_VER, s.tof_bad ? 1u : 0u);
     if (n < 0 || (size_t)n >= cap) return -1;
 
     if (s.ok)
