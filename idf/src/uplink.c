@@ -261,6 +261,13 @@ static const char *window_of(const gf_cfg_t *cfg, const LogRecord *prev,
         rep = &s_prev;
         rr  = prev;
     }
+    /* Kept apart on purpose: without the in-line MS5837 there is no pressure
+     * or temperature, so the volume cannot be taken to standard conditions and
+     * -- worse -- the CH4 fraction cannot be read from the speed of sound at
+     * all (it needs the gas temperature). That is a missing sensor, not a bad
+     * ultrasonic sample, and the two need different fixes. */
+    if (!rep->ok && !(cur->sensor_ok & 0x08) && !(prev->sensor_ok & 0x08))
+                                                               return "no_pt";
     if (!rep->ok)                                              return "no_sample";
 
     /* Integrated time claimed by S0, at the representative ToF, against the
@@ -289,15 +296,26 @@ static int derived_values(const LogRecord *r, char *out, size_t cap)
     gf_sample_t s;
     sample_of(&cfg, r, &s);
 
-    /* Configuration: what the server needs to recompute from the raw keys. */
+    /* Configuration: what the server needs to recompute from the raw keys.
+     * uss_validated is a property of profile + cell (always 0 on 44 mm): it is
+     * what marks provisional data, so it goes on every record. */
     int n = snprintf(out, cap,
-        ",\"uss_gas\":\"%s\",\"uss_cell\":%d,\"uss_derive_ver\":%d",
-        gf_gas_name(cfg.kind), gf_cell_mm(cfg.cell), GF_DERIVE_VER);
+        ",\"uss_gas\":\"%s\",\"uss_cell\":%d,\"uss_derive_ver\":%d,\"uss_validated\":%u",
+        gf_gas_name(cfg.kind), gf_cell_mm(cfg.cell), GF_DERIVE_VER,
+        cfg.validated ? 1u : 0u);
     if (n < 0 || (size_t)n >= cap) return -1;
 
-    /* "Methane" only means something under the biogas profile, where the
-     * profile's first component IS CH4. For air/N2 it is not sent at all. */
-    if (cfg.kind != GF_GAS_BIOGAS) return n;
+    /* Sample flags, sent as 0 OR 1 whenever the check actually ran, so an
+     * absent key means "not evaluated", never "not set" (server request,
+     * 2026-09-25). The ToF check runs on every code-122 sample with P and T;
+     * the composition and the echo check only on one whose ToF passed. A
+     * record without them says why through uss_code / sensor_ok. */
+    if (s.ok || s.tof_bad)
+        n += snprintf(out + n, cap - n, ",\"uss_tof_bad\":%u", s.tof_bad ? 1u : 0u);
+    if (s.ok && n > 0 && (size_t)n < cap)
+        n += snprintf(out + n, cap - n, ",\"uss_x_a\":%.4f,\"uss_not_gas\":%u",
+                      s.x_a, s.not_gas ? 1u : 0u);
+    if (n < 0 || (size_t)n >= cap) return -1;
 
     LogRecord prev;
     if (r->seq == 0 || !flashlog_read_seq(r->seq - 1, &prev))
@@ -310,12 +328,17 @@ static int derived_values(const LogRecord *r, char *out, size_t cap)
     if (err)
         return n + snprintf(out + n, cap - n, ",\"uss_win_err\":\"%s\"", err);
 
-    /* Standard litres CH4 (20 C, 1013.25 mbar) in the window since the
-     * previous record: total volume from the totalizer, taken to standard
-     * conditions with the in-line P and T, times the CH4 fraction from the
-     * speed of sound. 0 below the low-flow cutoff, and 0 when the echo says the
-     * line does not hold biogas at all. */
-    return n + snprintf(out + n, cap - n, ",\"uss_v_ch4_std_l\":%.4f", w.v_a_n_ul / 1e6);
+    /* Standard litres (20 C, 1013.25 mbar) in the window since the previous
+     * record: total volume from the totalizer, taken to standard conditions
+     * with the in-line P and T. Both 0 below the low-flow cutoff.
+     * uss_v_ch4_std_l is that times the CH4 fraction from the speed of sound,
+     * and 0 when the echo says the line does not hold biogas at all. "Methane"
+     * only means something under the biogas profile, where the profile's first
+     * component IS CH4, so for air/N2 only the total goes out. */
+    n += snprintf(out + n, cap - n, ",\"uss_v_std_l\":%.4f", w.v_n_ul / 1e6);
+    if (cfg.kind == GF_GAS_BIOGAS && n > 0 && (size_t)n < cap)
+        n += snprintf(out + n, cap - n, ",\"uss_v_ch4_std_l\":%.4f", w.v_a_n_ul / 1e6);
+    return n;
 }
 
 /* ---- ThingsBoard JSON, same schema the dashboards already use ---- */
