@@ -34,6 +34,9 @@ bool     flashlog_append(LogRecord *r);               /* fills seq/magic/crc */
 uint32_t flashlog_head_seq(void);
 uint32_t flashlog_pending(void);
 bool     flashlog_peek(uint32_t i, LogRecord *r);     /* i-th pending, 0 = oldest */
+/* Any record still in the ring, sent or not, by its seq. False if it was never
+ * written, has been overwritten, or fails its CRC. */
+bool     flashlog_read_seq(uint32_t seq, LogRecord *r);
 void     flashlog_advance(uint32_t n);                /* persists the cursor */
 void     flashlog_sleep(void);                        /* deep power-down */
 

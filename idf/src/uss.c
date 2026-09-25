@@ -73,6 +73,19 @@ static bool read_result(uint8_t *blk)
 /* PROTO version the module last identified as; 0 until first contact. */
 static uint8_t s_proto;
 
+/* STATUS.BOOT seen on any read this wake. Latched, because the bit only lives
+ * "from reset until the first command": uss_start_auto() reads STATUS and then
+ * sends AUTO_START, so by the time uss_sample() looks, the command has already
+ * cleared it. Reading it where it is first visible is the only reliable way. */
+static bool s_saw_boot;
+
+static void note_status(uint8_t st)
+{
+    if (st & USS_ST_BOOT) s_saw_boot = true;
+}
+
+bool uss_saw_boot(void) { return s_saw_boot; }
+
 static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static uint32_t le32(const uint8_t *p)
 {
@@ -220,6 +233,7 @@ bool uss_start_auto(uint16_t period_s)
      * provide. Re-asserting only when STATUS.AUTO is clear still recovers
      * automatically after the module reboots. */
     if (!rd(USS_REG_STATUS, &st, 1)) return false;
+    note_status(st);
     if (st & USS_ST_AUTO) return true;
 
     if (!wr(USS_REG_AUTO_PERIOD, lo))     return false;
@@ -287,6 +301,7 @@ bool uss_sample(uss_result_t *out)
 
     uint8_t st = 0;
     if (!rd(USS_REG_STATUS, &st, 1)) return false;
+    note_status(st);
     int64_t t_status = esp_timer_get_time();
     uint8_t st_first = st;
     int ready_polls = 0;
@@ -356,7 +371,69 @@ bool uss_sample(uss_result_t *out)
     out->tof_ups_q40 = le32(&blk[USS_REG_TOF_UPS_Q40 - USS_LINK_RESULT_OFF]);
     out->tof_dns_q40 = le32(&blk[USS_REG_TOF_DNS_Q40 - USS_LINK_RESULT_OFF]);
 
+    note_status(out->status);
     if (out->status & USS_ST_BOOT)
         ESP_LOGW(TAG, "slave rebooted since last contact");
     return true;
+}
+
+/* One PARAM command: write id + value in ONE transaction at 0x44, then the
+ * command byte, then poll the PARAM result block until its sequence number
+ * moves with a valid CRC and our id.
+ *
+ * The module applies the command from its main loop BETWEEN captures, so the
+ * answer can take up to one capture period; the budget is the measurement
+ * timeout. A GET is harmless. A SET PERSISTS in module FRAM until the next
+ * flash -- the caller reads first and only writes what differs. */
+static bool param_cmd(uint8_t cmd, uint8_t id, int32_t value,
+                      int32_t *in_effect, uint8_t *status)
+{
+    if (!s_dev) {
+        eco_i2c_add_tracked(&s_dev, USS_LINK_ADDR7);
+        if (!s_dev) return false;
+    }
+
+    uint8_t blk[USS_PRM_LEN];
+    if (!rd(USS_PRM_OFF, blk, sizeof(blk))) return false;
+    /* A torn first read would give a garbage seq0 and could make an old answer
+     * look new. Its CRC says whether seq0 can be trusted. */
+    if (uss_link_crc8(blk, USS_PRM_LEN - 1) != blk[USS_PRM_LEN - 1]) {
+        ESP_LOGW(TAG, "param 0x%02X: PARAM block CRC mismatch before command", id);
+        return false;
+    }
+    uint8_t seq0 = blk[USS_REG_PRM_SEQ - USS_PRM_OFF];
+
+    uint32_t v = (uint32_t) value;
+    uint8_t p[6] = { USS_REG_PARAM_ID, id, (uint8_t) v, (uint8_t)(v >> 8),
+                     (uint8_t)(v >> 16), (uint8_t)(v >> 24) };
+    bool sent = false;
+    for (int i = 0; i < XFER_TRIES && !sent; i++) {
+        if (i) vTaskDelay(pdMS_TO_TICKS(XFER_GAP_MS));
+        sent = i2c_master_transmit(s_dev, p, sizeof(p), XFER_TO_MS) == ESP_OK;
+    }
+    if (!sent) return false;
+    if (!wr(USS_REG_CMD, cmd)) return false;
+
+    for (int waited = 0; waited < USS_MEAS_TIMEOUT_MS; waited += USS_POLL_MS) {
+        vTaskDelay(pdMS_TO_TICKS(USS_POLL_MS));
+        if (!rd(USS_PRM_OFF, blk, sizeof(blk))) continue;
+        if (uss_link_crc8(blk, USS_PRM_LEN - 1) != blk[USS_PRM_LEN - 1]) continue;
+        if (blk[USS_REG_PRM_SEQ - USS_PRM_OFF] == seq0) continue;
+        if (blk[USS_REG_PRM_ID  - USS_PRM_OFF] != id)   continue;
+        *status    = blk[USS_REG_PRM_STAT - USS_PRM_OFF];
+        *in_effect = (int32_t) le32(&blk[USS_REG_PRM_VAL - USS_PRM_OFF]);
+        return true;
+    }
+    ESP_LOGW(TAG, "param 0x%02X: no answer in %d ms", id, USS_MEAS_TIMEOUT_MS);
+    return false;
+}
+
+bool uss_param_get(uint8_t id, int32_t *in_effect, uint8_t *status)
+{
+    return param_cmd(USS_CMD_PARAM_GET, id, 0, in_effect, status);
+}
+
+bool uss_param_set(uint8_t id, int32_t value, int32_t *in_effect, uint8_t *status)
+{
+    return param_cmd(USS_CMD_PARAM_SET, id, value, in_effect, status);
 }

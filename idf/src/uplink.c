@@ -30,6 +30,10 @@
 
 #include "board.h"
 #include "secrets.h"
+#include "gasflow.h"
+#include "uss_link.h"
+
+#include <math.h>
 
 static const char *TAG = "uplink";
 
@@ -188,6 +192,128 @@ static bool publish_acked(const char *json)
     return (b & EV_PUBACK) != 0;
 }
 
+/* ---- derived ultrasonic values (gasflow.c) ---------------------------------
+ *
+ * Computed HERE, at upload, from the raw fields already in the record, so the
+ * record layout (and REC_MAGIC) stays untouched and a backlog logged before
+ * this build still gets derived values. The raw keys keep going out next to
+ * these: the server can always recompute with refitted constants, and
+ * uss_derive_ver says which constants produced what it received.
+ *
+ * WINDOWS come from a record and its PREDECESSOR in the flash ring, read back
+ * by seq -- not remembered in RAM, so it survives deep sleep, reboots and
+ * sessions that start mid-backlog alike. No predecessor, no window: a missing
+ * predecessor is never treated as zero. */
+static void raw_of(const LogRecord *r, gf_raw_t *raw)
+{
+    raw->code        = r->uss_code;
+    raw->tof_ups_q40 = r->uss_tof_ups_q40;
+    raw->tof_dns_q40 = r->uss_tof_dns_q40;
+    raw->dtof_ps     = r->uss_dtof_ps;
+    raw->amp_ups     = r->uss_amp_ups;
+    raw->amp_dns     = r->uss_amp_dns;
+    raw->gain        = r->uss_gain;
+}
+
+/* A sample needs the module (bit 4) AND the in-line MS5837 (bit 3). */
+static void sample_of(const gf_cfg_t *cfg, const LogRecord *r, gf_sample_t *s)
+{
+    gf_raw_t raw;
+    memset(s, 0, sizeof(*s));
+    if ((r->sensor_ok & 0x18) != 0x18) return;
+    raw_of(r, &raw);
+    gf_sample(cfg, &raw, r->press_dmbar / 10.0, r->temp_cC / 100.0, s);
+}
+
+/* Window between prev and cur. Returns NULL and fills *w on success, or a short
+ * reason, which is published so a missing volume explains itself. */
+static const char *window_of(const gf_cfg_t *cfg, const LogRecord *prev,
+                             const LogRecord *cur, const gf_sample_t *s_cur,
+                             gf_window_t *w, double *cov, uint32_t *dt_s)
+{
+    if (!(prev->sensor_ok & 0x10) || !(cur->sensor_ok & 0x10)) return "no_module";
+    if (cur->uss_tot_flags & USS_TOT_FLAG_SAT)                 return "saturated";
+    /* <= 0 also covers a totalizer reset and pre-PROTO 3 records (all zero). */
+    int64_t ds0 = cur->uss_s0 - prev->uss_s0;
+    int64_t ds1 = cur->uss_s1 - prev->uss_s1;
+    if (ds0 <= 0)                                              return "ds0";
+
+    /* Wall-clock window. uptime_s is only comparable within one boot epoch. */
+    if (prev->ts_s && cur->ts_s > prev->ts_s)
+        *dt_s = cur->ts_s - prev->ts_s;
+    else if (prev->boot_id == cur->boot_id && cur->uptime_s > prev->uptime_s)
+        *dt_s = cur->uptime_s - prev->uptime_s;
+    else                                                       return "no_dt";
+
+    /* Composition, P and T from this record's sample, else the predecessor's
+     * (the window touches both ends). */
+    gf_sample_t s_prev;
+    const gf_sample_t *rep = s_cur;
+    const LogRecord   *rr  = cur;
+    if (!rep->ok) {
+        sample_of(cfg, prev, &s_prev);
+        rep = &s_prev;
+        rr  = prev;
+    }
+    if (!rep->ok)                                              return "no_sample";
+
+    /* Integrated time claimed by S0, at the representative ToF, against the
+     * wall clock. Above 1 means the sum claims more time than passed. Median
+     * 0.990 over a day of field windows (eco-field-02, 2026-09-23).
+     *
+     * Not judged below 60 s: record stamps are whole seconds and are taken a
+     * few seconds before the totalizer read, which alone moves a 5 s window's
+     * coverage by +-50 %. The volume of a short window does not depend on dt,
+     * so it is kept rather than thrown away on a check it cannot pass. */
+    double tu_ns = rr->uss_tof_ups_q40 / 1099511.627776 * 1000.0;
+    double td_ns = rr->uss_tof_dns_q40 / 1099511.627776 * 1000.0;
+    *cov = (double) ds0 / 1099511627776.0 * tu_ns * td_ns / (*dt_s * 1000.0);
+    if (*dt_s >= 60 && *cov > USS_WIN_COV_MAX)                return "coverage";
+
+    if (!gf_window(cfg, ds1, ds0, *dt_s * 1000u, rep, w))     return "window";
+    if (fabs(w->q_n_lpm) > USS_WIN_Q_MAX_LPM)                  return "q_max";
+    return NULL;
+}
+
+static int derived_values(const LogRecord *r, char *out, size_t cap)
+{
+    gf_cfg_t cfg;
+    gf_profile(&cfg, USS_GAS_PROFILE);
+
+    gf_sample_t s;
+    sample_of(&cfg, r, &s);
+
+    int n = snprintf(out, cap,
+        ",\"uss_gas\":\"%s\",\"uss_validated\":%u,\"uss_derive_ver\":%d,"
+        "\"uss_tof_bad\":%u",
+        gf_gas_name(cfg.kind), cfg.validated ? 1u : 0u, GF_DERIVE_VER,
+        s.tof_bad ? 1u : 0u);
+    if (n < 0 || (size_t)n >= cap) return -1;
+
+    if (s.ok)
+        n += snprintf(out + n, cap - n,
+            ",\"uss_c_mps\":%.2f,\"uss_x_a\":%.4f,\"uss_not_gas\":%u",
+            s.c_mps, s.x_a, s.not_gas ? 1u : 0u);
+    if (n < 0 || (size_t)n >= cap) return -1;
+
+    LogRecord prev;
+    if (r->seq == 0 || !flashlog_read_seq(r->seq - 1, &prev))
+        return n + snprintf(out + n, cap - n, ",\"uss_win_err\":\"no_prev\"");
+
+    gf_window_t w;
+    double   cov  = 0.0;
+    uint32_t dt_s = 0;
+    const char *err = window_of(&cfg, &prev, r, &s, &w, &cov, &dt_s);
+    if (err)
+        return n + snprintf(out + n, cap - n, ",\"uss_win_err\":\"%s\"", err);
+
+    return n + snprintf(out + n, cap - n,
+        ",\"uss_q_std_lpm\":%.3f,\"uss_v_std_l\":%.4f,\"uss_v_a_std_l\":%.4f,"
+        "\"uss_re\":%.0f,\"uss_cut\":%u,\"uss_cov\":%.3f,\"uss_win_s\":%lu",
+        w.q_n_lpm, w.v_n_ul / 1e6, w.v_a_n_ul / 1e6,
+        w.re, w.cut ? 1u : 0u, cov, (unsigned long) dt_s);
+}
+
 /* ---- ThingsBoard JSON, same schema the dashboards already use ---- */
 
 /* Returns the length written, or -1 if the payload did not fit. A truncated
@@ -271,14 +397,29 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
              * offset is changed later -- see the derivation in uss_link.h.
              * Both stay well inside 2^53, so JSON carries them exactly; S0 is
              * the faster of the two at ~3.5e12 per year. */
-            ",\"uss_s1\":%lld,\"uss_s0\":%lld,\"uss_skip\":%u",
+            ",\"uss_s1\":%lld,\"uss_s0\":%lld,\"uss_skip\":%u"
+            /* Echo amplitudes and PGA gain, restored 2026-09-25 (the 08-15 trim
+             * dropped them). They are the "is it this gas at all?" input: air
+             * in a biogas line reads ~61 % CH4 by speed of sound alone and only
+             * the echo strength gives it away. uss_not_gas below is the
+             * device's verdict; these let the server re-judge it. */
+            ",\"uss_amp_ups\":%u,\"uss_amp_dns\":%u,\"uss_gain\":%u",
             tof_us, r->uss_dtof_ps / 1e6f,
             r->uss_code, r->uss_snr_db2 / 2.0f,
             (unsigned long)r->uss_vol_ml,
             /* 0xFFFF = logged before this field existed */
             r->uss_seq == 0xFFFFu ? -1 : (int) r->uss_seq,
             r->uss_recoveries,
-            (long long) r->uss_s1, (long long) r->uss_s0, r->uss_tot_skip);
+            (long long) r->uss_s1, (long long) r->uss_s0, r->uss_tot_skip,
+            r->uss_amp_ups, r->uss_amp_dns, r->uss_gain);
+        /* uss_vol_ml above is LEGACY: the module's VOL_ML integrator still
+         * carries the old 44 mm cell's constants and is wrong for the 75 mm
+         * cell. Kept only because the server reads the key. uss_v_std_l is the
+         * volume to use. */
+        if (n > 0 && (size_t)n < cap) {
+            int d = derived_values(r, out + n, cap - n);
+            n = (d < 0) ? -1 : n + d;
+        }
     }
 
     /* Gas pressure from the MS5837 (it sits in the LINE, not ambient), and the
@@ -296,7 +437,9 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
     return n;
 }
 
-static char s_json[10240];
+/* 16 KB: 8 records at ~1.5 KB each with the derived ultrasonic keys. 10 KB no
+ * longer held a full batch. */
+static char s_json[16384];
 
 /* Reference for back-dating: the uptime and boot epoch of the newest record
  * (set from the ctx at the start of every session). */
@@ -388,7 +531,10 @@ static uint32_t drain(uplink_result_t *res)
             else
                 w = snprintf(s_json + len, sizeof(s_json) - len - 2,
                              "%s{%s}", included ? "," : "", vals);
-            if (w < 0 || (size_t)w >= sizeof(s_json) - len - 2) break;
+            /* Batch full: stop HERE and consume only what was processed. The
+             * advance below used to take the full n regardless, so the records
+             * that did not fit were marked sent without ever leaving the board. */
+            if (w < 0 || (size_t)w >= sizeof(s_json) - len - 2) { n = i; break; }
             len += (size_t)w;
             included++;
         }
@@ -450,6 +596,7 @@ static void send_status(const uplink_ctx_t *ctx, const uplink_result_t *res)
              "\"crash_count\":%u,\"vbat_mv\":%u,"
              "\"sun_h\":%u,\"voc_max_mv\":%u,\"fw\":\"" FW_VERSION "\","
              "\"uss_rst_cause\":%d,\"uss_lh_starts\":%d,\"uss_lh_uptime\":%d,"
+             "\"uss_preset\":%d,"
              /* Session phase timing. Cumulative ms of modem-on time; a phase's
               * own cost is the difference from the previous column. */
              "\"t_modem\":%lu,\"t_reg\":%lu,\"t_ppp\":%lu,\"t_sntp\":%lu,"
@@ -470,6 +617,7 @@ static void send_status(const uplink_ctx_t *ctx, const uplink_result_t *res)
              ctx->uss_health_valid ? (int) ctx->uss_rst_cause   : -1,
              ctx->uss_health_valid ? (int) ctx->uss_lh_starts   : -1,
              ctx->uss_health_valid ? (int) ctx->uss_lh_uptime_s : -1,
+             (int) ctx->uss_preset,
              (unsigned long)res->t_modem_ms, (unsigned long)res->t_reg_ms,
              (unsigned long)res->t_ppp_ms,   (unsigned long)res->t_sntp_ms,
              (unsigned long)res->t_mqtt_ms,  (unsigned long)res->t_drain_ms,

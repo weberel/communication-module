@@ -35,6 +35,8 @@
 #include "solar.h"
 #include "sensors.h"
 #include "uss.h"
+#include "uss_link.h"
+#include "gasflow.h"
 #include "i2c_bus.h"
 #include "esp_timer.h"
 #include "wf280a.h"
@@ -75,15 +77,14 @@ static uint16_t s_uss_rst_cause;
 static uint16_t s_uss_lh_starts;
 static uint16_t s_uss_lh_uptime_s;
 
-/* Previous raw-totalizer read, kept across deep sleep so the K cross-check can
- * diff consecutive wakes. RTC_DATA_ATTR, not NVS: this is a diagnostic, losing
- * it on a power cycle costs one skipped log line, and it is nowhere near worth
- * a flash write every 5 minutes. */
-RTC_DATA_ATTR static int64_t  s_uss_tot_prev_s1;
-RTC_DATA_ATTR static int64_t  s_uss_tot_prev_s0;
-RTC_DATA_ATTR static uint32_t s_uss_tot_prev_n;
-RTC_DATA_ATTR static uint32_t s_uss_tot_prev_ml;
-RTC_DATA_ATTR static bool     s_uss_tot_prev_valid;
+/* Module preset (gas-dependent capture window, gain, pulses, tones) for this
+ * MODULE boot. The settings persist in module FRAM, so checking them every wake
+ * would only burn awake time; they can only change when the module restarts
+ * (a reflash resets them to compiled defaults) or when this board has lost its
+ * RTC state. -1 not yet tried, 0 failed, 1 in place. Tried ONCE per module boot
+ * either way: a module firmware without PARAM support never answers, and a
+ * retry every wake would cost a 3 s timeout at 16 mA 288 times a day. */
+RTC_DATA_ATTR static int8_t   s_uss_preset = -1;
 
 /* Last uss_seq we published, for stale-frame detection. RTC_DATA_ATTR so the
  * check survives deep sleep -- the fault it looks for lasted ten hours, i.e.
@@ -105,6 +106,41 @@ static uint8_t soc_from_voltage(uint16_t vbat_mv)
     if (vbat_mv >= 4200) return 100;
     if (vbat_mv <= 3300) return 0;
     return (uint8_t)((vbat_mv - 3300) * 100 / (4200 - 3300));
+}
+
+/* Bring the module's gas-dependent settings to the profile's values.
+ *
+ * GET first, SET only what differs: on a module already running the profile
+ * (the normal case -- the compiled biogas defaults ARE the biogas preset) this
+ * writes nothing, so FRAM is untouched and bench tuning is not silently
+ * overwritten by a board that merely rebooted. Every SET is verified by the
+ * value the module reports back as in effect. */
+static bool uss_sync_preset(const gf_module_t *m)
+{
+    static const struct { uint8_t id; const char *name; } P[] = {
+        { USS_PARAM_GAP_ADCSMP, "gap_adcsmp" }, { USS_PARAM_GAIN, "gain" },
+        { USS_PARAM_PULSES, "pulses" }, { USS_PARAM_F1, "f1" }, { USS_PARAM_F2, "f2" },
+    };
+    const int32_t want[] = { m->gap_adcsmp, m->gain, m->pulses, m->f1_hz, m->f2_hz };
+
+    for (unsigned i = 0; i < sizeof(P) / sizeof(P[0]); i++) {
+        int32_t have = 0;
+        uint8_t st = 0xFF;
+        if (!uss_param_get(P[i].id, &have, &st) || st != USS_PRM_ST_OK) {
+            ESP_LOGW(TAG, "USS preset: cannot read %s (status %u)", P[i].name, st);
+            return false;
+        }
+        if (have == want[i]) continue;
+        esp_task_wdt_reset();
+        if (!uss_param_set(P[i].id, want[i], &have, &st) ||
+            st != USS_PRM_ST_OK || have != want[i]) {
+            ESP_LOGE(TAG, "USS preset: %s -> %ld refused (status %u, in effect %ld)",
+                     P[i].name, (long) want[i], st, (long) have);
+            return false;
+        }
+        ESP_LOGW(TAG, "USS preset: %s set to %ld", P[i].name, (long) want[i]);
+    }
+    return true;
 }
 
 static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
@@ -313,43 +349,15 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
         r->sensor_ok |= 0x10;
 
         /* Raw totalizer. A module still on PROTO 2 simply has nothing here, so
-         * this failing is not an error -- uss_vol_ml above stays authoritative
-         * until both sides are flashed. */
+         * this failing is not an error. Calibrated volumes are derived from
+         * these at upload time (uplink.c, gasflow.c); nothing on the device
+         * cuts or scales the raw sums. */
         uss_totals_t tot;
         if (uss_read_totalizer(&tot)) {
             r->uss_s1        = tot.s1;
             r->uss_s0        = tot.s0;
             r->uss_tot_skip  = tot.skip;
             r->uss_tot_flags = tot.flags;
-
-            /* Cross-check against the calibrated path while BOTH totalizers
-             * run. The geometry constant K is not known yet -- calibration
-             * against the MFC is what determines it -- so derive it here from
-             * the validated VOL_ML path and let it fall out of the soak
-             * instead of guessing a number and fitting the data to it.
-             *
-             *     K [uL per Q24-count] = d(vol_uL) / (dS1 / 2^24)
-             *
-             * A K that holds steady across records IS the evidence that the raw
-             * path reproduces the calibrated one; a K that drifts with flow or
-             * temperature says the two disagree and the raw path is not yet
-             * trustworthy. This is a diagnostic, not a control path -- nothing
-             * downstream consumes it. */
-            if (s_uss_tot_prev_valid && tot.n != s_uss_tot_prev_n) {
-                int64_t ds1 = tot.s1 - s_uss_tot_prev_s1;
-                int64_t ds0 = tot.s0 - s_uss_tot_prev_s0;
-                double  dml = (double) u.vol_ml - (double) s_uss_tot_prev_ml;
-                double  q24 = (double) ds1 / 16777216.0;
-                ESP_LOGI(TAG, "USS raw: dS1=%lld dS0=%lld skip=%u  "
-                              "K_est=%.6g uL/count (dVOL=%.0f mL)",
-                         (long long) ds1, (long long) ds0, tot.skip,
-                         (q24 != 0.0) ? (dml * 1000.0 / q24) : 0.0, dml);
-            }
-            s_uss_tot_prev_s1 = tot.s1;
-            s_uss_tot_prev_s0 = tot.s0;
-            s_uss_tot_prev_n  = tot.n;
-            s_uss_tot_prev_ml = u.vol_ml;
-            s_uss_tot_prev_valid = true;
         }
         ESP_LOGI(TAG, "USS ok: code=%u seq=%u dtof=%ld ps tof_ups=%lu tof_dns=%lu q40 "
                       "(%.1f/%.1f us) amp=%u/%u snr=%.1f dB gain=%u vol=%lu mL st=0x%02X",
@@ -370,6 +378,16 @@ static void read_sample(LogRecord *r, const solar_status_t *sol, bool bq_ok)
         r->uss_s1 = r->uss_s0 = 0;
         r->uss_tot_skip = 0;
         r->uss_tot_flags = 0;
+    }
+
+    /* Module preset, once per module boot. AFTER the sample is stored, so a
+     * slow or failing PARAM exchange can never cost the measurement. */
+    if (uss_ok && (s_uss_preset < 0 || uss_saw_boot())) {
+        gf_cfg_t gas;
+        gf_profile(&gas, USS_GAS_PROFILE);
+        s_uss_preset = uss_sync_preset(&gas.module) ? 1 : 0;
+        ESP_LOGI(TAG, "USS preset (%s): %s", gf_gas_name(USS_GAS_PROFILE),
+                 s_uss_preset ? "in place" : "FAILED");
     }
 
     uint32_t praw, traw;
@@ -455,6 +473,12 @@ void app_main(void)
     s_sensor_up_us   = esp_timer_get_time();
     s_sensor_cold_up = cold;
 
+#ifdef ECOTRACE_GNSS_TEST
+    /* Bench: GNSS + antenna path check (gnss_bench.c). Never returns. */
+    extern void gnss_bench_run(void);
+    gnss_bench_run();
+#endif
+
 #ifdef ECOTRACE_RAIL_BLINK
     /* Bench helper: does GPIO14 actually switch the SENSOR rail? Put an LED
      * across the J404 header's VCC/GND and watch. Never returns, so the board
@@ -488,6 +512,7 @@ void app_main(void)
         s_last_deep_uptime = 0;
         s_upload_inflight  = 0;
         s_upload_crashed   = 0;
+        s_uss_preset       = -1;
         solar_reset();
         ESP_LOGI(TAG, "cold boot (id %u, reset reason %d)", s_boot_id, (int)why);
     } else if (crashed) {
@@ -643,6 +668,7 @@ void app_main(void)
             .uss_rst_cause    = s_uss_rst_cause,
             .uss_lh_starts    = s_uss_lh_starts,
             .uss_lh_uptime_s  = s_uss_lh_uptime_s,
+            .uss_preset       = s_uss_preset,
         };
         if (ctx.deep_search) s_last_deep_uptime = s_uptime_s;
 

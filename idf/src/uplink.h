@@ -91,6 +91,8 @@ typedef struct {
     uint16_t uss_rst_cause;    /* raw SYSRSTIV: 2 brownout, 0xE SVSH, 0x14 SWPOR */
     uint16_t uss_lh_starts;    /* I2C address matches the module has seen */
     uint16_t uss_lh_uptime_s;  /* module uptime; a drop means it restarted */
+    int8_t   uss_preset;       /* gas preset on the module: -1 not tried this
+                                * module boot, 0 failed, 1 in place */
 } uplink_ctx_t;
 
 uplink_result_t uplink_upload_all(const uplink_ctx_t *ctx);

@@ -131,6 +131,18 @@ bool flashlog_peek(uint32_t i, LogRecord *r)
     return rec_valid(r) && r->seq == s_tail + i;
 }
 
+bool flashlog_read_seq(uint32_t seq, LogRecord *r)
+{
+    /* The oldest slots still intact: appending a record into a fresh sector
+     * erases that whole sector first, so only the last CAPACITY - one sector
+     * of records are guaranteed to survive. */
+    if (!s_ok || seq >= s_head ||
+        s_head - seq > FLASHLOG_CAPACITY - FLASHLOG_REC_PER_SECTOR)
+        return false;
+    extflash_read(slot_addr(seq), (uint8_t *)r, sizeof(*r));
+    return rec_valid(r) && r->seq == seq;
+}
+
 void flashlog_advance(uint32_t n)
 {
     s_tail += n;

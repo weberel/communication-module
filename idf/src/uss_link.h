@@ -210,6 +210,66 @@
 #define USS_REG_AUTO_PERIOD 0x42    /* u16 autonomous measurement period, s
                                      *     (future; 0 = off)                  */
 
+/* -- PARAMETER ACCESS (2026-09-25). Additive, no PROTO bump: an older master
+ * never writes 0x44..0x48 and never reads 0x68..0x6F.
+ *
+ * WHY. Tuning the acoustic front end (gain, pulses, tones, window, dTOF offset)
+ * used to need the bench image and the backchannel UART, which drops ~3 % of
+ * characters, and every candidate setting meant a reflash. And the end state
+ * this project wants -- the master detects gas composition from ToF and loads
+ * the operating point that suits it -- needs exactly this write path anyway.
+ *
+ *   SET: write PARAM_ID (u8) and PARAM_VAL (i32 LE) in one transaction starting
+ *        at 0x44, then CMD = USS_CMD_PARAM_SET. The main loop applies it
+ *        between captures, reconfigures the library, and REVERTS on failure.
+ *   GET: write PARAM_ID, then CMD = USS_CMD_PARAM_GET.
+ *   Both: poll the PARAM result block below until PRM_SEQ changes and its CRC
+ *        passes; PRM_VAL is the value NOW IN EFFECT (read back, not echoed).
+ *
+ * PERSISTENCE -- READ THIS. The whole USS configuration lives in #pragma
+ * PERSISTENT FRAM, so a SET survives resets and power cycles until the next
+ * flash. GET every parameter you intend to change BEFORE the first SET, and
+ * write those values back to undo. The dTOF offset persists too (same store
+ * as USS_CMD_ZEROCAL). */
+#define USS_REG_PARAM_ID    0x44    /* u8  write-only, USS_PARAM_*            */
+#define USS_REG_PARAM_VAL   0x45    /* i32 write-only, little-endian          */
+
+/* Result block, own CRC, readable. */
+#define USS_PRM_OFF         0x68
+#define USS_PRM_LEN         0x08    /* 0x68..0x6F inclusive, CRC included     */
+#define USS_REG_PRM_ID      0x68    /* u8  id the result belongs to           */
+#define USS_REG_PRM_STAT    0x69    /* u8  USS_PRM_ST_*                       */
+#define USS_REG_PRM_VAL     0x6A    /* i32 value in effect after the command  */
+#define USS_REG_PRM_SEQ     0x6E    /* u8  +1 per completed PARAM command     */
+#define USS_REG_PRM_CRC8    0x6F    /* u8  CRC8 over 0x68..0x6E               */
+
+#define USS_PRM_ST_OK       0x00
+#define USS_PRM_ST_UNKNOWN  0x01    /* no such id (or refused, e.g. AGC)      */
+#define USS_PRM_ST_RANGE    0x02    /* value outside the allowed range        */
+#define USS_PRM_ST_APPLY    0x03    /* library rejected it; old value restored */
+
+/* Parameter ids. 0x00..0x0F are the firmware's own table (ecotrace_proto.c
+ * PARAMS[], same order) -- change both together. Ranges are enforced there. */
+#define USS_PARAM_GAIN        0x00  /* PGA index 17..63 (~0.85 dB/step)       */
+#define USS_PARAM_AGC         0x01  /* REFUSED over I2C: the library AGC hangs
+                                     * this board (DEVLOG 2026-08-13)         */
+#define USS_PARAM_F1          0x02  /* Hz                                     */
+#define USS_PARAM_F2          0x03  /* Hz                                     */
+#define USS_PARAM_SAMPLES     0x04  /* ADC samples per capture                */
+#define USS_PARAM_OVERSAMPLE  0x05
+#define USS_PARAM_THRESH_HI   0x06
+#define USS_PARAM_THRESH_LO   0x07
+#define USS_PARAM_GAP_PPG     0x08  /* ASQ counts                             */
+#define USS_PARAM_GAP_ADC     0x09  /* ASQ counts                             */
+#define USS_PARAM_GAP_ADCSMP  0x0A  /* ASQ counts: excitation -> first sample */
+#define USS_PARAM_CAP_TIMEOUT 0x0B
+#define USS_PARAM_TOF_NEG     0x0C  /* abs-ToF search range, samples          */
+#define USS_PARAM_TOF_POS     0x0D
+#define USS_PARAM_DTOF_SHIFT  0x0E  /* maxSampleShift gate, samples           */
+#define USS_PARAM_PULSES      0x0F  /* trill cycles (2 pulses each)           */
+#define USS_PARAM_DTOF_OFF_PS 0x40  /* zero-flow dTOF offset the library
+                                     * subtracts, ps, +-1000000               */
+
 #define USS_LINK_RESULT_OFF 0x04
 #define USS_LINK_RESULT_LEN 44      /* 0x04..0x2F inclusive, CRC included     */
 #define USS_LINK_REGFILE_SIZE 0x40  /* the RAM-backed register file, 0x00..0x3F.
@@ -270,11 +330,20 @@
                                  * offset is otherwise a compile-time constant
                                  * that a reset restores. Result lands in
                                  * DTOF_PS; persisted to FRAM.               */
+#define USS_CMD_PARAM_SET   0x06    /* apply PARAM_ID/PARAM_VAL; see above     */
+#define USS_CMD_PARAM_GET   0x07    /* read PARAM_ID back into the PRM block   */
 #define USS_CMD_SOFT_RESET  0x0F
 
 /* USS message codes we care about on the master side (from the USS library) */
 #define USS_CODE_OK         122     /* valid measurement                      */
 #define USS_CODE_NO_ECHO    126
+/* Module-generated (not TI): a code-122 capture REJECTED because its abs-ToF
+ * was implausible -- up and down disagree by more than a real dTOF can, or the
+ * mean jumped away from the tracked value (the multitone lock landing one or
+ * two 10.05 us pattern periods off). Treated exactly like any invalid capture:
+ * no flow, counted as skipped in the raw totalizer, and it feeds the re-search.
+ * 0xE0 is taken by the firmware's "rails off" code. */
+#define USS_CODE_TOF_HOP    0xE1
 
 /* Unit conversions (slave side):
  *   flow  : USS VFR float L/min      -> i32 uL/min : (int32_t)(flow * 1e6f)

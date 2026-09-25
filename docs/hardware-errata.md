@@ -30,14 +30,29 @@ under inrush.
 **Action:** keep a charged battery connected while flashing and during first bring-up.
 If you see boot loops or resets only on USB-only power, this is the likely cause.
 
-## 🟠 4. GPS is untested
+## 🔴 4. No GPS: the fitted A7672E-LASE has no GNSS engine
 
-The A7672E-LASE has an internal GNSS engine, but **GPS has not been validated** on
-this board and the **GPS antenna path is unverified**. The `ModemA7672::gps*()`
-methods are deliberately stubs.
+**Tested 2026-09-25** (bench firmware `idf` env `gnsstest`, `src/gnss_bench.c`, active
+ceramic patch antenna with a view of the sky). The module identifies as
+`Model: A7672E-LASE`, `Revision: A011B18A7672M7`. **Every GNSS AT command returns
+`ERROR`**, also after the modem had fully booted (`+CPIN: READY`, `SMS DONE`,
+`PB DONE`): `AT+CGNSSPWR?`, `AT+CGNSSPWR=1`, `AT+CGNSSPORTSWITCH=0,1`,
+`AT+CGNSSTST=1`, `AT+CGPSCOLD`. No `+CGNSSPWR: READY!` in 60 s, no NMEA.
+The firmware has no GNSS command set at all. That matches distributor listings:
+**`-LASE` is the variant without GNSS, `-FASE` has it.** The old note here saying
+"the A7672E-LASE has an internal GNSS engine" was wrong.
 
-**Action:** treat GPS as unproven. Validate the antenna path and AT+CGNSS* flow on
-the bench before relying on location data.
+The GNSS circuit on the board follows SIMCom's non-standalone reference (1V8_GNSS
+from VDD_1V8, GNSS_TXD/RXD via 1 kΩ to UART3, GNSS_PWRCTL via 10 kΩ to MK_IN_3) and
+the active-antenna bias feed (C418 100 pF DC block, L404 ferrite from VDD_AUX, which
+reads `+CVAUXS: 1`, 3000 mV). C413/C414/R412 are the DNP matching footprints. So a
+footprint-compatible **A7672E-FASE** should work as drawn. Two deviations to revisit
+then: D403 (ESD9X3.3ST5G, 15 pF) is far above SIMCom's recommended sub-pF RF ESD
+parts (PESD0402-03, CE0201S05G01R), and L404 is a ferrite bead rather than the
+reference's >56 nH inductor plus series resistor.
+
+**Action:** location needs a module swap to A7672E-FASE (or a separate GNSS
+receiver). The `ModemA7672::gps*()` stubs stay stubs.
 
 ## 🟡 5. Important pads are on the BACK of the board
 

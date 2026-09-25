@@ -123,6 +123,21 @@ bool uss_soft_reset(void);
  * Only valid at genuine zero flow; the module cannot check that. */
 bool uss_zerocal(void);
 
+/* Module parameters over I2C (USS_PARAM_* ids, uss_link.h). Additive to
+ * PROTO 3; a module without it never answers and the call times out after
+ * USS_MEAS_TIMEOUT_MS. Returns true when the module answered: *status is then
+ * USS_PRM_ST_* and *in_effect the value NOW in effect (read back, not echoed),
+ * so a SET is verified by comparing it with what was asked for.
+ *
+ * A SET persists in module FRAM across power cycles until the next flash. */
+bool uss_param_get(uint8_t id, int32_t *in_effect, uint8_t *status);
+bool uss_param_set(uint8_t id, int32_t value, int32_t *in_effect, uint8_t *status);
+
+/* True once any STATUS read this wake showed USS_ST_BOOT, i.e. the module
+ * restarted since the last command -- which also means a reflash, after which
+ * FRAM holds the compiled defaults again. */
+bool uss_saw_boot(void);
+
 #ifdef __cplusplus
 }
 #endif

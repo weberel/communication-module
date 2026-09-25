@@ -5,7 +5,7 @@
  */
 #pragma once
 
-#define FW_VERSION              "idf-0.28"      /* + raw totalizer telemetry (module now PROTO 3) */
+#define FW_VERSION              "idf-0.29"      /* + derived gas/flow telemetry, module preset sync */
 
 /* DEBUG ONLY -- pad the flash log up to this many pending records so a drain
  * can be timed without waiting 12 h for a real backlog. 0 disables.
@@ -111,3 +111,19 @@
 /* Settle after USS_CMD_SOFT_RESET before talking to the slave again. The module
  * re-runs its USS init (crystal settle included) on the way back up. */
 #define USS_SOFT_RESET_SETTLE_MS   1500
+
+/* Gas in the line: selects the derivation constants (gasflow.c) AND the module
+ * settings written after every module boot. GF_GAS_BIOGAS / GF_GAS_AIR are
+ * validated (2026-09-25); GF_GAS_AIR_CO2 / GF_GAS_N2 are estimates.
+ * Compile-time until the board has a downlink to set it remotely. */
+#define USS_GAS_PROFILE         GF_GAS_BIOGAS
+
+/* Derived-window sanity limits (uplink.c).
+ * COVERAGE: S0 integrates dt_ms / (tu*td), so with the window's ToF it says how
+ * much time the module actually integrated. It cannot exceed the wall-clock
+ * window; > this is a torn or corrupted totalizer read (one in 256 passes the
+ * CRC), not a measurement.
+ * Q_MAX: the 75 mm cell is characterised to 14 SL/min; a window mean far above
+ * that is a torn S1, not gas. */
+#define USS_WIN_COV_MAX         1.25
+#define USS_WIN_Q_MAX_LPM       60.0
