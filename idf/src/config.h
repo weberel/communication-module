@@ -5,7 +5,7 @@
  */
 #pragma once
 
-#define FW_VERSION              "idf-0.30"      /* + per-cell profile, ToF gate in preset sync */
+#define FW_VERSION              "idf-0.31"      /* uplink: raw + methane volume only */
 
 /* DEBUG ONLY -- pad the flash log up to this many pending records so a drain
  * can be timed without waiting 12 h for a real backlog. 0 disables.

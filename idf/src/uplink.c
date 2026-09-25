@@ -194,11 +194,17 @@ static bool publish_acked(const char *json)
 
 /* ---- derived ultrasonic values (gasflow.c) ---------------------------------
  *
+ * ONE derived value goes out: the window's METHANE in standard litres, the
+ * number the whole project exists to measure. Everything else the derivation
+ * produces (c, composition, flow, total volume, Re, flags) stays on the board:
+ * the raw keys carry every input, the server recomputes them with its own port
+ * of the same maths, and each extra key was ~1/3 of the record over cellular
+ * for a value nothing on the board uses (reduced 2026-09-25, idf-0.31).
+ *
  * Computed HERE, at upload, from the raw fields already in the record, so the
  * record layout (and REC_MAGIC) stays untouched and a backlog logged before
- * this build still gets derived values. The raw keys keep going out next to
- * these: the server can always recompute with refitted constants, and
- * uss_derive_ver says which constants produced what it received.
+ * this build still gets it. uss_derive_ver says which constants produced it;
+ * after a refit the server recomputes history from the raw keys.
  *
  * WINDOWS come from a record and its PREDECESSOR in the flash ring, read back
  * by seq -- not remembered in RAM, so it survives deep sleep, reboots and
@@ -283,18 +289,15 @@ static int derived_values(const LogRecord *r, char *out, size_t cap)
     gf_sample_t s;
     sample_of(&cfg, r, &s);
 
+    /* Configuration: what the server needs to recompute from the raw keys. */
     int n = snprintf(out, cap,
-        ",\"uss_gas\":\"%s\",\"uss_cell\":%d,\"uss_validated\":%u,\"uss_derive_ver\":%d,"
-        "\"uss_tof_bad\":%u",
-        gf_gas_name(cfg.kind), gf_cell_mm(cfg.cell), cfg.validated ? 1u : 0u,
-        GF_DERIVE_VER, s.tof_bad ? 1u : 0u);
+        ",\"uss_gas\":\"%s\",\"uss_cell\":%d,\"uss_derive_ver\":%d",
+        gf_gas_name(cfg.kind), gf_cell_mm(cfg.cell), GF_DERIVE_VER);
     if (n < 0 || (size_t)n >= cap) return -1;
 
-    if (s.ok)
-        n += snprintf(out + n, cap - n,
-            ",\"uss_c_mps\":%.2f,\"uss_x_a\":%.4f,\"uss_not_gas\":%u",
-            s.c_mps, s.x_a, s.not_gas ? 1u : 0u);
-    if (n < 0 || (size_t)n >= cap) return -1;
+    /* "Methane" only means something under the biogas profile, where the
+     * profile's first component IS CH4. For air/N2 it is not sent at all. */
+    if (cfg.kind != GF_GAS_BIOGAS) return n;
 
     LogRecord prev;
     if (r->seq == 0 || !flashlog_read_seq(r->seq - 1, &prev))
@@ -307,11 +310,12 @@ static int derived_values(const LogRecord *r, char *out, size_t cap)
     if (err)
         return n + snprintf(out + n, cap - n, ",\"uss_win_err\":\"%s\"", err);
 
-    return n + snprintf(out + n, cap - n,
-        ",\"uss_q_std_lpm\":%.3f,\"uss_v_std_l\":%.4f,\"uss_v_a_std_l\":%.4f,"
-        "\"uss_re\":%.0f,\"uss_cut\":%u,\"uss_cov\":%.3f,\"uss_win_s\":%lu",
-        w.q_n_lpm, w.v_n_ul / 1e6, w.v_a_n_ul / 1e6,
-        w.re, w.cut ? 1u : 0u, cov, (unsigned long) dt_s);
+    /* Standard litres CH4 (20 C, 1013.25 mbar) in the window since the
+     * previous record: total volume from the totalizer, taken to standard
+     * conditions with the in-line P and T, times the CH4 fraction from the
+     * speed of sound. 0 below the low-flow cutoff, and 0 when the echo says the
+     * line does not hold biogas at all. */
+    return n + snprintf(out + n, cap - n, ",\"uss_v_ch4_std_l\":%.4f", w.v_a_n_ul / 1e6);
 }
 
 /* ---- ThingsBoard JSON, same schema the dashboards already use ---- */
