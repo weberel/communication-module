@@ -194,17 +194,17 @@ static bool publish_acked(const char *json)
 
 /* ---- derived ultrasonic values (gasflow.c) ---------------------------------
  *
- * ONE derived value goes out: the window's METHANE in standard litres, the
- * number the whole project exists to measure. Everything else the derivation
- * produces (c, composition, flow, total volume, Re, flags) stays on the board:
- * the raw keys carry every input, the server recomputes them with its own port
- * of the same maths, and each extra key was ~1/3 of the record over cellular
- * for a value nothing on the board uses (reduced 2026-09-25, idf-0.31).
+ * The server does not compute (agreed 2026-09-25), so the board sends the
+ * derived set it plots: per sample c, CH4 fraction and the 0/1 flags; per
+ * window the gas and METHANE volumes at standard conditions, mean flow, Re,
+ * cutoff, coverage and length. The raw keys still carry every input, so a
+ * refit can recompute history later; uss_derive_ver names the constants.
+ * (idf-0.31 had cut this to methane only; the server asked for the rest back
+ * in 0.32/0.33.)
  *
  * Computed HERE, at upload, from the raw fields already in the record, so the
  * record layout (and REC_MAGIC) stays untouched and a backlog logged before
- * this build still gets it. uss_derive_ver says which constants produced it;
- * after a refit the server recomputes history from the raw keys.
+ * this build still gets it.
  *
  * WINDOWS come from a record and its PREDECESSOR in the flash ring, read back
  * by seq -- not remembered in RAM, so it survives deep sleep, reboots and
@@ -313,8 +313,9 @@ static int derived_values(const LogRecord *r, char *out, size_t cap)
     if (s.ok || s.tof_bad)
         n += snprintf(out + n, cap - n, ",\"uss_tof_bad\":%u", s.tof_bad ? 1u : 0u);
     if (s.ok && n > 0 && (size_t)n < cap)
-        n += snprintf(out + n, cap - n, ",\"uss_x_a\":%.4f,\"uss_not_gas\":%u",
-                      s.x_a, s.not_gas ? 1u : 0u);
+        n += snprintf(out + n, cap - n,
+                      ",\"uss_c_mps\":%.2f,\"uss_x_a\":%.4f,\"uss_not_gas\":%u",
+                      s.c_mps, s.x_a, s.not_gas ? 1u : 0u);
     if (n < 0 || (size_t)n >= cap) return -1;
 
     LogRecord prev;
@@ -335,7 +336,10 @@ static int derived_values(const LogRecord *r, char *out, size_t cap)
      * and 0 when the echo says the line does not hold biogas at all. "Methane"
      * only means something under the biogas profile, where the profile's first
      * component IS CH4, so for air/N2 only the total goes out. */
-    n += snprintf(out + n, cap - n, ",\"uss_v_std_l\":%.4f", w.v_n_ul / 1e6);
+    n += snprintf(out + n, cap - n,
+        ",\"uss_v_std_l\":%.4f,\"uss_q_std_lpm\":%.3f,\"uss_re\":%.0f,\"uss_cut\":%u,"
+        "\"uss_cov\":%.3f,\"uss_win_s\":%lu",
+        w.v_n_ul / 1e6, w.q_n_lpm, w.re, w.cut ? 1u : 0u, cov, (unsigned long) dt_s);
     if (cfg.kind == GF_GAS_BIOGAS && n > 0 && (size_t)n < cap)
         n += snprintf(out + n, cap - n, ",\"uss_v_ch4_std_l\":%.4f", w.v_a_n_ul / 1e6);
     return n;

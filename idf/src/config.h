@@ -5,7 +5,7 @@
  */
 #pragma once
 
-#define FW_VERSION              "idf-0.32"      /* uplink: raw + gas/CH4 volume, x_a, flags */
+#define FW_VERSION              "idf-0.33"      /* uplink: raw + full derived set (server-agreed) */
 
 /* DEBUG ONLY -- pad the flash log up to this many pending records so a drain
  * can be timed without waiting 12 h for a real backlog. 0 disables.
