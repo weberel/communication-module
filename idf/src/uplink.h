@@ -71,6 +71,8 @@ typedef struct {
 typedef struct {
     uint8_t  boot_id;
     uint8_t  reset_reason;
+    const char *wake_reason;   /* "timer" | "button" | "cold" | "crash": why this
+                                * wake happened, from main.c's classification */
     uint16_t boot_count;
     uint16_t wake_count;
     uint16_t crash_count;

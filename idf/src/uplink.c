@@ -32,6 +32,7 @@
 #include "secrets.h"
 #include "gasflow.h"
 #include "uss_link.h"
+#include "devcfg.h"
 
 #include <math.h>
 
@@ -115,9 +116,21 @@ static EventGroupHandle_t s_ev;
 #define EV_MQTT_FAIL BIT1
 #define EV_PUBACK    BIT2
 #define EV_IP_UP     BIT3
+#define EV_CFG_DONE  BIT4   /* config topic answered: payload, or the subscribe was refused */
 
 static esp_mqtt_client_handle_t s_mqtt;
 static volatile int s_pending_msg_id = -1;
+
+/* ---- downlink: retained config (com-0.35, DOWNLINK.md) ----------------------
+ * The device may only READ ecotrace/<user>/config; the ACL refuses everything
+ * else, and until the ACL is deployed the SUBSCRIBE itself is refused. Both
+ * are "no config", not errors. */
+#define MQTT_CFG_TOPIC   "ecotrace/" MQTT_USERNAME "/config"
+#define CFG_WAIT_MS      2000      /* retained delivery follows SUBACK at once;
+                                    * the wait only runs out when nothing is retained */
+static volatile int s_cfg_sub_id = -1;
+static volatile devcfg_rc_t s_cfg_rc;
+static volatile bool s_cfg_seen;    /* a payload arrived this session */
 
 static void mqtt_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -128,6 +141,28 @@ static void mqtt_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     case MQTT_EVENT_DISCONNECTED: xEventGroupSetBits(s_ev, EV_MQTT_FAIL); break;
     case MQTT_EVENT_PUBLISHED:
         if (e->msg_id == s_pending_msg_id) xEventGroupSetBits(s_ev, EV_PUBACK);
+        break;
+    case MQTT_EVENT_SUBSCRIBED:
+        if (e->msg_id == s_cfg_sub_id && e->error_handle &&
+            e->error_handle->error_type == MQTT_ERROR_TYPE_SUBSCRIBE_FAILED) {
+            /* MQTT 5 reason code >= 0x80: not authorised (ACL not deployed
+             * yet). Same as an empty topic. */
+            ESP_LOGW(TAG, "config subscribe refused -- no config");
+            xEventGroupSetBits(s_ev, EV_CFG_DONE);
+        }
+        break;
+    case MQTT_EVENT_DATA:
+        if (e->topic_len == (int)strlen(MQTT_CFG_TOPIC) &&
+            memcmp(e->topic, MQTT_CFG_TOPIC, e->topic_len) == 0) {
+            /* Payloads are a few hundred bytes, far below the client's
+             * buffer, so one event carries the whole message; anything that
+             * arrives fragmented is not a config we know and is dropped. */
+            if (e->current_data_offset == 0 && e->total_data_len == e->data_len) {
+                s_cfg_rc   = devcfg_apply(e->data, (size_t)e->data_len);
+                s_cfg_seen = true;
+                xEventGroupSetBits(s_ev, EV_CFG_DONE);
+            }
+        }
         break;
     default: break;
     }
@@ -173,6 +208,30 @@ static void mqtt_down(void)
     esp_mqtt_client_stop(s_mqtt);
     esp_mqtt_client_destroy(s_mqtt);
     s_mqtt = NULL;
+}
+
+/* Subscribe to the retained config and wait for it, at most CFG_WAIT_MS.
+ * Runs BEFORE the drain so the sleep length and upload countdown computed
+ * after the session already use the new values (the ack in the status
+ * message is then what will actually happen). Nothing here can fail the
+ * session: no payload, a refused subscribe or a rejected payload all leave
+ * the NVS values in force. */
+static void config_fetch(void)
+{
+    if (!s_mqtt) return;
+    s_cfg_seen = false;
+    xEventGroupClearBits(s_ev, EV_CFG_DONE);
+    s_cfg_sub_id = esp_mqtt_client_subscribe(s_mqtt, MQTT_CFG_TOPIC, 1);
+    if (s_cfg_sub_id < 0) { ESP_LOGW(TAG, "config subscribe not sent"); return; }
+    EventBits_t b = xEventGroupWaitBits(s_ev, EV_CFG_DONE, pdTRUE, pdFALSE,
+                                        pdMS_TO_TICKS(CFG_WAIT_MS));
+    if (!(b & EV_CFG_DONE))
+        ESP_LOGI(TAG, "no retained config within %d ms", CFG_WAIT_MS);
+    else if (s_cfg_seen)
+        ESP_LOGI(TAG, "config: %s (ver %lu, sample %lu s, upload %lu s)",
+                 devcfg_rc_name(s_cfg_rc), (unsigned long)devcfg_ver(),
+                 (unsigned long)devcfg_sample_s(), (unsigned long)devcfg_upload_s());
+    esp_mqtt_client_unsubscribe(s_mqtt, MQTT_CFG_TOPIC);
 }
 
 /* QoS 1 publish, blocking until PUBACK -- the ring cursor only advances on ack. */
@@ -383,13 +442,22 @@ static int record_values(const LogRecord *r, char *out, size_t cap)
      * and the difference is the flow signal, which uss_dtof_us already carries
      * at far better resolution. Publishing both directions separately sent the
      * same information twice. */
+    /* Provenance first (com-0.34, server request 2026-09-30): seq is the flash
+     * ring cursor the record was written at -- recovered from the journal and
+     * a forward scan on every cold boot, so it never restarts at zero and is
+     * contiguous within a boot_id. A hole in seq is a record that was lost or
+     * overwritten by the ring, never a numbering artefact. boot_id is the
+     * 8-bit random stamp of the cold boot that wrote it, the same value the
+     * status message carries. */
     int n = snprintf(out, cap,
+        "\"seq\":%lu,\"boot_id\":%u,"
         "\"vbat_mv\":%u,\"ibat_ma\":%d,\"soc_pct\":%u,"
         "\"vbus_mv\":%u,\"ibus_ma\":%d,\"chg_stat\":%u,"
         "\"harvest_mah\":%u,\"solar\":%u,\"usb\":%u,"
         "\"light_ch0\":%u,"
         "\"acc_x_mg\":%d,\"acc_y_mg\":%d,\"acc_z_mg\":%d,"
         "\"temp_c\":%.2f,\"sensor_ok\":%u",
+        (unsigned long)r->seq, r->boot_id,
         r->vbat_mv, r->ibat_ma, r->soc_pct,
         r->vbus_mv, r->ibus_ma, r->chg_stat,
         r->harvest_mah,
@@ -499,7 +567,7 @@ static int64_t record_ts_ms(const LogRecord *r, int64_t now_ms, uint32_t head)
     if (r->ts_s) return (int64_t)r->ts_s * 1000;
     if (r->boot_id == s_ref_boot_id && r->uptime_s <= s_ref_uptime_s)
         return now_ms - (int64_t)(s_ref_uptime_s - r->uptime_s) * 1000;
-    return now_ms - (int64_t)(head - 1 - r->seq) * SAMPLE_INTERVAL_S * 1000;
+    return now_ms - (int64_t)(head - 1 - r->seq) * devcfg_sample_s() * 1000;
 }
 
 static uint32_t drain(uplink_result_t *res)
@@ -619,11 +687,14 @@ static void send_status(const uplink_ctx_t *ctx, const uplink_result_t *res)
     const char *transport = (res->sent && res->used_wifi) ? "wifi" :
                             res->sent ? "cell" : "none";
     int64_t now_ms = clock_valid() ? (int64_t)time(NULL) * 1000 : 0;
-    static char vals[800];          /* keep it off the 4 KB main stack too */
+    static char vals[1024];         /* keep it off the 4 KB main stack too */
     snprintf(vals, sizeof(vals),
              "\"rssi_dbm\":%d,\"wifi_rssi_dbm\":%d,\"transport\":\"%s\","
              "\"cereg_stat\":%u,\"backlog\":%lu,\"boot_id\":%u,"
-             "\"reset_reason\":%u,\"boot_count\":%u,\"wake_count\":%u,"
+             /* Why this session ran (com-0.34): reset_reason cannot tell a
+              * button press from a timer wake, and crash_count only counts. */
+             "\"reset_reason\":%u,\"wake_reason\":\"%s\","
+             "\"boot_count\":%u,\"wake_count\":%u,"
              "\"crash_count\":%u,\"vbat_mv\":%u,"
              "\"sun_h\":%u,\"voc_max_mv\":%u,\"fw\":\"" FW_VERSION "\","
              "\"uss_rst_cause\":%d,\"uss_lh_starts\":%d,\"uss_lh_uptime\":%d,"
@@ -636,10 +707,14 @@ static void send_status(const uplink_ctx_t *ctx, const uplink_result_t *res)
              /* Supply under load -- see power doc B2. vbat_pre is with the
               * modem off; the difference is the sag that sets battery sizing. */
              "\"vbat_pre\":%u,\"vbat_load\":%u,\"vsys_load\":%u,"
-             "\"bq_fault0\":%u,\"bq_fault1\":%u",
+             "\"bq_fault0\":%u,\"bq_fault1\":%u,"
+             /* Remote config in effect (com-0.35, DOWNLINK.md). These are the
+              * values the sleep after this session will use: the ack. */
+             "\"cfg_ver\":%lu,\"sample_s\":%lu,\"upload_s\":%lu",
              res->cell_rssi_dbm, res->wifi_rssi_dbm, transport,
              res->cell_reg_stat, (unsigned long)flashlog_pending(), ctx->boot_id,
-             ctx->reset_reason, ctx->boot_count, ctx->wake_count,
+             ctx->reset_reason, ctx->wake_reason ? ctx->wake_reason : "unknown",
+             ctx->boot_count, ctx->wake_count,
              ctx->crash_count, ctx->vbat_mv,
              ctx->sun_hours, ctx->voc_max_mv,
              /* -1 when the health read itself failed, which is itself the
@@ -655,7 +730,14 @@ static void send_status(const uplink_ctx_t *ctx, const uplink_result_t *res)
              (unsigned long)res->t_pub_max_ms, res->n_batches,
              (unsigned long)res->sent, res->drain_broke ? 1u : 0u,
              res->vbat_pre_mv, res->vbat_load_mv, res->vsys_load_mv,
-             res->fault0, res->fault1);
+             res->fault0, res->fault1,
+             (unsigned long)devcfg_ver(), (unsigned long)devcfg_sample_s(),
+             (unsigned long)devcfg_upload_s());
+    /* Only while the last received payload was rejected; absent otherwise. */
+    if (devcfg_err()) {
+        size_t l = strlen(vals);
+        snprintf(vals + l, sizeof(vals) - l, ",\"cfg_err\":\"%s\"", devcfg_err());
+    }
     if (now_ms > 0)
         snprintf(s_json, sizeof(s_json), "{\"ts\":%lld,\"values\":{%s}}",
                  (long long)now_ms, vals);
@@ -934,6 +1016,7 @@ static bool cell_session(const uplink_ctx_t *ctx, uplink_result_t *res)
 
     if (mqtt_up()) {
         res->t_mqtt_ms = sess_ms();
+        config_fetch();
         uint32_t sent = drain(res);
         res->t_drain_ms = sess_ms();
         res->sent += sent;
@@ -1015,6 +1098,7 @@ static bool wifi_session(const uplink_ctx_t *ctx, uplink_result_t *res)
 
     if (mqtt_up()) {
         res->used_wifi = true;
+        config_fetch();
         uint32_t sent = drain(res);
         res->sent += sent;
         if (sent) res->any_success = true;
@@ -1062,7 +1146,6 @@ uplink_result_t uplink_upload_all(const uplink_ctx_t *ctx)
 
     if (!s_ev) {
         s_ev = xEventGroupCreate();
-        nvs_flash_init();   /* esp_wifi requires NVS */
         esp_netif_init();
         esp_event_loop_create_default();
         esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, on_ip_event, NULL);

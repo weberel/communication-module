@@ -5,7 +5,8 @@
  */
 #pragma once
 
-#define FW_VERSION              "idf-0.33"      /* uplink: raw + full derived set (server-agreed) */
+#define FW_VERSION              "com-0.35"      /* downlink stage 1: retained config (intervals) over MQTT.
+                                                 * Scheme renamed idf-x.y -> com-x.y at 0.34; numbering continues. */
 
 /* DEBUG ONLY -- pad the flash log up to this many pending records so a drain
  * can be timed without waiting 12 h for a real backlog. 0 disables.
@@ -18,8 +19,12 @@
  * up to the target and uploads duplicate rows. */
 #define ECO_FAKE_BACKLOG        0
 
-/* ---- Duty cycle ---- */
+/* ---- Duty cycle ----
+ * COMPILED DEFAULTS. Since com-0.35 both are remotely configurable (devcfg.c,
+ * retained MQTT config): code must read devcfg_sample_s() / devcfg_upload_s(),
+ * not these. They apply until the first config payload arrives. */
 #define SAMPLE_INTERVAL_S       300     /* 5 min */
+#define UPLOAD_PERIOD_S         (12 * 3600)
 #define CRITICAL_VBAT_MV        3350
 #define CRITICAL_INTERVAL_MULT  6       /* -> 30 min when critical */
 

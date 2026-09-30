@@ -38,6 +38,7 @@
 #include "uss_link.h"
 #include "gasflow.h"
 #include "i2c_bus.h"
+#include "devcfg.h"
 #include "esp_timer.h"
 #include "wf280a.h"
 #include "uplink.h"
@@ -107,7 +108,6 @@ static RTC_DATA_ATTR uint32_t s_last_deep_uptime;   /* deep search once/day */
 static RTC_DATA_ATTR uint8_t  s_upload_inflight;
 static RTC_DATA_ATTR uint8_t  s_upload_crashed;
 
-#define UPLOAD_PERIOD_S (12 * 3600)
 #define UPLOAD_RETRY_S  (30 * 60)
 #define UPLOAD_RETRIES  2
 
@@ -454,6 +454,9 @@ void app_main(void)
     bool button_wake = board_woke_from_button();
     bool cold        = (s_rtc_magic != RTC_STATE_MAGIC);
     bool crashed     = !cold && !timer_wake && !button_wake;
+    /* The same four-way split, as the word the status message reports. */
+    const char *wake_reason = cold ? "cold" : crashed ? "crash" :
+                              button_wake ? "button" : "timer";
 
     /* Runtime-enforce the long WDT: sdkconfig regeneration silently reverted
      * TIMEOUT_S to 5 s once (idf-0.5/0.6 boot-looped on the modem's 8 s settle).
@@ -482,6 +485,10 @@ void app_main(void)
      * hangs before this point still gets rolled back, which is the behaviour
      * rollback exists for. */
     esp_ota_mark_app_valid_cancel_rollback();
+
+    /* NVS up and the remote config (intervals) loaded before anything
+     * schedules with them. Cheap on a warm wake: the values sit in RTC RAM. */
+    devcfg_init();
 
     board_init();
 
@@ -643,7 +650,7 @@ void app_main(void)
         time_t now = time(NULL);
         int32_t day_num = (now >= 1767225600 && now < 2082758400)
                         ? (int32_t)((now + TZ_OFFSET_MIN * 60) / 86400) : -1;
-        sol = solar_on_wake(SAMPLE_INTERVAL_S, day_num);
+        sol = solar_on_wake(devcfg_sample_s(), day_num);
     } else {
         ESP_LOGE(TAG, "BQ25792 not found -- battery data will be zero");
     }
@@ -666,7 +673,7 @@ void app_main(void)
         uint32_t want = ECO_FAKE_BACKLOG;
         for (uint32_t i = 1; i <= want && flashlog_pending() < want; i++) {
             LogRecord f = r;
-            if (r.ts_s) f.ts_s = r.ts_s - i * SAMPLE_INTERVAL_S;
+            if (r.ts_s) f.ts_s = r.ts_s - i * devcfg_sample_s();
             if (!flashlog_append(&f)) break;
         }
         ESP_LOGW(TAG, "DEBUG fake backlog: %lu pending",
@@ -702,6 +709,7 @@ void app_main(void)
         uplink_ctx_t ctx = {
             .boot_id      = s_boot_id,
             .reset_reason = (uint8_t)why,
+            .wake_reason  = wake_reason,
             .boot_count   = s_boot_count,
             .wake_count   = s_wake_count,
             .crash_count  = s_crash_count,
@@ -724,14 +732,17 @@ void app_main(void)
         s_upload_inflight = 0;
         s_upload_crashed  = 0;   /* one-shot: cellular is primary again */
 
+        /* devcfg_upload_s() here, after the session: a period that arrived
+         * in THIS session's config payload sets the next countdown, which is
+         * what makes the status message's upload_s truthful. */
         if (u.all_sent) {
-            s_next_upload_in_s = UPLOAD_PERIOD_S;
+            s_next_upload_in_s = devcfg_upload_s();
             s_retries_left     = UPLOAD_RETRIES;
         } else if (s_retries_left > 0) {
             s_retries_left--;
             s_next_upload_in_s = UPLOAD_RETRY_S;
         } else {
-            s_next_upload_in_s = UPLOAD_PERIOD_S;
+            s_next_upload_in_s = devcfg_upload_s();
             s_retries_left     = UPLOAD_RETRIES;
         }
     }
@@ -742,10 +753,10 @@ void app_main(void)
     }
     flashlog_sleep();
 
-    uint32_t sleep_s = SAMPLE_INTERVAL_S;
+    uint32_t sleep_s = devcfg_sample_s();
     if (r.vbat_mv && r.vbat_mv < CRITICAL_VBAT_MV &&
         !sol.usb_present && !sol.solar_present)
-        sleep_s = SAMPLE_INTERVAL_S * CRITICAL_INTERVAL_MULT;
+        sleep_s = devcfg_sample_s() * CRITICAL_INTERVAL_MULT;
 
     s_crash_count  = 0;   /* wake completed cleanly */
     s_last_sleep_s = sleep_s;
