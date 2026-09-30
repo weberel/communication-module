@@ -5,8 +5,17 @@
  */
 #pragma once
 
-#define FW_VERSION              "com-0.35"      /* downlink stage 1: retained config (intervals) over MQTT.
-                                                 * Scheme renamed idf-x.y -> com-x.y at 0.34; numbering continues. */
+/* FW_VERSION is NOT defined here since com-0.36. It comes from idf/version.txt:
+ * ESP-IDF reads that file into PROJECT_VER, which lands in the image's app
+ * descriptor, and src/CMakeLists.txt passes the same string in as FW_VERSION.
+ * One source, so the version the server reads out of an uploaded image and the
+ * one the board reports in "fw" can never disagree. Bump version.txt and
+ * TOUCH idf/CMakeLists.txt: PlatformIO re-runs CMake (where version.txt is
+ * read) only when a CMakeLists changes, so a bump alone rebuilds the old
+ * version. Check the descriptor of the .bin (offset 0x30) when in doubt. (Scheme renamed idf-x.y -> com-x.y at 0.34; numbering continues.) */
+#ifndef FW_VERSION
+#error "FW_VERSION comes from idf/version.txt via src/CMakeLists.txt -- build from idf/"
+#endif
 
 /* DEBUG ONLY -- pad the flash log up to this many pending records so a drain
  * can be timed without waiting 12 h for a real backlog. 0 disables.

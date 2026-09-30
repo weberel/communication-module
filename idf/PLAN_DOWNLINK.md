@@ -39,7 +39,7 @@ The ack is truthful within one session: the payload arrives at subscribe time, b
 drain; the sleep length and the upload countdown are computed after the drain, so the status
 message of the same session reports what will actually happen next.
 
-## Stage 1: config (one build, com-0.35) -- CODED 2026-09-30, not yet run on hardware
+## Stage 1: config (one build, com-0.35) -- DONE, verified on unit A (dev-4) 2026-09-30
 
 Files: `main.c`, `uplink.c`, new `devcfg.c/h`, `config.h`, `CMakeLists.txt` (adds `json`).
 
@@ -62,39 +62,60 @@ Files: `main.c`, `uplink.c`, new `devcfg.c/h`, `config.h`, `CMakeLists.txt` (add
 - [x] No countdown clamp needed: the countdown is (re)armed from `devcfg_upload_s()` after
       the session, so a new period is in force from the same session.
 
-Done when (hardware, still open): a config published from the server shows up in the next
+Verified 2026-09-30 from the server UI, board untouched: a config published from the server shows up in the next
 status message with the same `cfg_ver`; the following wakes are spaced by the new interval
 (USB console timestamps); a rejected payload shows `cfg_err` and unchanged intervals; a board
 that never received a config reports `cfg_ver` 0 and the compiled 300 / 43200; a session
 before the ACL is deployed logs "config subscribe refused" and drains normally.
 
-## Stage 2: OTA (com-0.36)
+## Stage 2: OTA (com-0.36) -- DONE: forward and reverse OTA proven on dev-4 2026-09-30; rollback with a broken build still open
 
-Files: `uplink.c`, `devcfg.c`, `main.c`; `esp_https_ota` added to `PRIV_REQUIRES`.
+Files: `ota.c/h` (new), `devcfg.c/h`, `uplink.c/h`, `main.c`, `config.h`, `src/CMakeLists.txt`,
+`version.txt` (new).
 
-1. After the drain (data first), if `fw_ver` is present, differs from `FW_VERSION`, and is not
-   the version recorded in NVS as `fw_failed` with 2 attempts: download with `esp_https_ota`
-   over the link already up (PPP or WiFi), same pinned ISRG root as MQTT. Check the SHA-256 of
-   the written image against `fw_sha256` before `esp_ota_set_boot_partition`. 1.3 MB at
-   230400 baud is about a minute of modem time, once.
-2. Before `esp_restart()`: clear the RTC magic. The new image has a different `RTC_DATA_ATTR`
-   layout and must come up as a cold boot, which also makes it phone home immediately.
-   Without this the first wake counts as a crash and skips cellular.
-3. Rollback. `esp_ota_mark_app_valid_cancel_rollback()` moves from the top of `app_main` to
-   the end of the first upload session, called only if that session published. Deep-sleep wake
-   goes through the bootloader, so an image that reaches deep sleep unmarked is rolled back by
-   the bootloader on the next wake: a build whose uplink is broken reverts itself within one
-   sample interval and the server sees the old `fw` again. An image that panics before that
-   point is rolled back as today. Rule from the 2026-09-11 incident stays: never flash over USB
-   into a slot without checking which one boots.
-4. The rolled-back image finds the same retained config, so it records `fw_ver` in NVS with an
-   attempt counter and stops after 2, reporting `fw_err: rolled_back`. The server clears it by
-   publishing a new `fw_ver`.
-5. The USB and WiFi-button OTA paths stay as they are.
+- [x] **One version source.** `idf/version.txt` holds `com-0.36`; ESP-IDF puts it in the image's
+      app descriptor (the server reads it there at release upload) and `src/CMakeLists.txt`
+      passes the same string as `FW_VERSION`. `config.h` errors if it is missing. Bump
+      `version.txt` **and touch `idf/CMakeLists.txt`** (PlatformIO re-runs CMake only when a
+      CMakeLists changes; a bump alone rebuilt com-0.36 on 2026-09-30). Checked on the built
+      image: descriptor and status string agree. Release copies go to `.pio/build/release/`.
+- [x] `devcfg.c` takes `fw_ver` / `fw_url` / `fw_sha256` from every accepted payload (also on
+      `same`), all three or none; keeps them for the session. Attempt counter per version and
+      the last error (`fw_err`, `fw_err_ver`) in NVS, so they outlive a rollback.
+- [x] `ota.c`: `esp_https_ota` begin/perform/finish over the link already up, pinned ISRG root,
+      into `esp_ota_get_next_update_partition()`. SHA-256 of the written bytes (mbedtls, 4 KB
+      static buffer, WDT reset per chunk) against `fw_sha256` BEFORE `esp_https_ota_finish()`
+      switches the boot partition. Errors map to the contract: `download`, `sha256`, `write`.
+- [x] `uplink.c` `ota_attempt()`: after the drain, before the status message, in both the
+      cellular and the WiFi session. Skipped when the target equals the running version, when
+      VBAT < modem floor + 100 mV, or after 3 attempts for that version. The attempt is counted
+      before the download starts, so a crash mid-download counts.
+- [x] `main.c`: the mark-valid call moved from the top of `app_main` to after the upload
+      session, only when it published. `ota_boot_check()` after the boot classification: an
+      ABORTED other slot records `fw_err: rollback` with that slot's descriptor version and
+      forces an upload now. On `ota_ready`: RTC magic cleared, devcfg cache dropped, restart.
+- [x] Status keys `fw_err`, `fw_err_ver` when set; `fw` unchanged (it is the ack).
+- [x] Builds clean: RAM 19.5 %, flash 64.8 %.
+- [x] **Found on the first attempt, fixed the same day:** the download wedged after
+      `uart_terminal: HW FIFO Overflow`. The UART ISR was in flash, so it is masked during every
+      OTA flash write and modem bytes are lost, which killed the PPP stream; and
+      `esp_https_ota_perform()` returns IN_PROGRESS on a read timeout, so the loop spun for 10+
+      minutes feeding the watchdog with the modem on. Fixes: `CONFIG_UART_ISR_IN_IRAM=y`
+      (sdkconfig.defaults and the generated sdkconfig), a 60 s no-progress stall and a 9 min
+      deadline in `ota_run()` (`fw_err: download`), and the attempt counter restarts when the
+      running version changes (a serial reflash gets fresh tries).
+- [x] Forward OTA verified 2026-09-30 17:06: dev-4 on the fixed com-0.36 downloaded com-0.37
+      over cellular, restarted, reported `fw: com-0.37`, cfg_ver 4 applied, server "up to date".
+      (That com-0.37 was the build WITHOUT the UART fix; it must not be asked to OTA again.)
 
-Done when: a version published from the server installs over cellular, the next status message
-shows the new `fw` and the old `cfg_ver`; a deliberately broken image (uplink disabled) reverts
-within two wakes and reports `fw_err`; a wrong SHA-256 is refused before the slot is switched.
+- [x] With the fixed code on both ends, 2026-09-30 17:19 and 17:26: com-0.36 -> com-0.37 -> com-0.36
+      over cellular, each under 4 min from button press to "up to date" on the server. The status
+      message of the downloading session goes out with the old `fw` and no `fw_err`, then the
+      new image's cold-boot session acknowledges.
+
+Still open on hardware: an image built with the uplink disabled reverts within two
+wakes and the old image reports `fw_err: rollback` with `fw_err_ver`; a wrong SHA-256 is
+refused with `fw_err: sha256` and the running image is untouched.
 
 ## Server side: three corrections to the 2026-09-30 plan (all taken into DOWNLINK.md)
 

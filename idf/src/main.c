@@ -39,6 +39,7 @@
 #include "gasflow.h"
 #include "i2c_bus.h"
 #include "devcfg.h"
+#include "ota.h"
 #include "esp_timer.h"
 #include "wf280a.h"
 #include "uplink.h"
@@ -470,21 +471,22 @@ void app_main(void)
         esp_task_wdt_init(&wdt_cfg);
     esp_task_wdt_add(NULL);
 
-    /* Tell the bootloader this image works, so it stops being a rollback
-     * candidate.
+    /* ROLLBACK, since com-0.36: this image is NOT marked valid here any more.
      *
      * partitions.csv has ota_0 and ota_1 and NO factory slot, and
-     * sdkconfig.defaults sets CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y. Without
-     * this call an image that panics before marking itself valid is ROLLED BACK
-     * to the other slot -- and on 2026-09-11 that slot still held a February
-     * 2025 Arduino build, which the board then ran for hours while every
-     * `esptool write_flash 0x10000` reported "Hash of data verified". The write
-     * was fine; it just went to a slot the bootloader had stopped booting.
+     * sdkconfig.defaults sets CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y. An image
+     * installed over the air boots as PENDING_VERIFY, and the bootloader
+     * boots the OTHER slot on the next reset unless the app has called
+     * esp_ota_mark_app_valid_cancel_rollback() by then. Deep-sleep wake goes
+     * through the bootloader, so "the next reset" is the next wake.
      *
-     * Placed AFTER the task WDT is armed on purpose: a genuine boot loop that
-     * hangs before this point still gets rolled back, which is the behaviour
-     * rollback exists for. */
-    esp_ota_mark_app_valid_cancel_rollback();
+     * The mark now sits after the upload session below, and only when that
+     * session published: an image that boots but cannot reach the server
+     * reverts itself within one sample interval, which is the property OTA
+     * without a person at the board needs. A serial flash is unaffected (no
+     * PENDING state), and the 2026-09-11 trap (a stale slot that silently
+     * kept booting) is still guarded: check which slot runs when a symptom
+     * contradicts the code. */
 
     /* NVS up and the remote config (intervals) loaded before anything
      * schedules with them. Cheap on a warm wake: the values sit in RTC RAM. */
@@ -587,6 +589,11 @@ void app_main(void)
         if (button_wake) ESP_LOGI(TAG, "button wake -- sample + upload now");
     }
     s_boot_count++;
+
+    /* The other slot holds an image the bootloader gave up on: we ARE the
+     * rollback. Report it now, not at the next scheduled session, which the
+     * failed image may have pushed 12 h out. */
+    if (ota_boot_check()) s_next_upload_in_s = 0;
 
     /* Charger first: park-mode decision needs VBAT before we touch anything. */
     bool bq_ok = bq_begin();
@@ -731,6 +738,22 @@ void app_main(void)
         uplink_result_t u = uplink_upload_all(&ctx);
         s_upload_inflight = 0;
         s_upload_crashed  = 0;   /* one-shot: cellular is primary again */
+
+        /* The session published, so this image demonstrably works: keep it.
+         * A no-op unless the slot is PENDING_VERIFY (first boot after OTA). */
+        if (u.any_success) esp_ota_mark_app_valid_cancel_rollback();
+
+        if (u.ota_ready) {
+            /* The new image comes up as a COLD boot: its RTC layout may differ
+             * from ours, and a cold boot phones home at once, which is the
+             * upload session it needs to mark itself valid. seq continues from
+             * the flash cursor; boot_id rolls. */
+            ESP_LOGW(TAG, "restarting into the new image");
+            s_rtc_magic = 0;
+            devcfg_drop_cache();
+            vTaskDelay(pdMS_TO_TICKS(300));   /* let the console flush */
+            esp_restart();
+        }
 
         /* devcfg_upload_s() here, after the session: a period that arrived
          * in THIS session's config payload sets the next countdown, which is

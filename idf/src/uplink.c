@@ -33,6 +33,7 @@
 #include "gasflow.h"
 #include "uss_link.h"
 #include "devcfg.h"
+#include "ota.h"
 
 #include <math.h>
 
@@ -232,6 +233,43 @@ static void config_fetch(void)
                  devcfg_rc_name(s_cfg_rc), (unsigned long)devcfg_ver(),
                  (unsigned long)devcfg_sample_s(), (unsigned long)devcfg_upload_s());
     esp_mqtt_client_unsubscribe(s_mqtt, MQTT_CFG_TOPIC);
+}
+
+/* ---- OTA (com-0.36, DOWNLINK.md "OTA semantics") --------------------------
+ * After the drain, so the data always goes first, and before the status
+ * message, so a failure is reported in the same session. On success the
+ * status still carries the OLD version (the new image's first session is the
+ * acknowledgement) and main.c restarts once the session is torn down.
+ *
+ * Only tried with a comfortable battery: the new image must complete one
+ * upload session before its first deep sleep or the bootloader rolls it back,
+ * and a session that is skipped for a low pack would waste the whole attempt. */
+#define OTA_MIN_VBAT_MV   (MODEM_MIN_VBAT_MV + 100)
+#define OTA_MAX_TRIES     3
+
+static void ota_attempt(const uplink_ctx_t *ctx, uplink_result_t *res)
+{
+    const devcfg_fw_t *t = devcfg_fw_target();
+    if (!t || res->ota_ready) return;
+    if (strcmp(t->ver, FW_VERSION) == 0) return;          /* already running it */
+    if (ctx->vbat_mv && ctx->vbat_mv < OTA_MIN_VBAT_MV) {
+        ESP_LOGW(TAG, "OTA %s deferred: VBAT %u mV < %d", t->ver, ctx->vbat_mv, OTA_MIN_VBAT_MV);
+        return;
+    }
+    uint8_t n = devcfg_fw_tries(t->ver);
+    if (n >= OTA_MAX_TRIES) {
+        ESP_LOGW(TAG, "OTA %s not retried (%u attempts)", t->ver, n);
+        return;
+    }
+    devcfg_fw_note_try(t->ver);                            /* counted before, so a crash counts */
+    esp_task_wdt_reset();
+    ota_rc_t rc = ota_run(t->ver, t->url, t->sha256);
+    if (rc == OTA_OK) {
+        devcfg_fw_clear_err();
+        res->ota_ready = true;
+    } else {
+        devcfg_fw_set_err(ota_rc_name(rc), t->ver);
+    }
 }
 
 /* QoS 1 publish, blocking until PUBACK -- the ring cursor only advances on ack. */
@@ -738,6 +776,13 @@ static void send_status(const uplink_ctx_t *ctx, const uplink_result_t *res)
         size_t l = strlen(vals);
         snprintf(vals + l, sizeof(vals) - l, ",\"cfg_err\":\"%s\"", devcfg_err());
     }
+    /* Only after a failed OTA attempt (this session, or a rollback found at
+     * boot); "fw" above is the acknowledgement of a successful one. */
+    if (devcfg_fw_err()) {
+        size_t l = strlen(vals);
+        snprintf(vals + l, sizeof(vals) - l, ",\"fw_err\":\"%s\",\"fw_err_ver\":\"%s\"",
+                 devcfg_fw_err(), devcfg_fw_err_ver() ? devcfg_fw_err_ver() : "?");
+    }
     if (now_ms > 0)
         snprintf(s_json, sizeof(s_json), "{\"ts\":%lld,\"values\":{%s}}",
                  (long long)now_ms, vals);
@@ -1021,6 +1066,7 @@ static bool cell_session(const uplink_ctx_t *ctx, uplink_result_t *res)
         res->t_drain_ms = sess_ms();
         res->sent += sent;
         res->sent ? (res->any_success = true) : 0;
+        ota_attempt(ctx, res);
         /* AFTER the drain timing is captured, so the status record carries this
          * session's own numbers rather than the previous one's. */
         send_status(ctx, res);
@@ -1102,6 +1148,7 @@ static bool wifi_session(const uplink_ctx_t *ctx, uplink_result_t *res)
         uint32_t sent = drain(res);
         res->sent += sent;
         if (sent) res->any_success = true;
+        ota_attempt(ctx, res);
         send_status(ctx, res);   /* always: health must not depend on the drain */
         ok = sent > 0 || flashlog_pending() == 0;
     }

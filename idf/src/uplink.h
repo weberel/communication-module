@@ -25,6 +25,8 @@ typedef struct {
     bool     any_success;
     bool     all_sent;
     bool     used_wifi;
+    bool     ota_ready;        /* a new image is written, verified and set to
+                                * boot: main.c clears the RTC state and restarts */
     uint32_t sent;
     int      cell_rssi_dbm;    /* 0 if modem never attached */
     int      wifi_rssi_dbm;    /* 0 if WiFi unused */
