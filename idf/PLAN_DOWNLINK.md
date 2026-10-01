@@ -68,7 +68,7 @@ status message with the same `cfg_ver`; the following wakes are spaced by the ne
 that never received a config reports `cfg_ver` 0 and the compiled 300 / 43200; a session
 before the ACL is deployed logs "config subscribe refused" and drains normally.
 
-## Stage 2: OTA (com-0.36) -- DONE: forward and reverse OTA proven on dev-4 2026-09-30; rollback with a broken build still open
+## Stage 2: OTA (com-0.36) -- DONE. Forward and reverse OTA proven 2026-09-30; rollback proven 2026-10-01 with com-0.40
 
 Files: `ota.c/h` (new), `devcfg.c/h`, `uplink.c/h`, `main.c`, `config.h`, `src/CMakeLists.txt`,
 `version.txt` (new).
@@ -113,8 +113,29 @@ Files: `ota.c/h` (new), `devcfg.c/h`, `uplink.c/h`, `main.c`, `config.h`, `src/C
       message of the downloading session goes out with the old `fw` and no `fw_err`, then the
       new image's cold-boot session acknowledges.
 
-Still open on hardware: an image built with the uplink disabled reverts within two
-wakes and the old image reports `fw_err: rollback` with `fw_err_ver`; a wrong SHA-256 is
+- [x] com-0.38 (2026-10-01): a version with `fw_err: rollback` on record is never retried (the
+      retry ran before the status message and would have cleared the error the server needs to
+      see; the same bytes would fail the same way). Also fixes the RSSI 0 dBm regression (CSQ
+      re-read after registration). com-0.39 = same code with a wrong broker host, built only for
+      the rollback test. Procedure: server `CHANGES_FIRMWARE_com-0.38.md`.
+
+- [x] **com-0.40 (2026-10-01): rollback actually works now.** The com-0.39 rollback test failed:
+      the broken image survived every wake and the button. Cause: the mark-valid call sat after
+      the upload session in `main.c`, and the OTA runs inside that session;
+      `esp_ota_mark_app_valid_cancel_rollback()` marks the ACTIVE otadata entry, which
+      `esp_https_ota_finish()` had just pointed at the new slot. So every OTA so far validated the
+      new image before it booted. Fix: `confirm_running_image()` in `uplink.c`, right after the
+      drain published and before `ota_attempt()`, guarded by "running slot is PENDING_VERIFY";
+      the `main.c` call is gone. com-0.41 = com-0.40 with the wrong broker host, for the retest.
+
+- [x] **Rollback verified 2026-10-01 09:50** (device_status row, UTC 07:50:02): com-0.40 downloaded
+      com-0.39 (09:44 status, `fw: com-0.40`, no error), restarted into it, com-0.39 failed its
+      cold-boot session and slept; at its first timer wake the bootloader booted com-0.40, which
+      reported `fw_err: rollback`, `fw_err_ver: com-0.39`, `wake_reason: timer`, `rssi_dbm: -71`
+      (RSSI fix confirmed too). 5.5 min from restart to report. Server-side gap: `ecotrace-admin
+      config` still prints `[pending]` for the target instead of failed; the data is there.
+
+Still open on hardware:  a wrong SHA-256 is
 refused with `fw_err: sha256` and the running image is untouched.
 
 ## Server side: three corrections to the 2026-09-30 plan (all taken into DOWNLINK.md)

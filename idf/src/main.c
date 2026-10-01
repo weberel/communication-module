@@ -480,10 +480,10 @@ void app_main(void)
      * esp_ota_mark_app_valid_cancel_rollback() by then. Deep-sleep wake goes
      * through the bootloader, so "the next reset" is the next wake.
      *
-     * The mark now sits after the upload session below, and only when that
-     * session published: an image that boots but cannot reach the server
-     * reverts itself within one sample interval, which is the property OTA
-     * without a person at the board needs. A serial flash is unaffected (no
+     * The mark happens inside the upload session (uplink.c), right after the
+     * drain published and before any OTA download: an image that boots but
+     * cannot reach the server reverts itself within one sample interval,
+     * which is the property OTA without a person at the board needs. A serial flash is unaffected (no
      * PENDING state), and the 2026-09-11 trap (a stale slot that silently
      * kept booting) is still guarded: check which slot runs when a symptom
      * contradicts the code. */
@@ -739,9 +739,10 @@ void app_main(void)
         s_upload_inflight = 0;
         s_upload_crashed  = 0;   /* one-shot: cellular is primary again */
 
-        /* The session published, so this image demonstrably works: keep it.
-         * A no-op unless the slot is PENDING_VERIFY (first boot after OTA). */
-        if (u.any_success) esp_ota_mark_app_valid_cancel_rollback();
+        /* The image confirms itself inside the session (uplink.c
+         * confirm_running_image), BEFORE any OTA switches the boot record.
+         * Do not mark it valid here: after an OTA the active otadata entry is
+         * the new slot's, and marking here validated the new image unseen. */
 
         if (u.ota_ready) {
             /* The new image comes up as a COLD boot: its RTC layout may differ

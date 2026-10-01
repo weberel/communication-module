@@ -23,6 +23,7 @@
 #include "mqtt_client.h"
 #include "driver/gpio.h"
 #include "esp_task_wdt.h"
+#include "esp_ota_ops.h"
 #include "esp_pm.h"   /* reproduction experiment 2026-09-14 */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -247,8 +248,30 @@ static void config_fetch(void)
 #define OTA_MIN_VBAT_MV   (MODEM_MIN_VBAT_MV + 100)
 #define OTA_MAX_TRIES     3
 
+/* This session published, so the image that is running works: tell the
+ * bootloader to keep it. MUST run before ota_attempt(), and nowhere after it:
+ * esp_ota_mark_app_valid_cancel_rollback() marks whichever otadata entry is
+ * ACTIVE, not the partition that is running, and esp_https_ota_finish() makes
+ * the freshly written slot the active entry. Marking after an OTA therefore
+ * validates the NEW image before it has ever booted, and the bootloader will
+ * never roll it back (found 2026-10-01: a build with a wrong broker host
+ * survived every wake; the four OTAs the day before had no protection either).
+ * A no-op unless this slot is PENDING_VERIFY, i.e. our own first boot after
+ * an OTA. */
+static void confirm_running_image(const uplink_result_t *res)
+{
+    if (!res->any_success) return;
+    const esp_partition_t *run = esp_ota_get_running_partition();
+    esp_ota_img_states_t st;
+    if (run && esp_ota_get_state_partition(run, &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY) {
+        esp_ota_mark_app_valid_cancel_rollback();
+        ESP_LOGI(TAG, "first session after OTA published -- %s (" FW_VERSION ") marked valid", run->label);
+    }
+}
+
 static void ota_attempt(const uplink_ctx_t *ctx, uplink_result_t *res)
 {
+    confirm_running_image(res);
     const devcfg_fw_t *t = devcfg_fw_target();
     if (!t || res->ota_ready) return;
     if (strcmp(t->ver, FW_VERSION) == 0) return;          /* already running it */
@@ -259,6 +282,16 @@ static void ota_attempt(const uplink_ctx_t *ctx, uplink_result_t *res)
     uint8_t n = devcfg_fw_tries(t->ver);
     if (n >= OTA_MAX_TRIES) {
         ESP_LOGW(TAG, "OTA %s not retried (%u attempts)", t->ver, n);
+        return;
+    }
+    /* A version that downloaded, booted and then could not upload was rolled
+     * back by the bootloader: the same bytes would fail the same way, and a
+     * retry here would run BEFORE the status message and clear the very
+     * fw_err the server needs to see. Stricter than the contract's three
+     * attempts, on purpose. A different fw_ver lifts it. */
+    if (devcfg_fw_err() && strcmp(devcfg_fw_err(), "rollback") == 0 &&
+        devcfg_fw_err_ver() && strcmp(devcfg_fw_err_ver(), t->ver) == 0) {
+        ESP_LOGW(TAG, "OTA %s not retried: it was rolled back", t->ver);
         return;
     }
     devcfg_fw_note_try(t->ver);                            /* counted before, so a crash counts */
@@ -1039,6 +1072,17 @@ static bool cell_session(const uplink_ctx_t *ctx, uplink_result_t *res)
         goto out;
     }
     res->t_reg_ms = sess_ms();
+    /* The registration poll reads +CSQ before +CEREG, and a fast attach
+     * answers "registered" on the first pass while +CSQ is still 99 ("not
+     * known"), so rssi_dbm stayed 0 in most sessions since idf-0.28. Now that
+     * we are registered the modem has a measurement within a second or so;
+     * this is the last chance before PPP takes the AT channel. */
+    for (int i = 0; i < 5 && res->cell_rssi_dbm == 0; i++) {
+        int rssi = 99, ber = 0;
+        vTaskDelay(pdMS_TO_TICKS(400));
+        if (esp_modem_get_signal_quality(dce, &rssi, &ber) == ESP_OK && rssi != 99)
+            res->cell_rssi_dbm = -113 + 2 * rssi;
+    }
     ESP_LOGI(TAG, "registered (stat %u, %d dBm) at %lu ms",
              res->cell_reg_stat, res->cell_rssi_dbm,
              (unsigned long)res->t_reg_ms);
